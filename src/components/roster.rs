@@ -89,6 +89,12 @@ pub static KEYMAP: &[Binding] = &[
         None,
         "remove the selected bird/room from the roster (asks first)",
     ),
+    bind(
+        ch('y'),
+        Action::Yank,
+        None,
+        "copy the selected bird's visible pane to the clipboard",
+    ),
 ];
 
 impl Roster {

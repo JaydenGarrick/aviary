@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     result
 }
 
-fn mouse_capture(on: bool) {
+pub(crate) fn mouse_capture(on: bool) {
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     let mut out = std::io::stdout();
     let _ = if on {

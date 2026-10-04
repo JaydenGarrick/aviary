@@ -39,6 +39,11 @@ pub enum Action {
     Profile,
     /// Remove the selected bird/room from the roster (confirmed first).
     Delete,
+    /// Release/recapture the mouse: released, the terminal's native
+    /// drag-select and copy work everywhere.
+    ToggleMouse,
+    /// Copy the selected bird's visible pane to the clipboard.
+    Yank,
     // -- scrolling panes
     PageUp,
     PageDown,

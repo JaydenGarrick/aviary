@@ -27,6 +27,22 @@ use crate::ui;
 const FLASH_TTL: Duration = Duration::from_secs(4);
 const SIDEBAR_WIDTH: u16 = 34;
 
+/// Pipe text into the macOS clipboard. No dependency — the same trade the
+/// room timestamps make with `date`.
+fn pbcopy(text: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
 /// Keys that act on the CONTENT pane (the room transcript) while the sidebar
 /// keeps navigation. Merged into dispatch and hints only when a room is up.
 static CONTENT_KEYS: &[Binding] = &[
@@ -48,6 +64,8 @@ pub struct App {
     should_quit: bool,
     sidebar: Rect,
     content: Rect,
+    /// False = the mouse belongs to the TERMINAL (native drag-select/copy).
+    mouse_on: bool,
     /// Tick counter pacing the agents poll (3s) and routine checks (30s).
     ticks: u64,
 }
@@ -72,6 +90,7 @@ pub fn run(mut terminal: DefaultTerminal) -> Result<()> {
         should_quit: false,
         sidebar: Rect::default(),
         content: Rect::default(),
+        mouse_on: true,
         ticks: 0,
     };
     // Point the content pane at the first bird and start the branch load.
@@ -387,6 +406,34 @@ impl App {
             Action::NewRoom => self.open_new_room(),
             Action::Back => {
                 self.shared.agent_focused = false;
+            }
+            Action::ToggleMouse => {
+                self.mouse_on = !self.mouse_on;
+                crate::mouse_capture(self.mouse_on);
+                self.shared.flash(if self.mouse_on {
+                    "mouse captured — clicks and wheel drive aviary again"
+                } else {
+                    "mouse released — drag to select, ⌘C to copy, m to re-capture"
+                });
+            }
+            Action::Yank => {
+                let text = self
+                    .shared
+                    .current_bot
+                    .as_ref()
+                    .and_then(|id| self.shared.agents.get(id))
+                    .and_then(|s| s.term.parser.read().ok().map(|p| p.screen().contents()));
+                match text {
+                    Some(t) if !t.trim().is_empty() => {
+                        let copied = pbcopy(&t);
+                        self.shared.flash(if copied {
+                            "pane copied to the clipboard"
+                        } else {
+                            "pbcopy failed"
+                        });
+                    }
+                    _ => self.shared.flash("nothing to copy — the pane is empty"),
+                }
             }
             Action::Reload => {
                 self.reload_config();
@@ -760,7 +807,9 @@ impl App {
             self.components.thread.draw(frame, cols[1], &mut self.shared);
         }
 
-        let hint_override = if self.shared.agent_focused {
+        let hint_override = if !self.mouse_on {
+            Some("mouse → terminal: drag selects, ⌘C copies · m gives the mouse back to aviary")
+        } else if self.shared.agent_focused {
             Some("the bird has the keyboard — every key goes to it except ctrl+a, which hands it back")
         } else if self.room_selected() && self.components.room.capturing() {
             Some("writing to the room — ⏎ sends · esc cancels · @name wakes just that bird")

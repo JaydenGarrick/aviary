@@ -162,6 +162,12 @@ pub static GLOBAL: &[Binding] = &[
     // `c`, not `g` — the sidebar's g (jump to top) would shadow it.
     bind(ch('c'), A::NewRoom, None, "create a room (group chat)"),
     bind(ch('r'), A::Reload, None, "reload config + repo state"),
+    bind(
+        ch('m'),
+        A::ToggleMouse,
+        None,
+        "release the mouse to the terminal (native drag-select/copy) · m again re-captures",
+    ),
     bind(key(KeyCode::Esc), A::Back, None, "hand the keyboard back to the sidebar"),
 ];
 
