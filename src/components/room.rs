@@ -277,13 +277,14 @@ impl Component for RoomView {
             )));
         }
 
-        // Layout: header · transcript window · quick-reply chips · composer.
+        // Layout: header · transcript window · quick-reply chips · a REAL
+        // bordered composer box (the single gray line was too easy to miss).
         let header_h = 1u16;
-        let footer_h = 1u16;
+        let input_h = 3u16;
         let show_options = !self.options.is_empty() && self.composing.is_none();
         let options_h = if show_options { 1u16 } else { 0 };
         let view_h =
-            area.height.saturating_sub(header_h + footer_h + options_h + 1) as usize;
+            area.height.saturating_sub(header_h + input_h + options_h + 1) as usize;
         let max_up = body.len().saturating_sub(view_h);
         self.scroll_up = self.scroll_up.min(max_up);
         let end = body.len() - self.scroll_up.min(body.len());
@@ -307,7 +308,7 @@ impl Component for RoomView {
         self.option_rects.clear();
         if show_options {
             use unicode_width::UnicodeWidthStr;
-            let y = area.y + area.height.saturating_sub(2);
+            let y = area.y + area.height.saturating_sub(input_h + 1);
             let mut spans: Vec<Span> = vec![Span::raw(" ")];
             let mut cursor = 1u16;
             for (i, opt) in self.options.iter().enumerate() {
@@ -330,42 +331,57 @@ impl Component for RoomView {
             );
         }
 
-        let footer_y = area.y + area.height.saturating_sub(1);
-        self.footer = Rect {
+        // The composer box — looks like an input because it IS the input.
+        let input_rect = Rect {
             x: area.x,
-            y: footer_y,
+            y: area.y + area.height.saturating_sub(input_h),
             width: area.width,
-            height: 1,
+            height: input_h,
         };
-        let footer = match &self.composing {
+        self.footer = input_rect;
+
+        let composing = self.composing.is_some();
+        let border = if composing { ACCENT } else { DIM };
+        let hint = if composing {
+            " ⏎ send · esc cancel "
+        } else {
+            " ⏎ or click to write "
+        };
+        let mut block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title_bottom(Line::from(Span::styled(
+                hint,
+                Style::default().fg(border),
+            )));
+        if self.scroll_up > 0 {
+            block = block.title(Line::from(Span::styled(
+                format!(" ↓ {} below — G follows ", self.scroll_up),
+                Style::default().fg(ACCENT),
+            )));
+        }
+        let content = match &self.composing {
             Some(buf) => Line::from(vec![
-                Span::styled(" > ", Style::default().fg(ACCENT)),
+                Span::raw(" "),
                 Span::styled(
-                    format!("{buf}▌"),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    // Long drafts keep their TAIL visible — that's where the
+                    // caret lives while typing.
+                    format!("{}▌", tail(buf, area.width.saturating_sub(5) as usize)),
+                    Style::default()
+                        .fg(ratatui::style::Color::Reset)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                dim("   ⏎ send · esc cancel · @name wakes just that bird"),
             ]),
-            None => {
-                let mut spans = vec![dim(" ⏎ or click here to message the room")];
-                if self.scroll_up > 0 {
-                    spans.push(Span::styled(
-                        format!("   ↓ {} below — G follows", self.scroll_up),
-                        Style::default().fg(ACCENT),
-                    ));
-                }
-                Line::from(spans)
-            }
+            None => Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!("Message #{}", room.name),
+                    Style::default().fg(MUTED),
+                ),
+                dim("  — no @mention wakes everyone · @name wakes just that bird"),
+            ]),
         };
-        frame.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(DIM)),
-            Rect {
-                x: area.x,
-                y: footer_y,
-                width: area.width,
-                height: footer_h,
-            },
-        );
+        frame.render_widget(ratatui::widgets::Paragraph::new(content).block(block), input_rect);
     }
 }
 
@@ -385,6 +401,16 @@ fn truncate_opt(s: &str, max: usize) -> String {
         let kept: String = s.chars().take(max - 1).collect();
         format!("{kept}…")
     }
+}
+
+fn tail(s: &str, max: usize) -> String {
+    let max = max.max(8);
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().skip(n - (max - 1)).collect();
+    format!("…{kept}")
 }
 
 #[cfg(test)]
