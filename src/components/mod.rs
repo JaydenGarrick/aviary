@@ -10,19 +10,9 @@ use ratatui::Frame;
 
 use crate::action::{Action, Effects};
 use crate::command::CommandResult;
-use crate::keymap::Binding;
 use crate::shared::Shared;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    Roster,
-    Thread,
-    Room,
-}
-
 pub trait Component {
-    /// The screen's bindings — dispatch, hints, and help all read this table.
-    fn keymap(&self) -> &'static [Binding];
     /// A text field owns the keyboard; the keymap is bypassed.
     fn capturing(&self) -> bool {
         false
@@ -37,8 +27,10 @@ pub trait Component {
     fn draw(&mut self, f: &mut Frame, area: Rect, s: &mut Shared);
 }
 
-/// Static registry — no `Box<dyn>`, no downcasting. Bots and rooms are STATE
-/// inside these components, never new components.
+/// Static registry — no `Box<dyn>`, no downcasting. The sidebar (roster) is
+/// always visible and owns the keys; thread/room are the content pane, picked
+/// by the sidebar selection. Bots and rooms are STATE inside these components,
+/// never new components.
 pub struct Components {
     pub roster: roster::Roster,
     pub thread: thread::Thread,
@@ -51,14 +43,6 @@ impl Components {
             roster: roster::Roster::default(),
             thread: thread::Thread::default(),
             room: room::RoomView::default(),
-        }
-    }
-
-    pub fn active_mut(&mut self, screen: Screen) -> &mut dyn Component {
-        match screen {
-            Screen::Roster => &mut self.roster,
-            Screen::Thread => &mut self.thread,
-            Screen::Room => &mut self.room,
         }
     }
 }

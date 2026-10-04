@@ -65,6 +65,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tui-term",
+ "unicode-width",
  "vt100",
 ]
 

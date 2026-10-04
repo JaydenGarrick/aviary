@@ -1,35 +1,48 @@
-//! The thin shell: layered key dispatch, overlay routing, msg fan-out, and the
-//! run loop. Everything screen-specific lives in `components/`; everything
-//! shared lives in `shared.rs`. This file should stay small — growth here is
-//! the smell the mb migration plan exists to prevent.
+//! The thin shell: layered key dispatch, mouse routing, overlay handling, msg
+//! fan-out, and the run loop.
+//!
+//! Layout is Grok-Bot-shaped: the sidebar (roster) is ALWAYS visible and owns
+//! the keyboard; the content pane beside it shows whatever the sidebar
+//! selection points at — a bird's live session or a room transcript.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::DefaultTerminal;
 
 use crate::action::{Action, Effects, Msg};
+use crate::agent_store::Collab;
 use crate::command::Executor;
-use crate::components::{Component, Components, Screen};
-use crate::config::{self, Config};
+use crate::components::{hits, Component, Components};
+use crate::config::{self, BotId, Config};
 use crate::event::{self, Event};
-use crate::keymap::{self, GLOBAL};
+use crate::keymap::{self, bind, ch, Binding, GLOBAL};
 use crate::overlays::{AddBotForm, ComposeForm, FormEvent, NewRoomForm, Overlay};
 use crate::prompts;
 use crate::shared::Shared;
 use crate::ui;
 
 const FLASH_TTL: Duration = Duration::from_secs(4);
+const SIDEBAR_WIDTH: u16 = 34;
+
+/// Keys that act on the CONTENT pane (the room transcript) while the sidebar
+/// keeps navigation. Merged into dispatch and hints only when a room is up.
+static CONTENT_KEYS: &[Binding] = &[
+    bind(ch('i'), Action::Compose, None, "write to the room (same as ⏎)"),
+    bind(ch('u'), Action::PageUp, Some("scroll"), "scroll the room up"),
+    bind(ch('d'), Action::PageDown, None, "scroll the room down"),
+];
 
 pub struct App {
-    screen: Screen,
     components: Components,
     overlay: Overlay,
     shared: Shared,
     executor: Executor,
     should_quit: bool,
+    sidebar: Rect,
+    content: Rect,
 }
 
 pub fn run(mut terminal: DefaultTerminal) -> Result<()> {
@@ -38,14 +51,18 @@ pub fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let (tx, rx) = event::channel();
 
     let mut app = App {
-        screen: Screen::Roster,
         components: Components::new(),
         overlay: Overlay::None,
         shared: Shared::new(cfg, tx.clone()),
         executor: Executor::new(tx),
         should_quit: false,
+        sidebar: Rect::default(),
+        content: Rect::default(),
     };
-    app.goto(Screen::Roster);
+    // Point the content pane at the first bird and start the branch load.
+    let mut fx = Effects::default();
+    app.components.roster.on_enter(&mut app.shared, &mut fx);
+    app.apply(fx);
 
     while !app.should_quit {
         terminal.draw(|frame| app.draw(frame))?;
@@ -64,6 +81,10 @@ pub fn run(mut terminal: DefaultTerminal) -> Result<()> {
 }
 
 impl App {
+    fn room_selected(&self) -> bool {
+        self.shared.current_room.is_some()
+    }
+
     // ---------------------------------------------------------------- events
 
     fn handle(&mut self, ev: Event) {
@@ -83,13 +104,7 @@ impl App {
                 }
             }
             Event::Done(result) => {
-                self.components
-                    .active_mut(self.screen)
-                    .on_result(&result, &mut self.shared);
-                // Branch info is roster data even when another screen is up.
-                if self.screen != Screen::Roster {
-                    self.components.roster.on_result(&result, &mut self.shared);
-                }
+                self.components.roster.on_result(&result, &mut self.shared);
             }
             Event::Tick => self.on_tick(),
             Event::Resize => {}
@@ -103,24 +118,30 @@ impl App {
             }
         }
 
+        // Fresh sessions become resumable only after surviving long enough —
+        // a boot crash must never leave a ghost resume record.
+        self.shared.agents.tick(&self.shared.config);
+
         // Room dispatch is aviary-wide: bot appends wake @-mentioned members
         // whether or not anyone is looking at the room.
         let dispatches = self.shared.watcher.poll(&self.shared.config);
-        for (target, prompt) in dispatches {
+        for (target, room_id, prompt) in dispatches {
             self.shared.boot_bot(&target, Some(&prompt));
+            self.shared.agents.set_collab(&target, Collab::Room(room_id));
         }
 
         let mut fx = Effects::default();
-        self.components
-            .active_mut(self.screen)
-            .on_tick(&mut self.shared, &mut fx);
+        self.components.roster.on_tick(&mut self.shared, &mut fx);
+        if self.room_selected() {
+            self.components.room.on_tick(&mut self.shared, &mut fx);
+        }
         self.apply(fx);
     }
 
     // ------------------------------------------------------------------ keys
     //
-    // The layer order is load-bearing; see the plan. Interrupts sit ABOVE
-    // capturing so ctrl+c quits even from inside a text field.
+    // The layer order is load-bearing. Interrupts sit ABOVE capturing so
+    // ctrl+c quits even from inside a text field.
 
     fn on_key(&mut self, key: KeyEvent) {
         // ① the bird holds the keyboard — everything goes to it but ctrl+a.
@@ -134,7 +155,11 @@ impl App {
                 return;
             };
             match self.shared.agents.get_mut(&id) {
-                Some(s) if s.term.is_running() => s.term.send_key(key),
+                Some(s) if s.term.is_running() => {
+                    s.term.send_key(key);
+                    // The user taking over means the bird works for THEM now.
+                    self.shared.agents.clear_collab(&id);
+                }
                 _ => self.shared.agent_focused = false,
             }
             return;
@@ -154,68 +179,90 @@ impl App {
 
         // ④ modal forms capture everything.
         if !self.overlay.is_none() {
-            self.on_form_key(key);
+            let event = match &mut self.overlay {
+                Overlay::AddBot(f) => f.handle_key(key),
+                Overlay::NewRoom(f) => f.handle_key(key),
+                Overlay::Compose(f) => f.handle_key(key),
+                _ => return,
+            };
+            self.on_form_event(event);
             return;
         }
 
-        // ④b a component text field (the room composer) captures everything.
-        let active = self.components.active_mut(self.screen);
-        if active.capturing() {
+        // ④b the room composer captures everything.
+        if self.room_selected() && self.components.room.capturing() {
             let mut fx = Effects::default();
-            active.handle_text(key, &mut self.shared, &mut fx);
+            self.components.room.handle_text(key, &mut self.shared, &mut fx);
             self.apply(fx);
             return;
         }
 
-        // ⑤/⑥ component keymap, then globals.
-        let Some(action) = keymap::resolve(&[active.keymap(), GLOBAL], &key) else {
+        // ⑤/⑥ sidebar keymap (+ content keys when a room is up), then globals.
+        let tables: &[&[Binding]] = if self.room_selected() {
+            &[crate::components::roster::KEYMAP, CONTENT_KEYS, GLOBAL]
+        } else {
+            &[crate::components::roster::KEYMAP, GLOBAL]
+        };
+        let Some(action) = keymap::resolve(tables, &key) else {
             return;
         };
+        self.dispatch(action);
+    }
+
+    fn dispatch(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Help => self.overlay = Overlay::Help,
-            Action::NewBot => {
-                self.overlay = Overlay::AddBot(AddBotForm::new(self.shared.config.bots.len()));
-            }
-            Action::NewRoom => {
-                if self.shared.config.bots.len() < 2 {
-                    self.shared.flash("a room needs at least two birds — n adds more");
-                } else {
-                    self.overlay = Overlay::NewRoom(NewRoomForm::new(&self.shared.config.bots));
-                }
-            }
+            Action::NewBot => self.open_new_bot(),
+            Action::NewRoom => self.open_new_room(),
             Action::Back => {
                 self.shared.agent_focused = false;
-                if self.screen != Screen::Roster {
-                    self.goto(Screen::Roster);
-                }
             }
             Action::Reload => {
                 self.reload_config();
                 let mut fx = Effects::default();
-                let screen = self.screen;
                 self.components
-                    .active_mut(screen)
+                    .roster
                     .update(Action::Reload, &mut self.shared, &mut fx);
+                if self.room_selected() {
+                    self.components
+                        .room
+                        .update(Action::Reload, &mut self.shared, &mut fx);
+                }
                 self.apply(fx);
+            }
+            // Content-pane verbs go to the room view; everything else is the
+            // sidebar's (which owns selection and all bird actions).
+            Action::PageUp | Action::PageDown | Action::Compose => {
+                if self.room_selected() {
+                    let mut fx = Effects::default();
+                    self.components.room.update(action, &mut self.shared, &mut fx);
+                    self.apply(fx);
+                }
             }
             other => {
                 let mut fx = Effects::default();
                 self.components
-                    .active_mut(self.screen)
+                    .roster
                     .update(other, &mut self.shared, &mut fx);
                 self.apply(fx);
             }
         }
     }
 
-    fn on_form_key(&mut self, key: KeyEvent) {
-        let event = match &mut self.overlay {
-            Overlay::AddBot(f) => f.handle_key(key),
-            Overlay::NewRoom(f) => f.handle_key(key),
-            Overlay::Compose(f) => f.handle_key(key),
-            _ => return,
-        };
+    fn open_new_bot(&mut self) {
+        self.overlay = Overlay::AddBot(AddBotForm::new(self.shared.config.bots.len()));
+    }
+
+    fn open_new_room(&mut self) {
+        if self.shared.config.bots.len() < 2 {
+            self.shared.flash("a room needs at least two birds — n adds more");
+        } else {
+            self.overlay = Overlay::NewRoom(NewRoomForm::new(&self.shared.config.bots));
+        }
+    }
+
+    fn on_form_event(&mut self, event: FormEvent) {
         match event {
             FormEvent::Consumed => {}
             FormEvent::Cancel => self.overlay = Overlay::None,
@@ -257,8 +304,8 @@ impl App {
 
     /// The handoff/direct-message submit. With a source bird, the SOURCE owns
     /// packaging (it has the context); the target is booted first so the
-    /// SendMessage has a live recipient.
-    fn send_compose(&mut self, source: Option<crate::config::BotId>, target: crate::config::BotId, text: String) {
+    /// SendMessage has a live recipient. Both get collaboration tags.
+    fn send_compose(&mut self, source: Option<BotId>, target: BotId, text: String) {
         match source {
             Some(src) => {
                 let (Some(from), Some(to)) = (
@@ -271,12 +318,16 @@ impl App {
                 self.shared.boot_bot(&target, wake.as_deref());
                 let prompt = prompts::handoff(&from, &to, &text, &self.shared.config.handoffs_dir());
                 self.shared.boot_bot(&src, Some(&prompt));
+                self.shared.agents.set_collab(&src, Collab::Delegating(to.id.0.clone()));
+                self.shared.agents.set_collab(&target, Collab::Receiving(from.id.0.clone()));
                 self.shared
                     .flash(format!("{} is packaging a handoff for {}", from.name, to.name));
             }
             None => {
                 let prompt = prompts::direct(&text);
                 self.shared.boot_bot(&target, Some(&prompt));
+                // A direct user message makes the bird the USER's again.
+                self.shared.agents.clear_collab(&target);
                 let name = self
                     .shared
                     .config
@@ -296,12 +347,26 @@ impl App {
             return;
         }
         if !self.overlay.is_none() {
-            return; // forms are keyboard-only
+            let event = match &mut self.overlay {
+                Overlay::AddBot(f) => f.handle_mouse(m),
+                Overlay::NewRoom(f) => f.handle_mouse(m),
+                Overlay::Compose(f) => f.handle_mouse(m),
+                _ => return,
+            };
+            self.on_form_event(event);
+            return;
         }
+
         let mut fx = Effects::default();
-        self.components
-            .active_mut(self.screen)
-            .handle_mouse(m, &mut self.shared, &mut fx);
+        if hits(self.sidebar, m.column, m.row) {
+            self.components.roster.handle_mouse(m, &mut self.shared, &mut fx);
+        } else if hits(self.content, m.column, m.row) {
+            if self.room_selected() {
+                self.components.room.handle_mouse(m, &mut self.shared, &mut fx);
+            } else {
+                self.components.thread.handle_mouse(m, &mut self.shared, &mut fx);
+            }
+        }
         self.apply(fx);
     }
 
@@ -313,14 +378,17 @@ impl App {
         }
         for msg in fx.msgs {
             match msg {
-                Msg::OpenThread(id) => {
-                    self.shared.current_bot = Some(id);
-                    self.goto(Screen::Thread);
-                }
                 Msg::OpenRoom(id) => {
-                    self.shared.current_room = Some(id);
-                    self.goto(Screen::Room);
+                    self.shared.current_room = Some(id.clone());
+                    self.shared.current_bot = None;
+                    self.components.roster.select_room(&mut self.shared, &id);
+                    let mut enter = Effects::default();
+                    self.components.room.on_enter(&mut self.shared, &mut enter);
+                    self.components.room.start_compose();
+                    self.apply(enter);
                 }
+                Msg::OpenNewBot => self.open_new_bot(),
+                Msg::OpenNewRoom => self.open_new_room(),
                 Msg::Compose { source, preselect } => {
                     match ComposeForm::new(&self.shared, source, preselect) {
                         Some(form) => self.overlay = Overlay::Compose(form),
@@ -332,19 +400,11 @@ impl App {
         }
     }
 
-    fn goto(&mut self, screen: Screen) {
-        self.screen = screen;
-        let mut fx = Effects::default();
-        self.components
-            .active_mut(screen)
-            .on_enter(&mut self.shared, &mut fx);
-        self.apply(fx);
-    }
-
     fn reload_config(&mut self) {
         match Config::load_or_scaffold(self.shared.config.dir.clone()) {
             Ok(cfg) => {
                 self.shared.config = cfg;
+                self.components.roster.sync(&mut self.shared);
                 self.shared.flash("config reloaded");
             }
             Err(e) => self.shared.flash(format!("reload failed: {e:#}")),
@@ -359,7 +419,7 @@ impl App {
             .constraints([
                 Constraint::Length(1), // brand + flash + live count
                 Constraint::Length(1), // air
-                Constraint::Min(0),    // body
+                Constraint::Min(0),    // sidebar | content
                 Constraint::Length(1), // generated hints
             ])
             .split(frame.area());
@@ -372,30 +432,47 @@ impl App {
             self.shared.flash.as_ref().map(|(_, m)| m.as_str()),
         );
 
-        self.components
-            .active_mut(self.screen)
-            .draw(frame, rows[2], &mut self.shared);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(30)])
+            .split(rows[2]);
+        self.sidebar = cols[0];
+        self.content = cols[1];
+
+        self.components.roster.draw(frame, cols[0], &mut self.shared);
+        if self.room_selected() {
+            self.components.room.draw(frame, cols[1], &mut self.shared);
+        } else {
+            self.components.thread.draw(frame, cols[1], &mut self.shared);
+        }
 
         let hint_override = if self.shared.agent_focused {
             Some("the bird has the keyboard — every key goes to it except ctrl+a, which hands it back")
+        } else if self.room_selected() && self.components.room.capturing() {
+            Some("writing to the room — ⏎ sends · esc cancels · @name wakes just that bird")
         } else if !self.overlay.is_none() && !matches!(self.overlay, Overlay::Help) {
-            Some("esc cancels")
+            Some("fill the form — ⏎ submits · esc cancels · fields are clickable")
         } else {
             None
         };
-        let active_keymap = self.components.active_mut(self.screen).keymap();
-        ui::draw_hints(frame, rows[3], &[active_keymap, GLOBAL], hint_override);
+        let tables: &[&[Binding]] = if self.room_selected() {
+            &[crate::components::roster::KEYMAP, CONTENT_KEYS, GLOBAL]
+        } else {
+            &[crate::components::roster::KEYMAP, GLOBAL]
+        };
+        ui::draw_hints(frame, rows[3], tables, hint_override);
 
-        match &self.overlay {
+        match &mut self.overlay {
             Overlay::None => {}
-            Overlay::Help => {
-                let title = match self.screen {
-                    Screen::Roster => "roster",
-                    Screen::Thread => "thread",
-                    Screen::Room => "room",
-                };
-                ui::draw_help(frame, frame.area(), &[(title, active_keymap), ("everywhere", GLOBAL)]);
-            }
+            Overlay::Help => ui::draw_help(
+                frame,
+                frame.area(),
+                &[
+                    ("sidebar", crate::components::roster::KEYMAP),
+                    ("room", CONTENT_KEYS),
+                    ("everywhere", GLOBAL),
+                ],
+            ),
             Overlay::AddBot(f) => f.draw(frame, frame.area()),
             Overlay::NewRoom(f) => f.draw(frame, frame.area()),
             Overlay::Compose(f) => f.draw(frame, frame.area()),

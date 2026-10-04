@@ -65,4 +65,22 @@ impl Shared {
         let bot = self.config.bot(id)?;
         (!self.agents.has_session_record(id)).then(|| prompts::first_flight(bot))
     }
+
+    /// Abandon the bird's conversation on purpose and start a new one.
+    pub fn fresh_bot(&mut self, id: &BotId) {
+        let Some(bot) = self.config.bot(id).cloned() else {
+            self.flash(format!("no bot named {id:?}"));
+            return;
+        };
+        let tx = self.tx.clone();
+        let prompt = prompts::first_flight(&bot);
+        if let Err(e) = self
+            .agents
+            .fresh_start(&self.config, &bot, Some(&prompt), &tx)
+        {
+            self.flash(format!("{e:#}"));
+        } else {
+            self.flash(format!("{} — fresh conversation", bot.name));
+        }
+    }
 }

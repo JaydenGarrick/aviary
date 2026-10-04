@@ -130,10 +130,10 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Poll every room; return (target bot, notify prompt) for fresh appends.
-    /// Appends made through aviary's own composer are pre-counted via
+    /// Poll every room; return (target bot, room id, notify prompt) for fresh
+    /// appends. Appends made through aviary's own composer are pre-counted via
     /// [`Watcher::note_local_append`], so only bot/external writes dispatch.
-    pub fn poll(&mut self, cfg: &Config) -> Vec<(BotId, String)> {
+    pub fn poll(&mut self, cfg: &Config) -> Vec<(BotId, String, String)> {
         let mut out = Vec::new();
         for room in &cfg.rooms {
             let entries = read(&room.transcript_path(&cfg.dir));
@@ -149,6 +149,7 @@ impl Watcher {
                 for target in dispatch_targets(room, &e.author, &e.body) {
                     out.push((
                         target,
+                        room.id.clone(),
                         notify_prompt(room, &e.author, &cfg.dir),
                     ));
                 }
@@ -263,7 +264,8 @@ mod tests {
         let dispatches = w.poll(&cfg);
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0].0, BotId("raven".into()));
-        assert!(dispatches[0].1.contains("@swift"));
+        assert_eq!(dispatches[0].1, "nest");
+        assert!(dispatches[0].2.contains("@swift"));
         assert!(w.poll(&cfg).is_empty(), "no double dispatch");
     }
 

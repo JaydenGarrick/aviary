@@ -6,21 +6,28 @@ living in its own repo with its own persistent context and character; aviary is
 the roster that spawns, names, displays, and connects them.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ AVIARY                               ● 2 flying · 3 birds│
-│                                                         │
-│   BIRDS                                                 │
-│ ▸ 🪶 swift    ios       ● working      ⎇ develop        │
-│        “Hand off to @aviary-raven: …”                   │
-│   🧺 weaver   android   · idle 4m      ⎇ main           │
-│   🐦‍⬛ raven    core-api  ○ not started                   │
-│                                                         │
-│   ROOMS                                                 │
-│   # fly-calculator   @swift · @raven                    │
-│                                                         │
-│ j move · ⏎ open · a talk · @ message · ? keys           │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ AVIARY                                        ● 2 flying · 3 birds│
+│ BIRDS             │ 🪶 Swift · ~/…/ios · ● working · ⎇ develop   │
+│▸🪶 Swift ● working │ ┌──────────────────────────────────────────┐ │
+│   ↗ @raven “…”    │ │                                          │ │
+│ 🧺 Weaver ✔ done 4m│ │   the selected bird's live claude        │ │
+│ 🐦‍⬛ Raven ● working │ │   session (or the room transcript),      │ │
+│   ↘ @swift        │ │   always on the right — selection         │ │
+│ ROOMS             │ │   switches it instantly                   │ │
+│ # fly-calc    2   │ │                                          │ │
+│   @swift @raven   │ └──────────────────────────────────────────┘ │
+│ + bird  + room    │                                              │
+│ j move · ⏎ open · a talk · @ handoff · ? keys                    │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+The sidebar tells you what every bird is doing at a glance:
+`● working` (output in the last 5s) · `✔ done 3m` (finished, waiting) ·
+`○ not started` · `✗ exited` — plus a **collaboration tag** when aviary
+brokered it: `↗ @raven` (handed work off), `↘ @swift` (received a handoff),
+`⇄ #room` (working a room thread). No tag = working independently; the tag
+clears when you take the keyboard yourself.
 
 ## Why
 
@@ -67,18 +74,23 @@ First run scaffolds `~/.config/aviary/` with three default birds (edit
 
 Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 
-## Keys
+## Keys (everything is mouse-clickable too)
 
-| Key | Where | Does |
-|---|---|---|
-| `j/k` `⏎` | roster | move · open a thread or room |
-| `a` | roster/thread | wake the bird and take the keyboard |
-| `ctrl+a` | anywhere | hand the keyboard back to aviary |
-| `@` | roster/thread | message a bird / hand off via the current bird |
-| `n` / `g` | anywhere | new bird / new room |
-| `x` | roster/thread | stop a session (it resumes by name later) |
-| `⏎` | room | write to the room |
-| `?` | anywhere | help, generated from the real keymaps |
+| Key | Does |
+|---|---|
+| `j/k` / click | select a bird or room — the content pane follows instantly |
+| `⏎` / `a` / click pane | step in: wake the bird and take the keyboard, or write the room |
+| `ctrl+a` / `esc` | hand the keyboard back to the sidebar |
+| `@` | handoff: the selected bird packages its context for a teammate |
+| `n` / `c` (or the `+ bird` / `+ room` buttons) | hatch a bird / create a room |
+| `N` | abandon the bird's conversation and start a fresh one |
+| `x` | stop a session (it resumes by name later) |
+| `i` / `u` / `d` | write / scroll the room |
+| `?` | help, generated from the real keymaps |
+
+Mouse: click rows to select (again to step in), click chips/fields/members in
+any form, click outside a popup to dismiss it, wheel scrolls everything —
+including the bird's own transcript inside its pane.
 
 ## Layout
 

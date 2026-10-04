@@ -40,11 +40,12 @@ pub fn dim(text: impl Into<String>) -> Span<'static> {
 }
 
 /// Status chip: shape AND colour, so the roster reads without colour too.
+/// "done" = the session finished responding and is waiting at its prompt.
 pub fn status_span(status: BotStatus) -> Span<'static> {
     match status {
         BotStatus::Working => Span::styled("● working", Style::default().fg(OK)),
         BotStatus::Idle(secs) => Span::styled(
-            format!("· idle {}", human_duration(secs)),
+            format!("✔ done {}", human_duration(secs)),
             Style::default().fg(MUTED),
         ),
         BotStatus::NotStarted => Span::styled("○ not started", Style::default().fg(DIM)),

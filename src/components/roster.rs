@@ -1,11 +1,13 @@
-//! The roster — birds first, rooms below, Grok-Bot-shaped: each row is a
-//! contact with a live status chip and its last activity.
+//! The sidebar — birds first, rooms below, Grok-Bot-shaped: a persistent
+//! contact list whose selection drives the content pane beside it. Moving the
+//! cursor switches the conversation; ⏎/`a` steps INTO it (keyboard to the
+//! bird, or the room composer).
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::action::{Action, Effects, Msg};
@@ -14,7 +16,7 @@ use crate::components::{hits, Component};
 use crate::config::Config;
 use crate::keymap::{bind, bind_alias, ch, key, Binding, KeyCode};
 use crate::shared::Shared;
-use crate::ui::{bird_color, dim, muted, status_span, ACCENT, MUTED};
+use crate::ui::{bird_color, dim, muted, status_span, ACCENT, DIM, MUTED};
 use crate::widgets::list_nav::{ListNav, Wrap};
 
 /// One logical row: a bird or a room, in display order.
@@ -35,46 +37,98 @@ pub struct Roster {
     nav: ListNav,
     /// Where each logical row was drawn, for clicks.
     row_rects: Vec<(Rect, usize)>,
+    /// The footer buttons: `+ bird` and `+ room`.
+    new_bot_rect: Rect,
+    new_room_rect: Rect,
     /// Branch refresh cadence: every 15th tick.
     ticks: u32,
 }
 
-static KEYMAP: &[Binding] = &[
+pub static KEYMAP: &[Binding] = &[
     bind_alias(
         ch('j'),
         &[key(KeyCode::Down)],
         Action::Down,
         Some("move"),
-        "move down",
+        "select the next bird/room (the pane follows)",
     ),
-    bind_alias(ch('k'), &[key(KeyCode::Up)], Action::Up, None, "move up"),
+    bind_alias(ch('k'), &[key(KeyCode::Up)], Action::Up, None, "select the previous"),
     bind(ch('g'), Action::Top, None, "jump to the top"),
     bind(ch('G'), Action::Bottom, None, "jump to the bottom"),
     bind(
         key(KeyCode::Enter),
         Action::Confirm,
         Some("open"),
-        "open the selected bird's thread / room",
+        "step into the conversation (wake the bird / write the room)",
     ),
-    bind(ch('a'), Action::FocusAgent, Some("talk"), "open + take the keyboard"),
-    bind(ch('@'), Action::Handoff, Some("message"), "compose a message to a bird"),
+    bind(ch('a'), Action::FocusAgent, Some("talk"), "wake the bird and take the keyboard"),
+    bind(
+        ch('@'),
+        Action::Handoff,
+        Some("handoff"),
+        "hand work to a teammate (the selected bird packages its context)",
+    ),
     bind(ch('x'), Action::StopBot, None, "stop the selected bird's session"),
+    bind(
+        ch('N'),
+        Action::FreshStart,
+        None,
+        "abandon the bird's conversation and hatch a fresh one",
+    ),
 ];
 
 impl Roster {
-    fn open_selected(&self, s: &mut Shared, fx: &mut Effects, focus: bool) {
+    /// Keep the content pane pointed at the selection — the whole sidebar model.
+    pub fn sync(&mut self, s: &mut Shared) {
         let all = rows(&s.config);
+        self.nav.clamp(all.len());
         match all.get(self.nav.selected) {
             Some(Row::Bot(i)) => {
                 let id = s.config.bots[*i].id.clone();
-                fx.msg(Msg::OpenThread(id));
-                if focus {
-                    s.agent_focused = true;
+                if s.current_bot.as_ref() != Some(&id) {
+                    s.agent_focused = false;
                 }
+                s.current_bot = Some(id);
+                s.current_room = None;
             }
             Some(Row::Room(i)) => {
                 let id = s.config.rooms[*i].id.clone();
-                fx.msg(Msg::OpenRoom(id));
+                s.current_room = Some(id);
+                s.current_bot = None;
+                s.agent_focused = false;
+            }
+            None => {
+                s.current_bot = None;
+                s.current_room = None;
+                s.agent_focused = false;
+            }
+        }
+    }
+
+    /// Move the cursor to a room (after creating one).
+    pub fn select_room(&mut self, s: &mut Shared, room_id: &str) {
+        if let Some(idx) = s.config.rooms.iter().position(|r| r.id == room_id) {
+            self.nav.selected = s.config.bots.len() + idx;
+        }
+        self.sync(s);
+    }
+
+    /// Step into the selection: wake a bird and hand it the keyboard, or open
+    /// the room composer (via the shell, which owns the room component).
+    fn confirm(&mut self, s: &mut Shared, fx: &mut Effects) {
+        self.sync(s);
+        match rows(&s.config).get(self.nav.selected) {
+            Some(Row::Bot(_)) => {
+                if let Some(id) = s.current_bot.clone() {
+                    let prompt = s.opening_prompt(&id);
+                    s.boot_bot(&id, prompt.as_deref());
+                    s.agent_focused = true;
+                }
+            }
+            Some(Row::Room(_)) => {
+                if let Some(id) = s.current_room.clone() {
+                    fx.msg(Msg::OpenRoom(id));
+                }
             }
             None => {}
         }
@@ -93,35 +147,37 @@ impl Roster {
 }
 
 impl Component for Roster {
-    fn keymap(&self) -> &'static [Binding] {
-        KEYMAP
-    }
-
     fn update(&mut self, a: Action, s: &mut Shared, fx: &mut Effects) {
         let len = rows(&s.config).len();
         if self.nav.handle(a, len, Wrap::Clamp) {
+            self.sync(s);
             return;
         }
         match a {
-            Action::Confirm => self.open_selected(s, fx, false),
-            Action::FocusAgent => self.open_selected(s, fx, true),
+            Action::Confirm | Action::FocusAgent => self.confirm(s, fx),
             Action::StopBot => {
                 if let Some(Row::Bot(i)) = rows(&s.config).get(self.nav.selected) {
                     let bot = &s.config.bots[*i];
                     let (id, name) = (bot.id.clone(), bot.name.clone());
                     s.agents.stop(&id);
+                    s.agent_focused = false;
                     fx.flash(format!("{name} stopped — its session resumes by name"));
                 }
             }
+            Action::FreshStart => {
+                if let Some(Row::Bot(i)) = rows(&s.config).get(self.nav.selected) {
+                    let id = s.config.bots[*i].id.clone();
+                    s.fresh_bot(&id);
+                    s.agent_focused = true;
+                }
+            }
             Action::Handoff => {
-                let preselect = match rows(&s.config).get(self.nav.selected) {
-                    Some(Row::Bot(i)) => Some(s.config.bots[*i].id.clone()),
-                    _ => None,
-                };
-                fx.msg(Msg::Compose {
-                    source: None,
-                    preselect,
-                });
+                if let Some(Row::Bot(i)) = rows(&s.config).get(self.nav.selected) {
+                    fx.msg(Msg::Compose {
+                        source: Some(s.config.bots[*i].id.clone()),
+                        preselect: None,
+                    });
+                }
             }
             Action::Reload => self.reload_branches(s, fx),
             _ => {}
@@ -129,7 +185,7 @@ impl Component for Roster {
     }
 
     fn on_enter(&mut self, s: &mut Shared, fx: &mut Effects) {
-        self.nav.clamp(rows(&s.config).len());
+        self.sync(s);
         self.reload_branches(s, fx);
     }
 
@@ -142,7 +198,6 @@ impl Component for Roster {
 
     fn on_result(&mut self, r: &CommandResult, s: &mut Shared) {
         let CommandResult::Branches { gen, info } = r;
-        // Clone is fine: a handful of short strings, every 15 seconds.
         s.branches.accept(
             *gen,
             info.iter()
@@ -158,23 +213,34 @@ impl Component for Roster {
     fn handle_mouse(&mut self, m: MouseEvent, s: &mut Shared, fx: &mut Effects) {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if hits(self.new_bot_rect, m.column, m.row) {
+                    fx.msg(Msg::OpenNewBot);
+                    return;
+                }
+                if hits(self.new_room_rect, m.column, m.row) {
+                    fx.msg(Msg::OpenNewRoom);
+                    return;
+                }
                 if let Some((_, idx)) = self
                     .row_rects
                     .iter()
                     .find(|(r, _)| hits(*r, m.column, m.row))
                 {
                     if self.nav.selected == *idx {
-                        self.open_selected(s, fx, false); // second click opens
+                        self.confirm(s, fx); // second click steps in
                     } else {
                         self.nav.selected = *idx;
+                        self.sync(s);
                     }
                 }
             }
             MouseEventKind::ScrollDown => {
                 self.nav.handle(Action::Down, rows(&s.config).len(), Wrap::Clamp);
+                self.sync(s);
             }
             MouseEventKind::ScrollUp => {
                 self.nav.handle(Action::Up, rows(&s.config).len(), Wrap::Clamp);
+                self.sync(s);
             }
             _ => {}
         }
@@ -185,10 +251,17 @@ impl Component for Roster {
         let all = rows(&s.config);
         self.nav.clamp(all.len());
 
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(DIM));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let name_w = inner.width.saturating_sub(8) as usize;
         let mut lines: Vec<Line> = vec![Line::from("")];
         let mut line_rows: Vec<Option<usize>> = vec![None];
 
-        lines.push(Line::from(muted("  BIRDS")));
+        lines.push(Line::from(muted(" BIRDS")));
         line_rows.push(None);
 
         for (idx, row) in all.iter().enumerate() {
@@ -200,100 +273,102 @@ impl Component for Roster {
                     let status = s.agents.status(&bot.id);
                     let colour = bird_color(*i);
 
-                    let mut spans = vec![
-                        Span::styled(format!("  {marker} "), Style::default().fg(ACCENT)),
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" {marker} "), Style::default().fg(ACCENT)),
                         Span::raw(format!("{} ", bot.glyph)),
                         Span::styled(
-                            format!("{:<10}", bot.name),
+                            format!("{:<9}", truncate(&bot.name, 9)),
                             if selected {
                                 Style::default().fg(colour).add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default().fg(colour)
                             },
                         ),
-                        muted(format!("{:<12}", repo_tail(&bot.repo))),
                         status_span(status),
-                    ];
-                    if let Some(info) = s
-                        .branches
-                        .data
-                        .as_ref()
-                        .and_then(|v| v.iter().find(|b| b.bot == bot.id))
-                    {
-                        spans.push(dim(format!(
-                            "   ⎇ {}{}",
-                            info.branch,
-                            if info.dirty { " ●" } else { "" }
-                        )));
-                    }
-                    lines.push(Line::from(spans));
+                    ]));
                     line_rows.push(Some(idx));
 
-                    // The activity line: the last thing aviary asked of it.
-                    let detail = s
+                    // Preview line: collaboration tag first (who it's working
+                    // WITH), then what aviary last asked of it, else its branch.
+                    let collab = s.agents.collab(&bot.id).map(|c| c.tag());
+                    let tag_w = collab.as_ref().map_or(0, |t| t.chars().count() + 1);
+                    let preview = s
                         .agents
                         .get(&bot.id)
                         .and_then(|sess| sess.last_prompt.clone())
-                        .map(|p| truncate(&p, area.width.saturating_sub(16) as usize));
-                    if let Some(d) = detail {
-                        lines.push(Line::from(dim(format!("        “{d}”"))));
+                        .map(|p| format!("“{}”", truncate(&p, name_w.saturating_sub(tag_w))))
+                        .or_else(|| {
+                            s.branches.data.as_ref().and_then(|v| {
+                                v.iter().find(|b| b.bot == bot.id).map(|b| {
+                                    format!(
+                                        "⎇ {}{}",
+                                        truncate(&b.branch, name_w.saturating_sub(4 + tag_w)),
+                                        if b.dirty { " ●" } else { "" }
+                                    )
+                                })
+                            })
+                        });
+                    if collab.is_some() || preview.is_some() {
+                        let mut spans = vec![Span::raw("      ")];
+                        if let Some(tag) = collab {
+                            spans.push(Span::styled(
+                                format!("{tag} "),
+                                Style::default().fg(crate::ui::WARN),
+                            ));
+                        }
+                        if let Some(p) = preview {
+                            spans.push(dim(p));
+                        }
+                        lines.push(Line::from(spans));
                         line_rows.push(Some(idx));
                     }
                 }
                 Row::Room(i) => {
-                    // Section header before the first room.
                     if *i == 0 {
                         lines.push(Line::from(""));
                         line_rows.push(None);
-                        lines.push(Line::from(muted("  ROOMS")));
+                        lines.push(Line::from(muted(" ROOMS")));
                         line_rows.push(None);
                     }
                     let room = &s.config.rooms[*i];
-                    let members: Vec<String> =
-                        room.members.iter().map(|m| format!("@{m}")).collect();
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {marker} "), Style::default().fg(ACCENT)),
+                        Span::styled(format!(" {marker} "), Style::default().fg(ACCENT)),
                         Span::styled(
-                            format!("# {:<12}", room.name),
+                            format!("# {:<10}", truncate(&room.name, 10)),
                             if selected {
                                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default().fg(MUTED)
                             },
                         ),
-                        dim(members.join(" · ")),
+                        dim(format!("{}", room.members.len())),
                     ]));
+                    line_rows.push(Some(idx));
+                    let members: Vec<String> =
+                        room.members.iter().map(|m| format!("@{m}")).collect();
+                    lines.push(Line::from(dim(format!(
+                        "      {}",
+                        truncate(&members.join(" "), name_w)
+                    ))));
                     line_rows.push(Some(idx));
                 }
             }
         }
 
         if s.config.bots.is_empty() {
-            lines.push(Line::from(dim("  no birds yet — n adds one")));
+            lines.push(Line::from(dim(" no birds — n adds one")));
             line_rows.push(None);
         }
-        lines.push(Line::from(""));
-        line_rows.push(None);
-        lines.push(Line::from(dim(
-            "  each bird is a claude session living in its own repo, with its own",
-        )));
-        line_rows.push(None);
-        lines.push(Line::from(dim(
-            "  context and character — they hand work to each other by name",
-        )));
-        line_rows.push(None);
 
-        // Record hit rects line-by-line (the list never scrolls in v1: a
-        // roster outgrowing a terminal means too many birds, not a scrollbar).
         for (offset, maybe_idx) in line_rows.iter().enumerate() {
             if let Some(idx) = maybe_idx {
-                let y = area.y + offset as u16;
-                if y < area.y + area.height {
+                let y = inner.y + offset as u16;
+                if y + 1 < inner.y + inner.height {
                     self.row_rects.push((
                         Rect {
-                            x: area.x,
+                            x: inner.x,
                             y,
-                            width: area.width,
+                            width: inner.width,
                             height: 1,
                         },
                         *idx,
@@ -302,16 +377,44 @@ impl Component for Roster {
             }
         }
 
-        frame.render_widget(Paragraph::new(lines), area);
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        // Footer buttons, pinned to the sidebar's bottom line.
+        let footer_y = inner.y + inner.height.saturating_sub(1);
+        let bot_label = " + bird ";
+        let room_label = " + room ";
+        self.new_bot_rect = Rect {
+            x: inner.x + 1,
+            y: footer_y,
+            width: bot_label.chars().count() as u16,
+            height: 1,
+        };
+        self.new_room_rect = Rect {
+            x: self.new_bot_rect.x + self.new_bot_rect.width + 2,
+            y: footer_y,
+            width: room_label.chars().count() as u16,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(bot_label, Style::default().fg(ACCENT)),
+                Span::raw("  "),
+                Span::styled(room_label, Style::default().fg(ACCENT)),
+                dim("  n · c"),
+            ])),
+            Rect {
+                x: inner.x,
+                y: footer_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
     }
 }
 
-fn repo_tail(repo: &str) -> String {
-    repo.rsplit('/').next().unwrap_or(repo).to_string()
-}
-
 fn truncate(s: &str, max: usize) -> String {
-    let max = max.max(8);
+    let max = max.max(4);
     if s.chars().count() <= max {
         s.to_string()
     } else {

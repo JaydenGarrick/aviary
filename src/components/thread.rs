@@ -1,6 +1,6 @@
-//! The thread — one bird, full screen. The pane IS the conversation: a real
-//! Claude Code session on a PTY, so it behaves exactly as it would in its own
-//! terminal window.
+//! The content pane for a bird: its Claude Code session, full height, beside
+//! the sidebar. Draw + mouse only — all bird ACTIONS (wake, stop, fresh,
+//! handoff) belong to the sidebar, which owns the selection.
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -8,9 +8,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::action::{Action, Effects, Msg};
+use crate::action::{Action, Effects};
 use crate::components::{hits, Component};
-use crate::keymap::{bind, ch, key, Binding, KeyCode};
 use crate::shared::Shared;
 use crate::ui::{bird_color, dim, muted, status_span, ACCENT};
 use crate::widgets::agent_pane;
@@ -20,66 +19,21 @@ pub struct Thread {
     pane: Rect,
 }
 
-static KEYMAP: &[Binding] = &[
-    bind(ch('a'), Action::FocusAgent, Some("talk"), "give the bird the keyboard"),
-    bind(
-        ch('@'),
-        Action::Handoff,
-        Some("handoff"),
-        "hand work to a teammate (this bird packages the context)",
-    ),
-    bind(ch('x'), Action::StopBot, None, "stop this bird's session"),
-    bind(ch('q'), Action::Back, Some("roster"), "back to the roster"),
-    bind(
-        key(KeyCode::Enter),
-        Action::FocusAgent,
-        None,
-        "give the bird the keyboard",
-    ),
-];
-
 impl Component for Thread {
-    fn keymap(&self) -> &'static [Binding] {
-        KEYMAP
-    }
-
-    fn update(&mut self, a: Action, s: &mut Shared, fx: &mut Effects) {
-        match a {
-            Action::FocusAgent => {
-                let Some(id) = s.current_bot.clone() else { return };
-                // A dead or never-started session relaunches on focus.
-                let prompt = s.opening_prompt(&id);
-                s.boot_bot(&id, prompt.as_deref());
-                s.agent_focused = true;
-            }
-            Action::StopBot => {
-                if let Some(id) = s.current_bot.clone() {
-                    s.agents.stop(&id);
-                    s.agent_focused = false;
-                    fx.flash("stopped — a or ⏎ starts it again, resuming its conversation");
-                }
-            }
-            Action::Handoff => {
-                fx.msg(Msg::Compose {
-                    source: s.current_bot.clone(),
-                    preselect: None,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    fn on_enter(&mut self, s: &mut Shared, _fx: &mut Effects) {
-        let Some(id) = s.current_bot.clone() else { return };
-        let prompt = s.opening_prompt(&id);
-        s.boot_bot(&id, prompt.as_deref());
-    }
+    // The sidebar owns the keys; this pane is display + mouse only.
+    fn update(&mut self, _a: Action, _s: &mut Shared, _fx: &mut Effects) {}
 
     fn handle_mouse(&mut self, m: MouseEvent, s: &mut Shared, _fx: &mut Effects) {
         let over_pane = hits(self.pane, m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) if over_pane => {
-                s.agent_focused = true;
+                // Clicking the pane wakes the bird and hands it the keyboard,
+                // exactly like ⏎ on the sidebar.
+                if let Some(id) = s.current_bot.clone() {
+                    let prompt = s.opening_prompt(&id);
+                    s.boot_bot(&id, prompt.as_deref());
+                    s.agent_focused = true;
+                }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if over_pane => {
                 let delta = if m.kind == MouseEventKind::ScrollUp { 3 } else { -3 };
@@ -141,7 +95,7 @@ impl Component for Thread {
             Line::from(""),
             Line::from(vec![
                 muted("  press "),
-                Span::styled("a", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled("⏎", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                 muted(format!(" to wake {} — it lives in {}", bot.name, bot.repo)),
             ]),
             Line::from(""),
@@ -149,9 +103,9 @@ impl Component for Thread {
                 "  its session is named {} and resumes with its full memory;",
                 id.session_name()
             ))),
-            Line::from(dim(
-                "  teammates reach it by that name with SendMessage",
-            )),
+            Line::from(dim("  teammates reach it by that name with SendMessage")),
+            Line::from(""),
+            Line::from(dim("  N starts a brand-new conversation instead")),
         ];
 
         let focused = s.agent_focused;

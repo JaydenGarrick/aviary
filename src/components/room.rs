@@ -12,9 +12,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::action::{Action, Effects};
-use crate::components::Component;
+use crate::agent_store::Collab;
+use crate::components::{hits, Component};
 use crate::config::BotId;
-use crate::keymap::{bind, ch, key, Binding, KeyCode};
 use crate::room::{self, Entry, USER_AUTHOR};
 use crate::shared::Shared;
 use crate::ui::{bird_color, dim, status_span, wrap, ACCENT, DIM, MUTED};
@@ -25,23 +25,17 @@ pub struct RoomView {
     /// Lines up from the bottom; 0 = follow new messages.
     scroll_up: usize,
     composing: Option<String>,
+    /// The composer/hint line — clickable to start writing.
+    footer: Rect,
 }
 
-static KEYMAP: &[Binding] = &[
-    bind(
-        key(KeyCode::Enter),
-        Action::Compose,
-        Some("message"),
-        "write to the room",
-    ),
-    bind(ch('i'), Action::Compose, None, "write to the room"),
-    bind(ch('u'), Action::PageUp, Some("scroll"), "scroll up"),
-    bind(ch('d'), Action::PageDown, None, "scroll down"),
-    bind(ch('G'), Action::Bottom, None, "follow the newest message"),
-    bind(ch('q'), Action::Back, Some("roster"), "back to the roster"),
-];
-
 impl RoomView {
+    /// The sidebar's ⏎ on a room lands here: open the composer.
+    pub fn start_compose(&mut self) {
+        self.composing = Some(String::new());
+        self.scroll_up = 0;
+    }
+
     fn reload(&mut self, s: &Shared) {
         if let Some(room) = s.current_room.as_deref().and_then(|id| s.config.room(id)) {
             self.entries = room::read(&room.transcript_path(&s.config.dir));
@@ -70,6 +64,7 @@ impl RoomView {
         for target in targets {
             let prompt = room::notify_prompt(&room, USER_AUTHOR, &s.config.dir);
             s.boot_bot(&target, Some(&prompt));
+            s.agents.set_collab(&target, Collab::Room(room.id.clone()));
         }
         fx.flash(match count {
             0 => "sent — no birds to wake".to_string(),
@@ -82,10 +77,6 @@ impl RoomView {
 }
 
 impl Component for RoomView {
-    fn keymap(&self) -> &'static [Binding] {
-        KEYMAP
-    }
-
     fn capturing(&self) -> bool {
         self.composing.is_some()
     }
@@ -111,10 +102,9 @@ impl Component for RoomView {
 
     fn update(&mut self, a: Action, s: &mut Shared, _fx: &mut Effects) {
         match a {
-            Action::Compose => self.composing = Some(String::new()),
+            Action::Compose => self.start_compose(),
             Action::PageUp => self.scroll_up = self.scroll_up.saturating_add(8),
             Action::PageDown => self.scroll_up = self.scroll_up.saturating_sub(8),
-            Action::Bottom => self.scroll_up = 0,
             Action::Reload => self.reload(s),
             _ => {}
         }
@@ -134,6 +124,11 @@ impl Component for RoomView {
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_up = self.scroll_up.saturating_add(3),
             MouseEventKind::ScrollDown => self.scroll_up = self.scroll_up.saturating_sub(3),
+            MouseEventKind::Down(_)
+                if hits(self.footer, m.column, m.row) && self.composing.is_none() =>
+            {
+                self.start_compose();
+            }
             _ => {}
         }
     }
@@ -228,6 +223,12 @@ impl Component for RoomView {
         );
 
         let footer_y = area.y + area.height.saturating_sub(1);
+        self.footer = Rect {
+            x: area.x,
+            y: footer_y,
+            width: area.width,
+            height: 1,
+        };
         let footer = match &self.composing {
             Some(buf) => Line::from(vec![
                 Span::styled(" > ", Style::default().fg(ACCENT)),
@@ -238,7 +239,7 @@ impl Component for RoomView {
                 dim("   ⏎ send · esc cancel · @name wakes just that bird"),
             ]),
             None => {
-                let mut spans = vec![dim(" ⏎ message the room")];
+                let mut spans = vec![dim(" ⏎ or click here to message the room")];
                 if self.scroll_up > 0 {
                     spans.push(Span::styled(
                         format!("   ↓ {} below — G follows", self.scroll_up),

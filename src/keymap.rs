@@ -158,10 +158,11 @@ use Action as A;
 pub static GLOBAL: &[Binding] = &[
     bind(ch('q'), A::Quit, None, "quit aviary (birds keep flying — sessions resume by name)"),
     bind(ch('?'), A::Help, Some("keys"), "help overlay"),
-    bind(ch('n'), A::NewBot, None, "add a bird (new repo bot)"),
-    bind(ch('g'), A::NewRoom, None, "create a room (group chat)"),
+    bind(ch('n'), A::NewBot, None, "hatch a bird (new repo bot)"),
+    // `c`, not `g` — the sidebar's g (jump to top) would shadow it.
+    bind(ch('c'), A::NewRoom, None, "create a room (group chat)"),
     bind(ch('r'), A::Reload, None, "reload config + repo state"),
-    bind(key(KeyCode::Esc), A::Back, None, "back to the roster"),
+    bind(key(KeyCode::Esc), A::Back, None, "hand the keyboard back to the sidebar"),
 ];
 
 #[cfg(test)]

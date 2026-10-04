@@ -26,6 +26,8 @@ pub enum Action {
     // -- thread / agent
     FocusAgent,
     StopBot,
+    /// Abandon the bird's conversation and hatch a brand-new session.
+    FreshStart,
     // -- scrolling panes
     PageUp,
     PageDown,
@@ -35,9 +37,11 @@ pub enum Action {
 
 /// Cross-component notifications, fanned out by the shell.
 pub enum Msg {
-    /// Switch screens. The shell swaps the active component and calls `on_enter`.
-    OpenThread(BotId),
+    /// Point the content pane at a room and open its composer.
     OpenRoom(String),
+    /// Open the new-bird / new-room forms (the sidebar's footer buttons).
+    OpenNewBot,
+    OpenNewRoom,
     /// Open the compose overlay. With a `source`, that bird packages a handoff;
     /// without one the text goes straight to the target.
     Compose {

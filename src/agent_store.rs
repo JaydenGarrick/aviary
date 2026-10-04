@@ -23,6 +23,11 @@ pub struct AgentSession {
     /// Launched via `--resume`: if it dies within seconds, the named session
     /// is gone and the next launch must be fresh.
     resumed: bool,
+    /// Fresh spawn not yet recorded in state — recorded only once the session
+    /// SURVIVES [`MARK_AFTER`]. Marking at launch time was a trap: a spawn
+    /// that crashed on boot left state claiming a session that never existed,
+    /// and every later launch fell into claude's resume picker.
+    fresh_unmarked: bool,
     exit_handled: bool,
 }
 
@@ -40,10 +45,39 @@ pub enum BotStatus {
 const WORKING_WINDOW: Duration = Duration::from_secs(5);
 /// A resumed session dying this fast means "no such session" — fall back fresh.
 const RESUME_FAIL_WINDOW: Duration = Duration::from_secs(4);
+/// A fresh session must live this long before it counts as resumable.
+const MARK_AFTER: Duration = Duration::from_secs(10);
+/// A collaboration tag older than this is stale and stops showing.
+const COLLAB_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Who a bird is working WITH right now, as far as aviary brokered it.
+/// (Bird-initiated SendMessages inside the sessions are invisible here —
+/// no tag means "independent, as far as we know".)
+#[derive(Clone)]
+pub enum Collab {
+    /// Sent a handoff to a teammate.
+    Delegating(String),
+    /// Received a handoff from a teammate.
+    Receiving(String),
+    /// Working a room thread.
+    Room(String),
+}
+
+impl Collab {
+    /// Sidebar tag: `↗ @raven` · `↘ @swift` · `⇄ #fly-calc`.
+    pub fn tag(&self) -> String {
+        match self {
+            Collab::Delegating(who) => format!("↗ @{who}"),
+            Collab::Receiving(who) => format!("↘ @{who}"),
+            Collab::Room(room) => format!("⇄ #{room}"),
+        }
+    }
+}
 
 pub struct AgentStore {
     sessions: HashMap<BotId, AgentSession>,
     last_output: HashMap<BotId, Instant>,
+    collab: HashMap<BotId, (Collab, Instant)>,
     state: State,
 }
 
@@ -52,8 +86,26 @@ impl AgentStore {
         AgentStore {
             sessions: HashMap::new(),
             last_output: HashMap::new(),
+            collab: HashMap::new(),
             state: State::load(&cfg.dir),
         }
+    }
+
+    pub fn set_collab(&mut self, id: &BotId, c: Collab) {
+        self.collab.insert(id.clone(), (c, Instant::now()));
+    }
+
+    /// The user taking over (typing, direct messages) makes a bird
+    /// independent again.
+    pub fn clear_collab(&mut self, id: &BotId) {
+        self.collab.remove(id);
+    }
+
+    pub fn collab(&self, id: &BotId) -> Option<&Collab> {
+        self.collab
+            .get(id)
+            .filter(|(_, since)| since.elapsed() < COLLAB_TTL)
+            .map(|(c, _)| c)
     }
 
     pub fn get(&self, id: &BotId) -> Option<&AgentSession> {
@@ -132,13 +184,44 @@ impl AgentStore {
                 last_prompt: prompt.map(str::to_string),
                 spawned_at: Instant::now(),
                 resumed: resume,
+                fresh_unmarked: !resume,
                 exit_handled: false,
             },
         );
-        if !resume {
-            self.state.mark_spawned(&cfg.dir, &bot.id);
-        }
         Ok(())
+    }
+
+    /// Deliberately abandon the current conversation: stop the session, forget
+    /// the resume record, and hatch a brand-new one.
+    pub fn fresh_start(
+        &mut self,
+        cfg: &Config,
+        bot: &Bot,
+        prompt: Option<&str>,
+        tx: &Sender<Event>,
+    ) -> Result<()> {
+        self.sessions.remove(&bot.id);
+        self.state.forget(&cfg.dir, &bot.id);
+        self.launch(cfg, bot, prompt, tx, false)
+    }
+
+    /// Once a second: a fresh session that has survived [`MARK_AFTER`] becomes
+    /// the bot's resumable session of record.
+    pub fn tick(&mut self, cfg: &Config) {
+        let ripe: Vec<BotId> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.fresh_unmarked && s.term.is_running() && s.spawned_at.elapsed() >= MARK_AFTER
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ripe {
+            self.state.mark_spawned(&cfg.dir, &id);
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.fresh_unmarked = false;
+            }
+        }
     }
 
     /// Note PTY activity (from `Event::AgentOutput`). Returns a relaunch
@@ -177,6 +260,7 @@ impl AgentStore {
     /// Dropping the master closes the PTY, which hangs up the child.
     pub fn stop(&mut self, id: &BotId) {
         self.sessions.remove(id);
+        self.collab.remove(id);
     }
 }
 

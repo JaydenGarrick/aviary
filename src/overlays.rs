@@ -1,13 +1,17 @@
 //! Modal forms, owned by the shell. While one is open it captures every key
 //! (layer 4); submitting hands a typed result back for the shell to apply.
+//! Fully mouse-operable: click a field to focus it, a chip/member to pick it,
+//! the hint line to submit, anywhere outside the popup to cancel.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
+use crate::components::hits;
 use crate::config::{Bot, BotId};
 use crate::shared::Shared;
 use crate::ui::{bird_color, centered, dim, muted, wrap, ACCENT, BAD, DIM};
@@ -69,7 +73,9 @@ fn field_line(label: &str, value: &str, active: bool, hint: &str) -> Line<'stati
     ])
 }
 
-fn popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
+/// Render the popup and return its rect, so forms can map click targets to the
+/// line positions inside it (inner lines start at rect.y + 1).
+fn popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) -> Rect {
     let height = (lines.len() as u16 + 2).min(area.height);
     let rect = centered(66, height, area);
     frame.render_widget(Clear, rect);
@@ -85,6 +91,20 @@ fn popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) 
         ),
         rect,
     );
+    rect
+}
+
+fn line_rect(popup: Rect, index: usize) -> Rect {
+    let y = popup.y + 1 + index as u16;
+    if y >= popup.y + popup.height.saturating_sub(1) {
+        return Rect::default();
+    }
+    Rect {
+        x: popup.x + 1,
+        y,
+        width: popup.width.saturating_sub(2),
+        height: 1,
+    }
 }
 
 fn error_lines(error: &Option<String>) -> Vec<Line<'static>> {
@@ -101,6 +121,20 @@ fn error_lines(error: &Option<String>) -> Vec<Line<'static>> {
     out
 }
 
+/// Left click only; anything outside the popup cancels.
+fn click(m: &MouseEvent, popup: Rect) -> Option<(u16, u16)> {
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if hits(popup, m.column, m.row) {
+                Some((m.column, m.row))
+            } else {
+                None
+            }
+        }
+        _ => Some((u16::MAX, u16::MAX)), // wheel/drag: consumed, no target
+    }
+}
+
 // -------------------------------------------------------------------- add bot
 
 pub struct AddBotForm {
@@ -109,6 +143,9 @@ pub struct AddBotForm {
     repo: String,
     glyph: String,
     pub error: Option<String>,
+    popup: Rect,
+    field_rects: [Rect; 3],
+    submit: Rect,
 }
 
 impl AddBotForm {
@@ -119,6 +156,26 @@ impl AddBotForm {
             repo: String::new(),
             glyph: GLYPHS[existing % GLYPHS.len()].to_string(),
             error: None,
+            popup: Rect::default(),
+            field_rects: [Rect::default(); 3],
+            submit: Rect::default(),
+        }
+    }
+
+    fn try_submit(&mut self) -> FormEvent {
+        if self.name.trim().is_empty() || self.repo.trim().is_empty() {
+            self.error = Some("a bird needs a name and a repo path".into());
+            FormEvent::Consumed
+        } else {
+            FormEvent::AddBot {
+                name: self.name.trim().to_string(),
+                glyph: if self.glyph.trim().is_empty() {
+                    GLYPHS[0].to_string()
+                } else {
+                    self.glyph.trim().to_string()
+                },
+                repo: self.repo.trim().to_string(),
+            }
         }
     }
 
@@ -143,27 +200,29 @@ impl AddBotForm {
                     _ => self.glyph.push(c),
                 }
             }
-            KeyCode::Enter => {
-                if self.name.trim().is_empty() || self.repo.trim().is_empty() {
-                    self.error = Some("a bird needs a name and a repo path".into());
-                } else {
-                    return FormEvent::AddBot {
-                        name: self.name.trim().to_string(),
-                        glyph: if self.glyph.trim().is_empty() {
-                            GLYPHS[0].to_string()
-                        } else {
-                            self.glyph.trim().to_string()
-                        },
-                        repo: self.repo.trim().to_string(),
-                    };
-                }
-            }
+            KeyCode::Enter => return self.try_submit(),
             _ => {}
         }
         FormEvent::Consumed
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        for (i, r) in self.field_rects.iter().enumerate() {
+            if hits(*r, x, y) {
+                self.field = i;
+                return FormEvent::Consumed;
+            }
+        }
+        if hits(self.submit, x, y) {
+            return self.try_submit();
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines = vec![
             Line::from(""),
             field_line("name", &self.name, self.field == 0, "what the bird is called"),
@@ -176,8 +235,17 @@ impl AddBotForm {
         ];
         lines.extend(error_lines(&self.error));
         lines.push(Line::from(""));
-        lines.push(Line::from(dim("  ⏎ hatch · ⇥ next field · esc cancel")));
-        popup(frame, area, "new bird", lines);
+        lines.push(Line::from(vec![
+            Span::styled("  ⏎ hatch", Style::default().fg(ACCENT)),
+            dim(" · ⇥ next field · esc cancel  (all clickable)"),
+        ]));
+        let submit_idx = lines.len() - 1;
+
+        self.popup = popup(frame, area, "new bird", lines);
+        for (i, slot) in self.field_rects.iter_mut().enumerate() {
+            *slot = line_rect(self.popup, i + 1);
+        }
+        self.submit = line_rect(self.popup, submit_idx);
     }
 }
 
@@ -191,6 +259,10 @@ pub struct NewRoomForm {
     chosen: Vec<bool>,
     bots: Vec<(BotId, String, String)>, // id, glyph, name
     pub error: Option<String>,
+    popup: Rect,
+    name_rect: Rect,
+    member_rects: Vec<Rect>,
+    submit: Rect,
 }
 
 impl NewRoomForm {
@@ -205,6 +277,10 @@ impl NewRoomForm {
                 .map(|b| (b.id.clone(), b.glyph.clone(), b.name.clone()))
                 .collect(),
             error: None,
+            popup: Rect::default(),
+            name_rect: Rect::default(),
+            member_rects: Vec::new(),
+            submit: Rect::default(),
         }
     }
 
@@ -217,20 +293,23 @@ impl NewRoomForm {
             .collect()
     }
 
+    fn try_submit(&mut self) -> FormEvent {
+        if self.name.trim().is_empty() {
+            self.error = Some("a room needs a name".into());
+            FormEvent::Consumed
+        } else {
+            FormEvent::NewRoom {
+                name: self.name.trim().to_string(),
+                members: self.members(),
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
         match k.code {
             KeyCode::Esc => return FormEvent::Cancel,
             KeyCode::Tab => self.field = 1 - self.field,
-            KeyCode::Enter => {
-                if self.name.trim().is_empty() {
-                    self.error = Some("a room needs a name".into());
-                } else {
-                    return FormEvent::NewRoom {
-                        name: self.name.trim().to_string(),
-                        members: self.members(),
-                    };
-                }
-            }
+            KeyCode::Enter => return self.try_submit(),
             KeyCode::Backspace if self.field == 0 => {
                 self.error = None;
                 self.name.pop();
@@ -256,7 +335,32 @@ impl NewRoomForm {
         FormEvent::Consumed
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if hits(self.name_rect, x, y) {
+            self.field = 0;
+            return FormEvent::Consumed;
+        }
+        for (i, r) in self.member_rects.clone().iter().enumerate() {
+            if hits(*r, x, y) {
+                self.field = 1;
+                self.cursor = i;
+                if let Some(c) = self.chosen.get_mut(i) {
+                    *c = !*c;
+                    self.error = None;
+                }
+                return FormEvent::Consumed;
+            }
+        }
+        if hits(self.submit, x, y) {
+            return self.try_submit();
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines = vec![
             Line::from(""),
             field_line("name", &self.name, self.field == 0, "what the room is about"),
@@ -268,12 +372,13 @@ impl NewRoomForm {
                 ),
                 muted("birds in the room"),
                 dim(if self.field == 1 {
-                    "   j/k move · space toggles"
+                    "   j/k move · space or click toggles"
                 } else {
-                    "   ⇥ to edit"
+                    "   ⇥ or click to edit"
                 }),
             ]),
         ];
+        let first_member_idx = lines.len();
         for (i, ((_, glyph, name), &on)) in self.bots.iter().zip(&self.chosen).enumerate() {
             let cursor = if self.field == 1 && i == self.cursor { "▸" } else { " " };
             let mark = if on { "◉" } else { "○" };
@@ -291,21 +396,34 @@ impl NewRoomForm {
         }
         lines.extend(error_lines(&self.error));
         lines.push(Line::from(""));
-        lines.push(Line::from(dim("  ⏎ create · ⇥ fields · esc cancel")));
-        popup(frame, area, "new room", lines);
+        lines.push(Line::from(vec![
+            Span::styled("  ⏎ create", Style::default().fg(ACCENT)),
+            dim(" · ⇥ fields · esc cancel  (all clickable)"),
+        ]));
+        let submit_idx = lines.len() - 1;
+
+        self.popup = popup(frame, area, "new room", lines);
+        self.name_rect = line_rect(self.popup, 1);
+        self.member_rects = (0..self.bots.len())
+            .map(|i| line_rect(self.popup, first_member_idx + i))
+            .collect();
+        self.submit = line_rect(self.popup, submit_idx);
     }
 }
 
 // -------------------------------------------------------------------- compose
 
-/// One composer, two modes. With a `source` bird (opened from its thread) the
-/// SOURCE packages the context and hands off; without one (roster) the text
-/// goes straight to the target.
+/// One composer, two modes. With a `source` bird (the sidebar's selection) the
+/// SOURCE packages the context and hands off; without one the text goes
+/// straight to the target.
 pub struct ComposeForm {
     pub source: Option<BotId>,
     targets: Vec<(BotId, String, String)>, // id, glyph, name
     target_idx: usize,
     text: String,
+    popup: Rect,
+    chip_rects: Vec<(Rect, usize)>,
+    submit: Rect,
 }
 
 impl ComposeForm {
@@ -328,7 +446,22 @@ impl ComposeForm {
             targets,
             target_idx,
             text: String::new(),
+            popup: Rect::default(),
+            chip_rects: Vec::new(),
+            submit: Rect::default(),
         })
+    }
+
+    fn try_submit(&mut self) -> FormEvent {
+        let text = self.text.trim().to_string();
+        if text.is_empty() {
+            return FormEvent::Consumed;
+        }
+        FormEvent::Compose {
+            source: self.source.clone(),
+            target: self.targets[self.target_idx].0.clone(),
+            text,
+        }
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
@@ -344,29 +477,40 @@ impl ComposeForm {
                 self.text.pop();
             }
             KeyCode::Char(c) => self.text.push(c),
-            KeyCode::Enter => {
-                let text = self.text.trim().to_string();
-                if !text.is_empty() {
-                    return FormEvent::Compose {
-                        source: self.source.clone(),
-                        target: self.targets[self.target_idx].0.clone(),
-                        text,
-                    };
-                }
-            }
+            KeyCode::Enter => return self.try_submit(),
             _ => {}
         }
         FormEvent::Consumed
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if let Some((_, idx)) = self.chip_rects.iter().find(|(r, _)| hits(*r, x, y)) {
+            self.target_idx = *idx;
+            return FormEvent::Consumed;
+        }
+        if hits(self.submit, x, y) {
+            return self.try_submit();
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let title = if self.source.is_some() { "handoff" } else { "message a bird" };
 
+        // Chips, measuring display width as we go so clicks land exactly.
         let mut chips: Vec<Span> = vec![muted(" to  ")];
+        let mut offsets: Vec<(u16, u16, usize)> = Vec::new(); // (x offset, width, idx)
+        let mut cursor = " to  ".width() as u16;
         for (i, (_, glyph, name)) in self.targets.iter().enumerate() {
+            let label = format!(" {glyph} {name} ");
+            let w = label.width() as u16;
+            offsets.push((cursor, w, i));
             let on = i == self.target_idx;
             chips.push(Span::styled(
-                format!(" {glyph} {name} "),
+                label,
                 if on {
                     Style::default()
                         .fg(ACCENT)
@@ -376,8 +520,9 @@ impl ComposeForm {
                 },
             ));
             chips.push(Span::raw(" "));
+            cursor += w + 1;
         }
-        chips.push(dim("  ◂ ▸ picks"));
+        chips.push(dim("  ◂ ▸ or click"));
 
         let mut lines = vec![Line::from(""), Line::from(chips), Line::from("")];
         let shown = tail(&self.text, 56);
@@ -402,8 +547,29 @@ impl ComposeForm {
             )));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(dim("  ⏎ send · ◂ ▸ target · esc cancel")));
-        popup(frame, area, title, lines);
+        lines.push(Line::from(vec![
+            Span::styled("  ⏎ send", Style::default().fg(ACCENT)),
+            dim(" · ◂ ▸ target · esc cancel  (all clickable)"),
+        ]));
+        let submit_idx = lines.len() - 1;
+
+        self.popup = popup(frame, area, title, lines);
+        let chip_line = line_rect(self.popup, 1);
+        self.chip_rects = offsets
+            .into_iter()
+            .map(|(dx, w, i)| {
+                (
+                    Rect {
+                        x: chip_line.x + dx,
+                        y: chip_line.y,
+                        width: w,
+                        height: 1,
+                    },
+                    i,
+                )
+            })
+            .collect();
+        self.submit = line_rect(self.popup, submit_idx);
     }
 }
 
