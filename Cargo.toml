@@ -1,0 +1,27 @@
+[package]
+name = "aviary"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "A roster of repo-resident Claude Code birds — each repo gets an agent with its own context, character, and the ability to hand work to its teammates."
+
+[[bin]]
+name = "aviary"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# Each bird is a full-screen Claude Code TUI, so it needs a real pseudo-terminal
+# (a pipe degrades it to dumb line output). vt100 parses the escape stream into
+# a cell grid; tui-term draws that grid as a ratatui widget.
+tui-term = "0.3.4"
+portable-pty = "0.9"
+vt100 = "0.16"
+
+[dev-dependencies]
+tempfile = "3"
