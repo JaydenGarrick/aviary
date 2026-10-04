@@ -60,16 +60,18 @@ pub fn read(path: &Path) -> Vec<Entry> {
         .unwrap_or_default()
 }
 
-/// Append one block in the same shape the personas teach the birds.
-pub fn append(path: &Path, author: &str, text: &str) -> Result<()> {
+/// Append one block in the same shape the personas teach the birds. Returns
+/// the header line written — the anchor delta-read notifications point at.
+pub fn append(path: &Path, author: &str, text: &str) -> Result<String> {
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
-    writeln!(f, "\n### @{author} — {}\n{}", local_now(), text.trim())?;
-    Ok(())
+    let header = format!("### @{author} — {}", local_now());
+    writeln!(f, "\n{header}\n{}", text.trim())?;
+    Ok(header)
 }
 
 /// `@word` tokens (letters, digits, dashes) anywhere in a message.
@@ -147,11 +149,12 @@ impl Watcher {
                 }
             };
             for e in entries.iter().skip(seen) {
+                let anchor = format!("### @{} — {}", e.author, e.when);
                 for target in dispatch_targets(room, &e.author, &e.body) {
                     out.push((
                         target,
                         room.id.clone(),
-                        notify_prompt(room, &e.author, &cfg.dir),
+                        notify_prompt(room, &e.author, &cfg.dir, &anchor),
                     ));
                 }
             }
@@ -167,9 +170,14 @@ impl Watcher {
 }
 
 /// What gets typed into a member bot's session when the room has news.
-pub fn notify_prompt(room: &Room, author: &str, dir: &Path) -> String {
+/// Delta-read by design: the anchor names the NEW entry so a bird that has
+/// been following along only re-reads what it hasn't seen — re-ingesting a
+/// growing transcript on every wake compounds context cost for nothing.
+pub fn notify_prompt(room: &Room, author: &str, dir: &Path, anchor: &str) -> String {
     format!(
-        "[#{room}] New message from @{author} in the room transcript {path}. Read it. \
+        "[#{room}] New message from @{author} in the room transcript {path}. Read it FROM \
+         the `{anchor}` entry onward — you have already seen everything above it. (If this \
+         room is new to you or your context was compacted, read the whole file instead.) \
          If you are addressed or have something material to add, APPEND your reply to that \
          file as a `### @<your-id> — <YYYY-MM-DD HH:MM>` block (never edit earlier content), \
          @-mentioning whoever should act next. If nothing is needed from you, do nothing.",
@@ -269,7 +277,8 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0].0, BotId("raven".into()));
         assert_eq!(dispatches[0].1, "nest");
-        assert!(dispatches[0].2.contains("@swift"));
+        // Delta-read: the prompt anchors at the NEW entry's header.
+        assert!(dispatches[0].2.contains("Read it FROM the `### @swift"));
         assert!(w.poll(&cfg).is_empty(), "no double dispatch");
     }
 

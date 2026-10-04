@@ -92,16 +92,19 @@ impl RoomView {
             return;
         };
         let path = room.transcript_path(&s.config.dir);
-        if let Err(e) = room::append(&path, USER_AUTHOR, &text) {
-            fx.flash(format!("could not write the room: {e:#}"));
-            return;
-        }
+        let anchor = match room::append(&path, USER_AUTHOR, &text) {
+            Ok(header) => header,
+            Err(e) => {
+                fx.flash(format!("could not write the room: {e:#}"));
+                return;
+            }
+        };
         s.watcher.note_local_append(&room.id);
 
         let targets = room::dispatch_targets(&room, USER_AUTHOR, &text);
         let count = targets.len();
         for target in targets {
-            let prompt = room::notify_prompt(&room, USER_AUTHOR, &s.config.dir);
+            let prompt = room::notify_prompt(&room, USER_AUTHOR, &s.config.dir, &anchor);
             s.boot_bot(&target, Some(&prompt));
             s.agents.set_collab(&target, Collab::Room(room.id.clone()));
         }
