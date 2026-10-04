@@ -40,11 +40,16 @@ pub fn dim(text: impl Into<String>) -> Span<'static> {
 }
 
 /// Status chip: shape AND colour, so the roster reads without colour too.
-/// "done" = the session finished responding and is waiting at its prompt.
+/// "done" = finished responding, waiting at its prompt; "needs you" = blocked
+/// on a permission prompt or question (from polls/hooks — the real signal).
 pub fn status_span(status: BotStatus) -> Span<'static> {
     match status {
         BotStatus::Working => Span::styled("● working", Style::default().fg(OK)),
-        BotStatus::Idle(secs) => Span::styled(
+        BotStatus::NeedsInput => Span::styled(
+            "⏸ needs you",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        ),
+        BotStatus::Done(secs) => Span::styled(
             format!("✔ done {}", human_duration(secs)),
             Style::default().fg(MUTED),
         ),

@@ -22,6 +22,7 @@ pub enum Overlay {
     AddBot(AddBotForm),
     NewRoom(NewRoomForm),
     Compose(ComposeForm),
+    Profile(ProfileView),
 }
 
 impl Overlay {
@@ -47,6 +48,11 @@ pub enum FormEvent {
         target: BotId,
         text: String,
     },
+    /// Profile actions — handled by the shell, overlay stays open.
+    ToggleNotify(BotId),
+    OpenPersona(BotId),
+    /// Profile shortcut for a fresh conversation (closes the overlay).
+    FreshStart(BotId),
 }
 
 const GLYPHS: [&str; 6] = ["🐦", "🦉", "🦅", "🪿", "🐧", "🦜"];
@@ -580,4 +586,141 @@ fn tail(s: &str, max: usize) -> String {
     }
     let kept: String = s.chars().skip(n - (max - 1)).collect();
     format!("…{kept}")
+}
+
+// --------------------------------------------------------------------- profile
+
+/// The bird's profile — Grok Bot's bot-profile screen, terminal-shaped:
+/// identity, session facts, routines, and the notifications toggle.
+pub struct ProfileView {
+    pub id: BotId,
+    popup: Rect,
+    notify_rect: Rect,
+    persona_rect: Rect,
+    fresh_rect: Rect,
+}
+
+impl ProfileView {
+    pub fn new(id: BotId) -> ProfileView {
+        ProfileView {
+            id,
+            popup: Rect::default(),
+            notify_rect: Rect::default(),
+            persona_rect: Rect::default(),
+            fresh_rect: Rect::default(),
+        }
+    }
+
+    pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => FormEvent::Cancel,
+            KeyCode::Char(' ') => FormEvent::ToggleNotify(self.id.clone()),
+            KeyCode::Char('e') => FormEvent::OpenPersona(self.id.clone()),
+            KeyCode::Char('N') => FormEvent::FreshStart(self.id.clone()),
+            _ => FormEvent::Consumed,
+        }
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if hits(self.notify_rect, x, y) {
+            return FormEvent::ToggleNotify(self.id.clone());
+        }
+        if hits(self.persona_rect, x, y) {
+            return FormEvent::OpenPersona(self.id.clone());
+        }
+        if hits(self.fresh_rect, x, y) {
+            return FormEvent::FreshStart(self.id.clone());
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
+        let Some(bot) = s.config.bot(&self.id) else { return };
+        let status = s.agents.status(&self.id);
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw(format!("  {} ", bot.glyph)),
+                Span::styled(
+                    bot.name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                dim("   "),
+                crate::ui::status_span(status),
+            ]),
+            Line::from(vec![muted("  repo      "), Span::raw(bot.repo.clone())]),
+            Line::from(vec![
+                muted("  session   "),
+                Span::raw(self.id.session_name()),
+                dim(if s.agents.has_session_record(&self.id) {
+                    "  (resumes with full memory)"
+                } else {
+                    "  (never flown)"
+                }),
+            ]),
+            Line::from(""),
+        ];
+
+        let notify_idx = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled(
+                if bot.notify { "  ◉ " } else { "  ○ " },
+                Style::default().fg(if bot.notify { ACCENT } else { DIM }),
+            ),
+            Span::raw("notifications"),
+            dim("  — banner when this bird finishes or needs input · space/click"),
+        ]));
+
+        let persona_idx = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled("  ✎ ", Style::default().fg(ACCENT)),
+            Span::raw("persona"),
+            muted(format!("  {}", bot.persona)),
+            dim("  · e/click opens"),
+        ]));
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(muted("  routines")));
+        if bot.routines.is_empty() {
+            lines.push(Line::from(dim(
+                "    none — add {id, schedule, prompt} under this bird in config.json",
+            )));
+            lines.push(Line::from(dim(
+                "    (daily@HH:MM · weekdays@HH:MM · every:<N>m|h; fires while aviary runs)",
+            )));
+        } else {
+            for r in &bot.routines {
+                let last = s
+                    .agents
+                    .routine_last_run(&self.id, &r.id)
+                    .map(|_| "has fired")
+                    .unwrap_or("never fired");
+                lines.push(Line::from(vec![
+                    Span::styled("    ⏱ ", Style::default().fg(ACCENT)),
+                    Span::raw(format!("{:<14}", r.id)),
+                    muted(format!("{:<16}", r.schedule)),
+                    dim(last),
+                ]));
+            }
+        }
+
+        lines.push(Line::from(""));
+        let fresh_idx = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled("  ↺ ", Style::default().fg(ACCENT)),
+            Span::raw("fresh conversation"),
+            dim("  — abandon this one and hatch anew · N/click"),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(dim("  esc closes")));
+
+        self.popup = popup(frame, area, &format!("{} {}", bot.glyph, bot.name), lines);
+        self.notify_rect = line_rect(self.popup, notify_idx);
+        self.persona_rect = line_rect(self.popup, persona_idx);
+        self.fresh_rect = line_rect(self.popup, fresh_idx);
+    }
 }

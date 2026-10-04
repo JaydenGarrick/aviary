@@ -17,11 +17,49 @@ use crate::widgets::agent_pane;
 #[derive(Default)]
 pub struct Thread {
     pane: Rect,
+    /// Recent handoff briefs involving the viewed bird (empty-state content).
+    feed: Vec<String>,
+    feed_for: Option<crate::config::BotId>,
+    ticks: u32,
+}
+
+impl Thread {
+    fn refresh_feed(&mut self, s: &Shared) {
+        let Some(id) = s.current_bot.clone() else {
+            self.feed.clear();
+            return;
+        };
+        let needle_from = format!("-{id}-to-");
+        let needle_to = format!("-to-{id}.md");
+        let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(s.config.handoffs_dir()) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.contains(&needle_from) || name.ends_with(&needle_to) {
+                    if let Ok(meta) = e.metadata() {
+                        if let Ok(mtime) = meta.modified() {
+                            found.push((mtime, name));
+                        }
+                    }
+                }
+            }
+        }
+        found.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+        self.feed = found.into_iter().take(3).map(|(_, n)| n).collect();
+        self.feed_for = Some(id);
+    }
 }
 
 impl Component for Thread {
     // The sidebar owns the keys; this pane is display + mouse only.
     fn update(&mut self, _a: Action, _s: &mut Shared, _fx: &mut Effects) {}
+
+    fn on_tick(&mut self, s: &mut Shared, _fx: &mut Effects) {
+        self.ticks += 1;
+        if self.feed_for != s.current_bot || self.ticks % 5 == 0 {
+            self.refresh_feed(s);
+        }
+    }
 
     fn handle_mouse(&mut self, m: MouseEvent, s: &mut Shared, _fx: &mut Effects) {
         let over_pane = hits(self.pane, m.column, m.row);
@@ -91,7 +129,7 @@ impl Component for Thread {
         }
         title.push_span(Span::raw(" "));
 
-        let empty = vec![
+        let mut empty = vec![
             Line::from(""),
             Line::from(vec![
                 muted("  press "),
@@ -105,8 +143,22 @@ impl Component for Thread {
             ))),
             Line::from(dim("  teammates reach it by that name with SendMessage")),
             Line::from(""),
-            Line::from(dim("  N starts a brand-new conversation instead")),
+            Line::from(dim("  N starts a brand-new conversation · p opens its profile")),
         ];
+        if !self.feed.is_empty() {
+            empty.push(Line::from(""));
+            empty.push(Line::from(muted("  recent handoffs")));
+            for name in &self.feed {
+                empty.push(Line::from(vec![
+                    Span::styled("    ⇄ ", Style::default().fg(ACCENT)),
+                    dim(name.clone()),
+                ]));
+            }
+            empty.push(Line::from(dim(format!(
+                "    (briefs live in {})",
+                s.config.handoffs_dir().display()
+            ))));
+        }
 
         let focused = s.agent_focused;
         agent_pane::draw(frame, area, title, s.agents.get_mut(&id), focused, empty);

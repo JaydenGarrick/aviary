@@ -2,14 +2,16 @@
 //! changes that another cares about lives here, not in a component.
 
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::agent_store::AgentStore;
 use crate::command::{BranchInfo, Slot};
 use crate::config::{BotId, Config};
 use crate::event::Event;
+use crate::events::EventsReader;
 use crate::prompts;
 use crate::room;
+use crate::routine::LocalTime;
 
 pub struct Shared {
     pub config: Config,
@@ -17,6 +19,10 @@ pub struct Shared {
     pub watcher: room::Watcher,
     /// Branch + dirty per bot repo — loaded off-thread, shown on the roster.
     pub branches: Slot<Vec<BranchInfo>>,
+    /// In-flight/gen guard for `claude agents --json` polling.
+    pub agents_poll: Slot<()>,
+    /// Offset-tracked reader of the hook events file.
+    pub events: EventsReader,
     /// The thread screen's bot / the room screen's room.
     pub current_bot: Option<BotId>,
     pub current_room: Option<String>,
@@ -25,6 +31,8 @@ pub struct Shared {
     /// Transient status line in the chrome.
     pub flash: Option<(Instant, String)>,
     pub tx: Sender<Event>,
+    clock: LocalTime,
+    clock_at: Instant,
 }
 
 impl Shared {
@@ -35,12 +43,25 @@ impl Shared {
             agents,
             watcher: room::Watcher::default(),
             branches: Slot::default(),
+            agents_poll: Slot::default(),
+            events: EventsReader::default(),
             current_bot: None,
             current_room: None,
             agent_focused: false,
             flash: None,
             tx,
+            clock: LocalTime::detect(),
+            clock_at: Instant::now(),
         }
+    }
+
+    /// Local-time view for routine scheduling, re-detected hourly (DST).
+    pub fn local_clock(&mut self) -> LocalTime {
+        if self.clock_at.elapsed() > Duration::from_secs(3600) {
+            self.clock = LocalTime::detect();
+            self.clock_at = Instant::now();
+        }
+        self.clock
     }
 
     pub fn flash(&mut self, text: impl Into<String>) {

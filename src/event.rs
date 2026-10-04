@@ -23,6 +23,8 @@ pub enum Event {
     AgentOutput(BotId),
     /// A background command finished (see [`crate::command`]).
     Done(Box<CommandResult>),
+    /// An authenticated inbound webhook (see [`crate::http`]).
+    Webhook(Box<crate::http::Webhook>),
     /// Once a second — drives room watching, status chips, and elapsed timers.
     Tick,
 }

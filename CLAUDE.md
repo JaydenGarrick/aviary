@@ -15,7 +15,11 @@ architecture throughout — read this map before touching the shell.
 | `keymap.rs` | binding tables — dispatch, the hints bar, and the help overlay all generate from them. Never hand-write a hint string. |
 | `command.rs` | `Executor` (thread-per-command) + `Slot<T>` for async results with stale-gen dropping. |
 | `room.rs` / `prompts.rs` | pure logic: transcript parse/append/dispatch, and the exact text typed into birds. Both unit-tested — change the tests with the wording. |
-| `overlays.rs` | modal forms (new bird, new room, compose), shell-owned. |
+| `overlays.rs` | modal forms (new bird, new room, compose, bird profile), shell-owned. |
+| `events.rs` | the hook pipeline: birds run `aviary --hook` on Stop/Notification (per-session via `--settings`); events land in events.jsonl, read offset-tracked each tick. |
+| `routine.rs` | schedule grammar + due-math (pure, tested); the shell fires due routines every 30s. |
+| `http.rs` | inbound webhooks (POST /bird/<id> · /room/<id>, bearer-gated, localhost, off unless configured). |
+| `doctor.rs` | `aviary doctor` — environment ✓/✗ screen. |
 
 ## Hard rules
 
@@ -36,6 +40,13 @@ architecture throughout — read this map before touching the shell.
   VARIADIC claude flags — each must be followed by another flag or it swallows
   the positional prompt as another value. `launch_args()` owns the order and
   a unit test guards it; never append args after the prompt or reorder it.
+- **Status precedence is layered and ordered:** fresh PTY output (<2s) →
+  Working; recent poll/hook observation (<15s) → its kind; else the
+  output-recency heuristic. `map_status_str` maps unknown poll strings to Done
+  — never invent urgency from an unrecognized state.
+- **Default files materialize on every startup** (`materialize_defaults`),
+  per-file and never overwriting — new shipped personas/templates reach
+  existing installs. Only `scaffold()` (first run) writes config.json.
 
 ## Verify
 

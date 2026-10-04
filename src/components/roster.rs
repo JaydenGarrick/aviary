@@ -75,6 +75,12 @@ pub static KEYMAP: &[Binding] = &[
         None,
         "abandon the bird's conversation and hatch a fresh one",
     ),
+    bind(
+        ch('p'),
+        Action::Profile,
+        None,
+        "bird profile: persona, routines, notifications",
+    ),
 ];
 
 impl Roster {
@@ -88,6 +94,8 @@ impl Roster {
                 if s.current_bot.as_ref() != Some(&id) {
                     s.agent_focused = false;
                 }
+                // Looking at a bird reads its news.
+                s.agents.clear_unread(&id);
                 s.current_bot = Some(id);
                 s.current_room = None;
             }
@@ -179,6 +187,11 @@ impl Component for Roster {
                     });
                 }
             }
+            Action::Profile => {
+                if let Some(Row::Bot(i)) = rows(&s.config).get(self.nav.selected) {
+                    fx.msg(Msg::OpenProfile(s.config.bots[*i].id.clone()));
+                }
+            }
             Action::Reload => self.reload_branches(s, fx),
             _ => {}
         }
@@ -197,7 +210,9 @@ impl Component for Roster {
     }
 
     fn on_result(&mut self, r: &CommandResult, s: &mut Shared) {
-        let CommandResult::Branches { gen, info } = r;
+        let CommandResult::Branches { gen, info } = r else {
+            return;
+        };
         s.branches.accept(
             *gen,
             info.iter()
@@ -273,7 +288,7 @@ impl Component for Roster {
                     let status = s.agents.status(&bot.id);
                     let colour = bird_color(*i);
 
-                    lines.push(Line::from(vec![
+                    let mut row_spans = vec![
                         Span::styled(format!(" {marker} "), Style::default().fg(ACCENT)),
                         Span::raw(format!("{} ", bot.glyph)),
                         Span::styled(
@@ -285,7 +300,13 @@ impl Component for Roster {
                             },
                         ),
                         status_span(status),
-                    ]));
+                    ];
+                    if s.agents.is_unread(&bot.id) {
+                        // The Grok-Bot unread dot: something happened here
+                        // since you last looked.
+                        row_spans.push(Span::styled(" ●", Style::default().fg(ACCENT)));
+                    }
+                    lines.push(Line::from(row_spans));
                     line_rows.push(Some(idx));
 
                     // Preview line: collaboration tag first (who it's working

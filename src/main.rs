@@ -11,12 +11,16 @@ mod app;
 mod command;
 mod components;
 mod config;
+mod doctor;
 mod event;
+mod events;
+mod http;
 mod keymap;
 mod overlays;
 mod prompts;
 mod pty;
 mod room;
+mod routine;
 mod shared;
 mod ui;
 mod widgets;
@@ -24,6 +28,20 @@ mod widgets;
 use anyhow::Result;
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Hook mode: runs inside every bird's Stop/Notification hook. Fast, silent,
+    // and NEVER the TUI — it must not fight the session for the terminal.
+    if args.iter().any(|a| a == "--hook") {
+        let dir = config::default_dir()?;
+        let _ = events::append_from_stdin(&dir.join("events.jsonl"));
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "doctor" || a == "--doctor") {
+        return doctor::run();
+    }
+
     install_panic_hook();
     let terminal = ratatui::init();
     mouse_capture(true);

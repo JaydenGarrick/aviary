@@ -2,22 +2,31 @@
 //!
 //! Identity is the session NAME (`aviary-<id>`, via `--name`), which makes
 //! resume trivial (`--resume aviary-<id>`) and makes every bird a stable
-//! SendMessage target for its teammates. No jsonl bookkeeping — Claude Code
-//! owns session storage; aviary only remembers whether a bot has ever spawned.
+//! SendMessage target for its teammates.
+//!
+//! Status is layered, most-truthful-first:
+//!   1. PTY output in the last 2s → Working (streaming IS activity),
+//!   2. a fresh `claude agents --json` poll / hook event → busy · idle ·
+//!      needs_input (the state a PTY can never show: blocked on a prompt),
+//!   3. the output-recency heuristic as the fallback.
+//!
+//! Transitions feed unread dots and macOS notifications in the shell.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
+use crate::command::SessionInfo;
 use crate::config::{Bot, BotId, Config, State};
 use crate::event::Event;
 use crate::pty;
 
 pub struct AgentSession {
     pub term: pty::Terminal,
-    /// The last prompt aviary itself typed — the roster's activity line.
+    /// The last prompt aviary itself typed — the sidebar's activity line.
     pub last_prompt: Option<String>,
     pub spawned_at: Instant,
     /// Launched via `--resume`: if it dies within seconds, the named session
@@ -31,18 +40,68 @@ pub struct AgentSession {
     exit_handled: bool,
 }
 
+/// The coarse state machine a bird moves through (drives transitions).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusKind {
+    Working,
+    NeedsInput,
+    Done,
+}
+
+/// What the UI shows (Done carries its age).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BotStatus {
     NotStarted,
-    /// PTY output within the last few seconds.
     Working,
-    /// Running, quiet for `secs`.
-    Idle(u64),
+    /// Blocked on a permission prompt / question — the state worth a banner.
+    NeedsInput,
+    /// Finished responding, waiting at its prompt for `secs`.
+    Done(u64),
     Exited,
 }
 
-/// How recent output must be to count as "working" on the roster.
+/// A status change worth reacting to (unread dot, notification).
+pub struct Transition {
+    pub id: BotId,
+    pub from: StatusKind,
+    pub to: StatusKind,
+}
+
+/// Map `claude agents --json` status strings; unknown strings read as Done
+/// (quiet) rather than inventing urgency.
+pub fn map_status_str(s: &str) -> StatusKind {
+    let s = s.to_ascii_lowercase();
+    if s == "busy" || s.contains("working") || s.contains("running") {
+        StatusKind::Working
+    } else if s.contains("input") || s.contains("waiting") || s.contains("blocked") {
+        StatusKind::NeedsInput
+    } else {
+        StatusKind::Done
+    }
+}
+
+/// Hook events → status kinds. `Stop` = finished; Notification subtypes that
+/// mean "a human must act" → NeedsInput; `idle_prompt` just means quiet.
+pub fn map_hook_event(event_name: &str, detail: &str) -> Option<StatusKind> {
+    match event_name {
+        "Stop" => Some(StatusKind::Done),
+        "Notification" => {
+            if detail.contains("idle") {
+                Some(StatusKind::Done)
+            } else {
+                Some(StatusKind::NeedsInput)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// How recent output must be to count as "working" with no poll data.
 const WORKING_WINDOW: Duration = Duration::from_secs(5);
+/// Output this fresh overrides a (laggy) poll — streaming IS working.
+const OUTPUT_OVERRIDE: Duration = Duration::from_secs(2);
+/// How long a poll/hook observation stays authoritative.
+const POLL_TRUST: Duration = Duration::from_secs(15);
 /// A resumed session dying this fast means "no such session" — fall back fresh.
 const RESUME_FAIL_WINDOW: Duration = Duration::from_secs(4);
 /// A fresh session must live this long before it counts as resumable.
@@ -51,8 +110,6 @@ const MARK_AFTER: Duration = Duration::from_secs(10);
 const COLLAB_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Who a bird is working WITH right now, as far as aviary brokered it.
-/// (Bird-initiated SendMessages inside the sessions are invisible here —
-/// no tag means "independent, as far as we know".)
 #[derive(Clone)]
 pub enum Collab {
     /// Sent a handoff to a teammate.
@@ -77,6 +134,11 @@ impl Collab {
 pub struct AgentStore {
     sessions: HashMap<BotId, AgentSession>,
     last_output: HashMap<BotId, Instant>,
+    /// Latest poll/hook observation per bot.
+    observed: HashMap<BotId, (StatusKind, Instant)>,
+    /// When the observed kind last CHANGED (Done age on the chip).
+    kind_since: HashMap<BotId, (StatusKind, Instant)>,
+    unread: HashMap<BotId, bool>,
     collab: HashMap<BotId, (Collab, Instant)>,
     state: State,
 }
@@ -86,6 +148,9 @@ impl AgentStore {
         AgentStore {
             sessions: HashMap::new(),
             last_output: HashMap::new(),
+            observed: HashMap::new(),
+            kind_since: HashMap::new(),
+            unread: HashMap::new(),
             collab: HashMap::new(),
             state: State::load(&cfg.dir),
         }
@@ -108,6 +173,22 @@ impl AgentStore {
             .map(|(c, _)| c)
     }
 
+    // ------------------------------------------------------------- unread
+
+    pub fn mark_unread(&mut self, id: &BotId) {
+        self.unread.insert(id.clone(), true);
+    }
+
+    pub fn clear_unread(&mut self, id: &BotId) {
+        self.unread.remove(id);
+    }
+
+    pub fn is_unread(&self, id: &BotId) -> bool {
+        self.unread.get(id).copied().unwrap_or(false)
+    }
+
+    // -------------------------------------------------------------- status
+
     pub fn get(&self, id: &BotId) -> Option<&AgentSession> {
         self.sessions.get(id)
     }
@@ -125,8 +206,109 @@ impl AgentStore {
         self.state.spawned_once(id)
     }
 
+    pub fn routine_last_run(&self, bot: &BotId, routine_id: &str) -> Option<u64> {
+        self.state.routine_last_run(bot, routine_id)
+    }
+
+    pub fn mark_routine_run(&mut self, cfg: &Config, bot: &BotId, routine_id: &str, epoch: u64) {
+        self.state.mark_routine_run(&cfg.dir, bot, routine_id, epoch);
+    }
+
+    pub fn status(&self, id: &BotId) -> BotStatus {
+        let Some(session) = self.sessions.get(id) else {
+            return BotStatus::NotStarted;
+        };
+        if !session.term.is_running() {
+            return BotStatus::Exited;
+        }
+        let output_age = self.last_output.get(id).map(|t| t.elapsed());
+        // Streaming overrides everything — a laggy poll can say "idle" while
+        // tokens are visibly arriving.
+        if output_age.is_some_and(|a| a < OUTPUT_OVERRIDE) {
+            return BotStatus::Working;
+        }
+        if let Some((kind, at)) = self.observed.get(id) {
+            if at.elapsed() < POLL_TRUST {
+                return match kind {
+                    StatusKind::Working => BotStatus::Working,
+                    StatusKind::NeedsInput => BotStatus::NeedsInput,
+                    StatusKind::Done => BotStatus::Done(self.kind_age(id)),
+                };
+            }
+        }
+        // Fallback heuristic: recent output = working, else done-for-a-while.
+        match output_age {
+            Some(a) if a < WORKING_WINDOW => BotStatus::Working,
+            Some(a) => BotStatus::Done(a.as_secs()),
+            None => BotStatus::Working, // just spawned, first paint pending
+        }
+    }
+
+    fn kind_age(&self, id: &BotId) -> u64 {
+        self.kind_since
+            .get(id)
+            .map(|(_, t)| t.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Record an observation; returns the transition if the kind changed.
+    fn observe(&mut self, id: &BotId, kind: StatusKind) -> Option<Transition> {
+        self.observed.insert(id.clone(), (kind, Instant::now()));
+        match self.kind_since.get(id) {
+            Some((prev, _)) if *prev == kind => None,
+            prev => {
+                let from = prev.map(|(k, _)| *k).unwrap_or(StatusKind::Working);
+                self.kind_since.insert(id.clone(), (kind, Instant::now()));
+                Some(Transition {
+                    id: id.clone(),
+                    from,
+                    to: kind,
+                })
+            }
+        }
+    }
+
+    /// Fold one `claude agents --json` poll in; returns status transitions.
+    pub fn apply_poll(&mut self, cfg: &Config, sessions: &[SessionInfo]) -> Vec<Transition> {
+        let mut out = Vec::new();
+        for bot in &cfg.bots {
+            // Only track birds whose PTY we actually hold — a user's own
+            // session that happens to share a name is not ours to badge.
+            if !self.sessions.get(&bot.id).is_some_and(|s| s.term.is_running()) {
+                continue;
+            }
+            let name = bot.id.session_name();
+            if let Some(info) = sessions.iter().find(|s| s.name == name) {
+                let kind = map_status_str(&info.status);
+                if let Some(t) = self.observe(&bot.id, kind) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// Fold one hook event in (cwd attributes it to a bird's repo).
+    pub fn apply_hook(
+        &mut self,
+        cfg: &Config,
+        cwd: &str,
+        event_name: &str,
+        detail: &str,
+    ) -> Option<Transition> {
+        let kind = map_hook_event(event_name, detail)?;
+        let cwd = Path::new(cwd);
+        let bot = cfg.bots.iter().find(|b| b.repo_path() == cwd)?;
+        if !self.sessions.get(&bot.id).is_some_and(|s| s.term.is_running()) {
+            return None;
+        }
+        self.observe(&bot.id.clone(), kind)
+    }
+
+    // ------------------------------------------------------------ lifecycle
+
     /// Make sure the bot has a LIVE session, spawning or resuming as needed.
-    /// `prompt`: typed in after launch (or into the running session).
+    /// `prompt`: rides argv on a launch, typed into a running session.
     pub fn ensure_running(
         &mut self,
         cfg: &Config,
@@ -145,7 +327,8 @@ impl AgentStore {
             }
             self.sessions.remove(&bot.id); // exited — replace it
         }
-        self.launch(cfg, bot, prompt, tx, self.state.spawned_once(&bot.id))
+        let resume = self.state.spawned_once(&bot.id);
+        self.launch(cfg, bot, prompt, tx, resume)
     }
 
     fn launch(
@@ -165,11 +348,13 @@ impl AgentStore {
                 cfg.dir.join("config.json").display()
             );
         }
-        let persona = bot.persona_path(&cfg.dir);
 
+        let persona = bot.persona_path(&cfg.dir);
+        let settings = cfg.settings_file_for(bot)?;
         let args = launch_args(
             bot.id.session_name(),
             &persona,
+            &settings,
             &cfg.dir,
             &cfg.mcp_config_path(),
             prompt,
@@ -188,6 +373,8 @@ impl AgentStore {
                 exit_handled: false,
             },
         );
+        self.kind_since
+            .insert(bot.id.clone(), (StatusKind::Working, Instant::now()));
         Ok(())
     }
 
@@ -201,6 +388,7 @@ impl AgentStore {
         tx: &Sender<Event>,
     ) -> Result<()> {
         self.sessions.remove(&bot.id);
+        self.collab.remove(&bot.id);
         self.state.forget(&cfg.dir, &bot.id);
         self.launch(cfg, bot, prompt, tx, false)
     }
@@ -245,22 +433,11 @@ impl AgentStore {
         RelaunchHint::No
     }
 
-    pub fn status(&self, id: &BotId) -> BotStatus {
-        match self.sessions.get(id) {
-            None => BotStatus::NotStarted,
-            Some(s) if !s.term.is_running() => BotStatus::Exited,
-            Some(_) => match self.last_output.get(id) {
-                Some(t) if t.elapsed() < WORKING_WINDOW => BotStatus::Working,
-                Some(t) => BotStatus::Idle(t.elapsed().as_secs()),
-                None => BotStatus::Working, // just spawned, first paint pending
-            },
-        }
-    }
-
     /// Dropping the master closes the PTY, which hangs up the child.
     pub fn stop(&mut self, id: &BotId) {
         self.sessions.remove(id);
         self.collab.remove(id);
+        self.observed.remove(id);
     }
 }
 
@@ -275,11 +452,12 @@ pub enum RelaunchHint {
 /// `--add-dir` are VARIADIC in the claude CLI and consume values until the
 /// next flag — unterminated, they swallow the positional prompt as another
 /// config path ("MCP config file not found: <repo>/<prompt text>"). Each is
-/// therefore followed by another flag, and the prompt only ever follows the
-/// single-value `--append-system-prompt-file`.
+/// therefore followed by another flag, and the positional prompt only ever
+/// follows a single-value flag.
 fn launch_args(
     session: String,
     persona: &std::path::Path,
+    settings: &std::path::Path,
     cfg_dir: &std::path::Path,
     mcp: &std::path::Path,
     prompt: Option<&str>,
@@ -298,6 +476,10 @@ fn launch_args(
         // first-class instead of out-of-scope.
         "--add-dir".into(),
         cfg_dir.display().to_string(),
+        // Per-session Stop/Notification hooks (+ optional permission allows) —
+        // the source of truthful "done / needs input" signals.
+        "--settings".into(),
+        settings.display().to_string(),
         "--append-system-prompt-file".into(),
         persona.display().to_string(),
     ]);
@@ -311,8 +493,32 @@ fn launch_args(
 
 #[cfg(test)]
 mod tests {
-    use super::launch_args;
+    use super::*;
     use std::path::Path;
+
+    #[test]
+    fn status_strings_map_conservatively() {
+        assert_eq!(map_status_str("busy"), StatusKind::Working);
+        assert_eq!(map_status_str("idle"), StatusKind::Done);
+        assert_eq!(map_status_str("needs_input"), StatusKind::NeedsInput);
+        assert_eq!(map_status_str("waiting_for_input"), StatusKind::NeedsInput);
+        // Unknown future value: quiet, never a false alarm.
+        assert_eq!(map_status_str("compacting"), StatusKind::Done);
+    }
+
+    #[test]
+    fn hook_events_map() {
+        assert_eq!(map_hook_event("Stop", ""), Some(StatusKind::Done));
+        assert_eq!(
+            map_hook_event("Notification", "permission_prompt"),
+            Some(StatusKind::NeedsInput)
+        );
+        assert_eq!(
+            map_hook_event("Notification", "idle_prompt"),
+            Some(StatusKind::Done)
+        );
+        assert_eq!(map_hook_event("PreToolUse", "x"), None);
+    }
 
     /// The regression this guards: a variadic flag directly before the
     /// positional prompt eats it ("MCP config file not found: …<prompt>").
@@ -321,13 +527,13 @@ mod tests {
         let args = launch_args(
             "aviary-swift".into(),
             Path::new("/cfg/birds/swift.md"),
+            Path::new("/cfg/settings/swift.json"),
             Path::new("/cfg"),
             Path::new("/cfg/mcp.json"),
             Some("You've just been perched."),
             false,
         );
         assert_eq!(args.last().map(String::as_str), Some("You've just been perched."));
-        // Every variadic flag's values are terminated by another flag.
         for variadic in ["--mcp-config", "--add-dir"] {
             let i = args.iter().position(|a| a == variadic).unwrap();
             assert!(
@@ -335,10 +541,11 @@ mod tests {
                 "{variadic} must be followed by exactly one value then a flag"
             );
         }
-        // The prompt sits right after the single-value persona flag's value.
         let i = args.iter().position(|a| a == "--append-system-prompt-file").unwrap();
         assert_eq!(args[i + 1], "/cfg/birds/swift.md");
         assert_eq!(i + 2, args.len() - 1);
+        let s = args.iter().position(|a| a == "--settings").unwrap();
+        assert_eq!(args[s + 1], "/cfg/settings/swift.json");
     }
 
     #[test]
@@ -346,6 +553,7 @@ mod tests {
         let args = launch_args(
             "aviary-raven".into(),
             Path::new("/cfg/birds/raven.md"),
+            Path::new("/cfg/settings/raven.json"),
             Path::new("/cfg"),
             Path::new("/cfg/mcp.json"),
             None,
@@ -353,7 +561,6 @@ mod tests {
         );
         assert_eq!(args[0], "--resume");
         assert_eq!(args[1], "aviary-raven");
-        // No prompt: the single-value persona flag's value ends the argv.
         assert_eq!(args.last().map(String::as_str), Some("/cfg/birds/raven.md"));
     }
 }

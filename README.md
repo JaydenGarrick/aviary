@@ -22,12 +22,21 @@ the roster that spawns, names, displays, and connects them.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-The sidebar tells you what every bird is doing at a glance:
-`● working` (output in the last 5s) · `✔ done 3m` (finished, waiting) ·
-`○ not started` · `✗ exited` — plus a **collaboration tag** when aviary
-brokered it: `↗ @raven` (handed work off), `↘ @swift` (received a handoff),
-`⇄ #room` (working a room thread). No tag = working independently; the tag
-clears when you take the keyboard yourself.
+The sidebar tells you what every bird is doing at a glance — and the signals
+are REAL, not guessed: each bird's session runs Stop/Notification hooks (wired
+per-session via `--settings`) and aviary reconciles against
+`claude agents --json` every 3s:
+
+- `● working` · `✔ done 3m` (finished, waiting) · **`⏸ needs you`** (blocked on
+  a permission prompt or question — the state a terminal can't show you) ·
+  `○ not started` · `✗ exited`
+- an accent `●` unread dot when a bird finished or got blocked while you were
+  looking elsewhere (clears when you select it)
+- a macOS banner when a bird **finishes or needs input** (per-bird toggle in
+  its profile, `p`)
+- a **collaboration tag**: `↗ @raven` (handed work off), `↘ @swift` (received a
+  handoff), `⇄ #room` (room work). No tag = flying solo; clears when you take
+  the keyboard.
 
 ## Why
 
@@ -83,17 +92,37 @@ Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 | `ctrl+a` / `esc` | hand the keyboard back to the sidebar |
 | `@` | handoff: the selected bird packages its context for a teammate |
 | `n` / `c` (or the `+ bird` / `+ room` buttons) | hatch a bird / create a room |
+| `p` | bird profile: persona, routines, notifications toggle, fresh start |
 | `N` | abandon the bird's conversation and start a fresh one |
 | `x` | stop a session (it resumes by name later) |
-| `i` / `u` / `d` | write / scroll the room |
+| `i` / `u` / `d` / `1-5` | write / scroll the room / pick a quick-reply |
 | `?` | help, generated from the real keymaps |
 
 Mouse: click rows to select (again to step in), click chips/fields/members in
 any form, click outside a popup to dismiss it, wheel scrolls everything —
 including the bird's own transcript inside its pane.
 
+## Doctor, routines, webhooks
+
+- **`aviary doctor`** — one screen of ✓/✗: claude version, repos, config, MCP
+  hooks, the events pipeline, plus the mimus 🪞 (mockingbird parity oracle)
+  config snippet. Run it whenever something feels off.
+- **Routines** — per-bird scheduled prompts in `config.json`
+  (`{"id":"standup","schedule":"weekdays@09:00","prompt":"…"}`; grammar:
+  `daily@HH:MM` · `weekdays@HH:MM` · `every:<N>m|h`). Fire while aviary runs,
+  into the bird's own session; listed in its profile (`p`).
+- **Webhooks** — add `"webhook": {"port": 4242, "token": "…"}` to config.json
+  and external events wake birds:
+  `curl -H "Authorization: Bearer …" -d "CI red on main" \
+  localhost:4242/bird/raven` (also `/room/<id>` — the message dispatches to
+  members like any outside author).
+- **Permissions** — set a bird's `"permissions": "permissions/readonly.json"`
+  to pre-allow read-only tools and cut prompt noise (template scaffolded).
+
 ## Layout
 
 Everything stateful lives outside this repo, in `~/.config/aviary/`:
-`config.json` (bots + rooms) · `birds/*.md` (personas) · `mcp.json` (hooks) ·
-`rooms/*.md` (transcripts) · `handoffs/` (briefs) · `state.json`.
+`config.json` (bots + rooms + webhook) · `birds/*.md` (personas) · `mcp.json`
+(MCP hooks) · `settings/*.json` (per-bird hook settings, regenerated at
+launch) · `events.jsonl` (hook events) · `rooms/*.md` (transcripts) ·
+`handoffs/` (briefs) · `permissions/` (allowlists) · `state.json`.

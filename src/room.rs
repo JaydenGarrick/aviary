@@ -102,18 +102,19 @@ pub fn mentions(text: &str) -> Vec<String> {
     out
 }
 
-/// Who a new message should wake. User messages with no mentions reach the
-/// whole room; a bot must @-mention to pass the floor. The author never
+/// Who a new message should wake. OUTSIDE authors (the user, a webhook) with
+/// no mentions reach the whole room; a member bot must @-mention to pass the
+/// floor — that asymmetry is what bounds bot chatter. The author never
 /// notifies itself.
 pub fn dispatch_targets(room: &Room, author: &str, text: &str) -> Vec<BotId> {
     let named = mentions(text);
-    let author_is_user = author == USER_AUTHOR;
+    let author_is_outsider = !room.members.iter().any(|m| m.0 == author);
     room.members
         .iter()
         .filter(|m| m.0 != author)
         .filter(|m| {
             if named.is_empty() {
-                author_is_user
+                author_is_outsider
             } else {
                 named.contains(&m.0)
             }
@@ -232,6 +233,9 @@ mod tests {
     fn user_without_mentions_reaches_everyone() {
         let room = room_with(&["swift", "raven", "weaver"]);
         let t = dispatch_targets(&room, USER_AUTHOR, "morning birds");
+        assert_eq!(t.len(), 3);
+        // Any outside author (a webhook) gets the same reach.
+        let t = dispatch_targets(&room, "webhook", "CI is red");
         assert_eq!(t.len(), 3);
     }
 

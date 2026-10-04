@@ -36,6 +36,19 @@ impl BotId {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// A scheduled prompt for one bird. Grammar: `daily@HH:MM`, `weekdays@HH:MM`,
+/// `every:<N>m|h` — parsed in `routine.rs`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Routine {
+    pub id: String,
+    pub schedule: String,
+    pub prompt: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Bot {
     pub id: BotId,
@@ -45,6 +58,15 @@ pub struct Bot {
     pub repo: String,
     /// Persona file, relative to the config dir (or absolute).
     pub persona: String,
+    /// macOS banners when this bird finishes or needs input.
+    #[serde(default = "default_true")]
+    pub notify: bool,
+    /// Optional permission-allowlist settings JSON (relative to the config
+    /// dir), merged into the bird's per-session `--settings` file.
+    #[serde(default)]
+    pub permissions: Option<String>,
+    #[serde(default)]
+    pub routines: Vec<Routine>,
 }
 
 impl Bot {
@@ -75,18 +97,28 @@ impl Room {
     }
 }
 
+/// Inbound webhooks (`POST /bird/<id>` · `/room/<id>`) — absent = off.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    pub port: u16,
+    pub token: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     bots: Vec<Bot>,
     #[serde(default)]
     rooms: Vec<Room>,
+    #[serde(default)]
+    webhook: Option<WebhookConfig>,
 }
 
 pub struct Config {
     pub dir: PathBuf,
     pub bots: Vec<Bot>,
     pub rooms: Vec<Room>,
+    pub webhook: Option<WebhookConfig>,
 }
 
 /// Where the config lives: `AVIARY_CONFIG_DIR`, else `~/.config/aviary`.
@@ -109,8 +141,11 @@ fn expand_tilde(s: &str) -> PathBuf {
 
 impl Config {
     /// Load the config, scaffolding the whole directory on first run.
+    /// Existing installs still get newly-shipped default files (personas,
+    /// templates) materialized — per-file, never overwriting edits.
     pub fn load_or_scaffold(dir: PathBuf) -> Result<Config> {
         let config_path = dir.join("config.json");
+        materialize_defaults(&dir)?;
         if !config_path.is_file() {
             scaffold(&dir)?;
         }
@@ -130,6 +165,7 @@ impl Config {
             dir,
             bots: raw.bots,
             rooms: raw.rooms,
+            webhook: raw.webhook,
         })
     }
 
@@ -153,10 +189,63 @@ impl Config {
         let raw = RawConfig {
             bots: self.bots.clone(),
             rooms: self.rooms.clone(),
+            webhook: self.webhook.clone(),
         };
         let json = serde_json::to_string_pretty(&raw)?;
         std::fs::write(self.dir.join("config.json"), json + "\n")?;
         Ok(())
+    }
+
+    /// Flip a bird's notification toggle and persist it.
+    pub fn set_notify(&mut self, id: &BotId, on: bool) -> Result<()> {
+        if let Some(bot) = self.bots.iter_mut().find(|b| &b.id == id) {
+            bot.notify = on;
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// The per-session `--settings` file for one bird: Stop + Notification
+    /// hooks (the truthful done/needs-input signals, probed working via
+    /// `--settings`), merged with the bird's optional permission allowlist.
+    /// Regenerated every launch — the hook command embeds the current exe.
+    pub fn settings_file_for(&self, bot: &Bot) -> Result<PathBuf> {
+        let dir = self.dir.join("settings");
+        std::fs::create_dir_all(&dir)?;
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "aviary".into());
+        let hook = serde_json::json!([{ "hooks": [{
+            "type": "command",
+            "command": format!("\"{exe}\" --hook"),
+        }]}]);
+        let mut root = serde_json::json!({
+            "hooks": { "Stop": hook.clone(), "Notification": hook }
+        });
+
+        if let Some(rel) = &bot.permissions {
+            let p = expand_tilde(rel);
+            let path = if p.is_absolute() { p } else { self.dir.join(p) };
+            let extra: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&path)
+                    .with_context(|| format!("cannot read {}", path.display()))?,
+            )
+            .with_context(|| format!("{} is not valid JSON", path.display()))?;
+            if let (Some(root_map), Some(extra_map)) = (root.as_object_mut(), extra.as_object()) {
+                for (k, v) in extra_map {
+                    root_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        let path = dir.join(format!("{}.json", bot.id));
+        std::fs::write(&path, serde_json::to_string_pretty(&root)? + "\n")?;
+        Ok(path)
+    }
+
+    /// Where `aviary --hook` appends events and the shell reads them.
+    pub fn events_path(&self) -> PathBuf {
+        self.dir.join("events.jsonl")
     }
 
     /// Add a bot: validate, materialize a persona from the template, persist.
@@ -185,13 +274,13 @@ impl Config {
             std::fs::write(&persona_abs, body)?;
         }
 
-        self.bots.push(Bot {
-            id: bot_id.clone(),
-            name: name.to_string(),
-            glyph: glyph.to_string(),
-            repo: repo.to_string(),
-            persona: persona_rel,
-        });
+        self.bots.push(make_bot(
+            bot_id.clone(),
+            name,
+            glyph,
+            repo,
+            &persona_rel,
+        ));
         self.save()?;
         Ok(bot_id)
     }
@@ -248,9 +337,23 @@ fn slug(s: &str) -> String {
 
 const PERSONA_TEMPLATE: &str = include_str!("../assets/birds/template.md");
 
-/// First run: create the directory tree, the three default Blackbird birds,
-/// and the MCP hooks file. Idempotent — only missing files are written.
-fn scaffold(dir: &Path) -> Result<()> {
+fn make_bot(id: BotId, name: &str, glyph: &str, repo: &str, persona: &str) -> Bot {
+    Bot {
+        id,
+        name: name.to_string(),
+        glyph: glyph.to_string(),
+        repo: repo.to_string(),
+        persona: persona.to_string(),
+        notify: true,
+        permissions: None,
+        routines: Vec::new(),
+    }
+}
+
+/// Directory tree + every shipped default file, written only when missing —
+/// safe to run on every startup, so upgrades deliver new personas/templates
+/// without ever overwriting a user's edits.
+fn materialize_defaults(dir: &Path) -> Result<()> {
     for sub in ["birds", "rooms", "handoffs"] {
         std::fs::create_dir_all(dir.join(sub))
             .with_context(|| format!("cannot create {}", dir.join(sub).display()))?;
@@ -260,11 +363,29 @@ fn scaffold(dir: &Path) -> Result<()> {
         ("swift.md", include_str!("../assets/birds/swift.md")),
         ("weaver.md", include_str!("../assets/birds/weaver.md")),
         ("raven.md", include_str!("../assets/birds/raven.md")),
+        ("mimus.md", include_str!("../assets/birds/mimus.md")),
     ] {
         let path = dir.join("birds").join(name);
         if !path.is_file() {
             std::fs::write(&path, body)?;
         }
+    }
+
+    // Opt-in read-only permission allowlist a bot can reference via its
+    // `permissions` field (served to claude through `--settings`).
+    let perms_dir = dir.join("permissions");
+    std::fs::create_dir_all(&perms_dir)?;
+    let readonly = perms_dir.join("readonly.json");
+    if !readonly.is_file() {
+        std::fs::write(
+            &readonly,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "permissions": { "allow": [
+                    "Read", "Grep", "Glob",
+                    "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)"
+                ]}
+            }))? + "\n",
+        )?;
     }
 
     // The Linear + Figma hooks: every bird spawns with `--mcp-config` pointing
@@ -283,31 +404,37 @@ fn scaffold(dir: &Path) -> Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+/// First run only: the default Blackbird flock.
+fn scaffold(dir: &Path) -> Result<()> {
     let default_config = RawConfig {
         bots: vec![
-            Bot {
-                id: BotId("swift".into()),
-                name: "Swift".into(),
-                glyph: "🪶".into(),
-                repo: "~/Library/Develop/iOS/ios".into(),
-                persona: "birds/swift.md".into(),
-            },
-            Bot {
-                id: BotId("weaver".into()),
-                name: "Weaver".into(),
-                glyph: "🧺".into(),
-                repo: "~/Library/Develop/iOS/android".into(),
-                persona: "birds/weaver.md".into(),
-            },
-            Bot {
-                id: BotId("raven".into()),
-                name: "Raven".into(),
-                glyph: "🐦‍⬛".into(),
-                repo: "~/Library/Develop/Backend/core-api".into(),
-                persona: "birds/raven.md".into(),
-            },
+            make_bot(
+                BotId("swift".into()),
+                "Swift",
+                "🪶",
+                "~/Library/Develop/iOS/ios",
+                "birds/swift.md",
+            ),
+            make_bot(
+                BotId("weaver".into()),
+                "Weaver",
+                "🧺",
+                "~/Library/Develop/iOS/android",
+                "birds/weaver.md",
+            ),
+            make_bot(
+                BotId("raven".into()),
+                "Raven",
+                "🐦‍⬛",
+                "~/Library/Develop/Backend/core-api",
+                "birds/raven.md",
+            ),
         ],
         rooms: Vec::new(),
+        webhook: None,
     };
     std::fs::write(
         dir.join("config.json"),
@@ -318,11 +445,15 @@ fn scaffold(dir: &Path) -> Result<()> {
 
 // --------------------------------------------------------------------- state
 
-/// Which bots have ever had a session — decides `--resume` vs a fresh spawn.
+/// Which bots have ever had a session — decides `--resume` vs a fresh spawn —
+/// plus when each routine last fired.
 #[derive(Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     spawned: BTreeSet<String>,
+    /// `"<bot>/<routine id>"` → unix seconds of the last firing.
+    #[serde(default)]
+    routine_runs: std::collections::BTreeMap<String, u64>,
 }
 
 impl State {
@@ -346,6 +477,15 @@ impl State {
     /// forget it so the next launch starts fresh.
     pub fn forget(&mut self, dir: &Path, id: &BotId) {
         self.spawned.remove(&id.0);
+        self.write(dir);
+    }
+
+    pub fn routine_last_run(&self, bot: &BotId, routine_id: &str) -> Option<u64> {
+        self.routine_runs.get(&format!("{bot}/{routine_id}")).copied()
+    }
+
+    pub fn mark_routine_run(&mut self, dir: &Path, bot: &BotId, routine_id: &str, epoch: u64) {
+        self.routine_runs.insert(format!("{bot}/{routine_id}"), epoch);
         self.write(dir);
     }
 

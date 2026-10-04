@@ -22,11 +22,44 @@ use crate::ui::{bird_color, dim, status_span, wrap, ACCENT, DIM, MUTED};
 #[derive(Default)]
 pub struct RoomView {
     entries: Vec<Entry>,
+    /// Lettered quick-reply options parsed from the last bot message.
+    options: Vec<String>,
+    option_rects: Vec<(Rect, usize)>,
     /// Lines up from the bottom; 0 = follow new messages.
     scroll_up: usize,
     composing: Option<String>,
     /// The composer/hint line — clickable to start writing.
     footer: Rect,
+}
+
+/// `A) …` / `A. …` lines at the end of the last BOT message become one-key
+/// quick replies — the Grok Bot lettered-options pattern.
+fn detect_options(entries: &[Entry]) -> Vec<String> {
+    let Some(last) = entries.last() else {
+        return Vec::new();
+    };
+    if last.author == USER_AUTHOR {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in last.body.lines() {
+        let t = line.trim();
+        let mut chars = t.chars();
+        if let (Some(letter @ 'A'..='E'), Some(')' | '.'), Some(' ')) =
+            (chars.next(), chars.next(), chars.next())
+        {
+            let expected = (b'A' + out.len() as u8) as char;
+            if letter == expected {
+                out.push(t[3..].trim().to_string());
+            }
+        }
+    }
+    if out.len() < 2 {
+        Vec::new() // a single stray "A) …" is prose, not a menu
+    } else {
+        out.truncate(5);
+        out
+    }
 }
 
 impl RoomView {
@@ -36,9 +69,15 @@ impl RoomView {
         self.scroll_up = 0;
     }
 
+    fn compose_with(&mut self, text: String) {
+        self.composing = Some(text);
+        self.scroll_up = 0;
+    }
+
     fn reload(&mut self, s: &Shared) {
         if let Some(room) = s.current_room.as_deref().and_then(|id| s.config.room(id)) {
             self.entries = room::read(&room.transcript_path(&s.config.dir));
+            self.options = detect_options(&self.entries);
         }
     }
 
@@ -103,6 +142,11 @@ impl Component for RoomView {
     fn update(&mut self, a: Action, s: &mut Shared, _fx: &mut Effects) {
         match a {
             Action::Compose => self.start_compose(),
+            Action::Quick(n) => {
+                if let Some(text) = self.options.get((n as usize).saturating_sub(1)) {
+                    self.compose_with(text.clone());
+                }
+            }
             Action::PageUp => self.scroll_up = self.scroll_up.saturating_add(8),
             Action::PageDown => self.scroll_up = self.scroll_up.saturating_sub(8),
             Action::Reload => self.reload(s),
@@ -124,10 +168,20 @@ impl Component for RoomView {
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_up = self.scroll_up.saturating_add(3),
             MouseEventKind::ScrollDown => self.scroll_up = self.scroll_up.saturating_sub(3),
-            MouseEventKind::Down(_)
-                if hits(self.footer, m.column, m.row) && self.composing.is_none() =>
-            {
-                self.start_compose();
+            MouseEventKind::Down(_) => {
+                if let Some((_, idx)) = self
+                    .option_rects
+                    .iter()
+                    .find(|(r, _)| hits(*r, m.column, m.row))
+                {
+                    if let Some(text) = self.options.get(*idx) {
+                        self.compose_with(text.clone());
+                    }
+                    return;
+                }
+                if hits(self.footer, m.column, m.row) && self.composing.is_none() {
+                    self.start_compose();
+                }
             }
             _ => {}
         }
@@ -177,12 +231,36 @@ impl Component for RoomView {
                 ),
                 dim(format!("  {}", e.when)),
             ]));
+            // Markdown-ish: fenced code dims verbatim, blockquotes get a bar.
+            let mut in_code = false;
             for para in e.body.lines() {
-                if para.trim().is_empty() {
+                let t = para.trim_end();
+                if t.trim_start().starts_with("```") {
+                    in_code = !in_code;
+                    body.push(Line::from(dim(format!("    {}", t.trim_start()))));
+                    continue;
+                }
+                if t.trim().is_empty() {
                     body.push(Line::from(""));
                     continue;
                 }
-                for chunk in wrap(para, width) {
+                if in_code {
+                    body.push(Line::from(Span::styled(
+                        format!("      {t}"),
+                        Style::default().fg(DIM),
+                    )));
+                    continue;
+                }
+                if let Some(q) = t.trim_start().strip_prefix("> ") {
+                    for chunk in wrap(q, width.saturating_sub(2)) {
+                        body.push(Line::from(vec![
+                            dim("    ▏ "),
+                            Span::styled(chunk, Style::default().fg(DIM)),
+                        ]));
+                    }
+                    continue;
+                }
+                for chunk in wrap(t, width) {
                     body.push(Line::from(Span::styled(
                         format!("    {chunk}"),
                         Style::default().fg(MUTED),
@@ -199,10 +277,13 @@ impl Component for RoomView {
             )));
         }
 
-        // Layout: header · transcript window · composer/hint line.
+        // Layout: header · transcript window · quick-reply chips · composer.
         let header_h = 1u16;
         let footer_h = 1u16;
-        let view_h = area.height.saturating_sub(header_h + footer_h + 1) as usize;
+        let show_options = !self.options.is_empty() && self.composing.is_none();
+        let options_h = if show_options { 1u16 } else { 0 };
+        let view_h =
+            area.height.saturating_sub(header_h + footer_h + options_h + 1) as usize;
         let max_up = body.len().saturating_sub(view_h);
         self.scroll_up = self.scroll_up.min(max_up);
         let end = body.len() - self.scroll_up.min(body.len());
@@ -221,6 +302,33 @@ impl Component for RoomView {
                 height: view_h as u16,
             },
         );
+
+        // Quick-reply chips: click or 1-5 prefills the composer.
+        self.option_rects.clear();
+        if show_options {
+            use unicode_width::UnicodeWidthStr;
+            let y = area.y + area.height.saturating_sub(2);
+            let mut spans: Vec<Span> = vec![Span::raw(" ")];
+            let mut cursor = 1u16;
+            for (i, opt) in self.options.iter().enumerate() {
+                let label = format!(" {} {} ", i + 1, truncate_opt(opt, 18));
+                let w = label.width() as u16;
+                self.option_rects.push((
+                    Rect { x: area.x + cursor, y, width: w, height: 1 },
+                    i,
+                ));
+                spans.push(Span::styled(
+                    label,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(Span::raw(" "));
+                cursor += w + 1;
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect { x: area.x, y, width: area.width, height: 1 },
+            );
+        }
 
         let footer_y = area.y + area.height.saturating_sub(1);
         self.footer = Rect {
@@ -268,4 +376,44 @@ fn colour_for(s: &Shared, id: &BotId) -> ratatui::style::Color {
         .position(|b| &b.id == id)
         .map(bird_color)
         .unwrap_or(MUTED)
+}
+
+fn truncate_opt(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max - 1).collect();
+        format!("{kept}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(author: &str, body: &str) -> Entry {
+        Entry {
+            author: author.into(),
+            when: String::new(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn lettered_options_parse_in_order_from_the_last_bot_message() {
+        let entries = vec![entry(
+            "swift",
+            "Pick one:\nA) This works\nB. Vegetarian\nC) No seafood",
+        )];
+        let opts = detect_options(&entries);
+        assert_eq!(opts, vec!["This works", "Vegetarian", "No seafood"]);
+    }
+
+    #[test]
+    fn user_messages_and_single_strays_offer_no_options() {
+        assert!(detect_options(&[entry(USER_AUTHOR, "A) hello\nB) world")]).is_empty());
+        assert!(detect_options(&[entry("swift", "A) just one")]).is_empty());
+        // Out-of-order letters are prose, not a menu.
+        assert!(detect_options(&[entry("swift", "B) two\nA) one")]).is_empty());
+    }
 }

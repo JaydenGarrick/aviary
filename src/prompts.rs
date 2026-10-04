@@ -102,6 +102,9 @@ mod tests {
             glyph: "x".into(),
             repo: format!("~/dev/{id}"),
             persona: format!("birds/{id}.md"),
+            notify: true,
+            permissions: None,
+            routines: Vec::new(),
         }
     }
 

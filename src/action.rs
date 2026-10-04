@@ -28,11 +28,15 @@ pub enum Action {
     StopBot,
     /// Abandon the bird's conversation and hatch a brand-new session.
     FreshStart,
+    /// Open the selected bird's profile (persona, routines, notifications).
+    Profile,
     // -- scrolling panes
     PageUp,
     PageDown,
     // -- room
     Compose,
+    /// Pick a lettered quick-reply option (1-based).
+    Quick(u8),
 }
 
 /// Cross-component notifications, fanned out by the shell.
@@ -42,6 +46,8 @@ pub enum Msg {
     /// Open the new-bird / new-room forms (the sidebar's footer buttons).
     OpenNewBot,
     OpenNewRoom,
+    /// Open a bird's profile overlay.
+    OpenProfile(BotId),
     /// Open the compose overlay. With a `source`, that bird packages a handoff;
     /// without one the text goes straight to the target.
     Compose {
