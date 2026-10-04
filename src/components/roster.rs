@@ -7,7 +7,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::action::{Action, Effects, Msg};
@@ -35,8 +35,10 @@ pub fn rows(cfg: &Config) -> Vec<Row> {
 #[derive(Default)]
 pub struct Roster {
     nav: ListNav,
-    /// Where each logical row was drawn, for clicks.
+    /// Where each card was drawn, for clicks.
     row_rects: Vec<(Rect, usize)>,
+    /// Scroll offset in rows — follows the selection so it's never clipped.
+    scroll: u16,
     /// The footer buttons: `+ bird` and `+ room`.
     new_bot_rect: Rect,
     new_room_rect: Rect,
@@ -272,133 +274,195 @@ impl Component for Roster {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let name_w = inner.width.saturating_sub(8) as usize;
-        let mut lines: Vec<Line> = vec![Line::from("")];
-        let mut line_rows: Vec<Option<usize>> = vec![None];
-
-        lines.push(Line::from(muted(" BIRDS")));
-        line_rows.push(None);
-
+        // Card stream: section headers (1 row) + one rounded card per bird or
+        // room (CARD_H rows). A scroll offset in rows keeps the SELECTED card
+        // fully visible; partially-clipped cards are hidden, not mangled.
+        const CARD_H: u16 = 4;
+        enum Item {
+            Header(&'static str, u16),
+            Card(usize),
+        }
+        let mut items: Vec<Item> = vec![Item::Header("BIRDS", 1)];
         for (idx, row) in all.iter().enumerate() {
-            let selected = idx == self.nav.selected;
-            let marker = if selected { "▸" } else { " " };
-            match row {
-                Row::Bot(i) => {
-                    let bot = &s.config.bots[*i];
-                    let status = s.agents.status(&bot.id);
-                    let colour = bird_color(*i);
+            if matches!(row, Row::Room(0)) {
+                items.push(Item::Header("ROOMS", 2));
+            }
+            items.push(Item::Card(idx));
+        }
 
-                    let mut row_spans = vec![
-                        Span::styled(format!(" {marker} "), Style::default().fg(ACCENT)),
-                        Span::raw(format!("{} ", bot.glyph)),
-                        Span::styled(
-                            format!("{:<9}", truncate(&bot.name, 9)),
-                            if selected {
-                                Style::default().fg(colour).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(colour)
-                            },
-                        ),
-                        status_span(status),
-                    ];
-                    if s.agents.is_unread(&bot.id) {
-                        // The Grok-Bot unread dot: something happened here
-                        // since you last looked.
-                        row_spans.push(Span::styled(" ●", Style::default().fg(ACCENT)));
-                    }
-                    lines.push(Line::from(row_spans));
-                    line_rows.push(Some(idx));
+        let avail = inner.height.saturating_sub(1); // footer keeps the last row
+        let item_h = |item: &Item| match item {
+            Item::Header(_, h) => *h,
+            Item::Card(_) => CARD_H,
+        };
 
-                    // Preview line: collaboration tag first (who it's working
-                    // WITH), then what aviary last asked of it, else its branch.
-                    let collab = s.agents.collab(&bot.id).map(|c| c.tag());
-                    let tag_w = collab.as_ref().map_or(0, |t| t.chars().count() + 1);
-                    let preview = s
-                        .agents
-                        .get(&bot.id)
-                        .and_then(|sess| sess.last_prompt.clone())
-                        .map(|p| format!("“{}”", truncate(&p, name_w.saturating_sub(tag_w))))
-                        .or_else(|| {
-                            s.branches.data.as_ref().and_then(|v| {
-                                v.iter().find(|b| b.bot == bot.id).map(|b| {
-                                    format!(
-                                        "⎇ {}{}",
-                                        truncate(&b.branch, name_w.saturating_sub(4 + tag_w)),
-                                        if b.dirty { " ●" } else { "" }
-                                    )
-                                })
-                            })
-                        });
-                    if collab.is_some() || preview.is_some() {
-                        let mut spans = vec![Span::raw("      ")];
-                        if let Some(tag) = collab {
-                            spans.push(Span::styled(
-                                format!("{tag} "),
-                                Style::default().fg(crate::ui::WARN),
-                            ));
-                        }
-                        if let Some(p) = preview {
-                            spans.push(dim(p));
-                        }
-                        lines.push(Line::from(spans));
-                        line_rows.push(Some(idx));
-                    }
+        // Selected card's row span, for scroll-follow.
+        let (mut sel_start, mut sel_end) = (0u16, 0u16);
+        let mut cursor = 0u16;
+        for item in &items {
+            let h = item_h(item);
+            if matches!(item, Item::Card(idx) if *idx == self.nav.selected) {
+                (sel_start, sel_end) = (cursor, cursor + h);
+            }
+            cursor += h;
+        }
+        let total = cursor;
+        if sel_start < self.scroll {
+            self.scroll = sel_start;
+        }
+        if sel_end > self.scroll + avail {
+            self.scroll = sel_end - avail;
+        }
+        self.scroll = self.scroll.min(total.saturating_sub(avail.min(total)));
+
+        let name_w = inner.width.saturating_sub(8) as usize;
+        let mut y = 0u16;
+        let mut clipped = 0usize;
+        for item in &items {
+            let h = item_h(item);
+            let top = y as i32 - self.scroll as i32;
+            y += h;
+            if top < 0 || top as u16 + h > avail {
+                if matches!(item, Item::Card(_)) {
+                    clipped += 1;
                 }
-                Row::Room(i) => {
-                    if *i == 0 {
-                        lines.push(Line::from(""));
-                        line_rows.push(None);
-                        lines.push(Line::from(muted(" ROOMS")));
-                        line_rows.push(None);
-                    }
-                    let room = &s.config.rooms[*i];
-                    lines.push(Line::from(vec![
-                        Span::styled(format!(" {marker} "), Style::default().fg(ACCENT)),
-                        Span::styled(
-                            format!("# {:<10}", truncate(&room.name, 10)),
-                            if selected {
-                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(MUTED)
-                            },
-                        ),
-                        dim(format!("{}", room.members.len())),
-                    ]));
-                    line_rows.push(Some(idx));
-                    let members: Vec<String> =
-                        room.members.iter().map(|m| format!("@{m}")).collect();
-                    lines.push(Line::from(dim(format!(
-                        "      {}",
-                        truncate(&members.join(" "), name_w)
-                    ))));
-                    line_rows.push(Some(idx));
+                continue;
+            }
+            let rect = Rect {
+                x: inner.x,
+                y: inner.y + top as u16,
+                width: inner.width,
+                height: h,
+            };
+            match item {
+                Item::Header(label, h) => {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(muted(format!(" {label}")))),
+                        Rect {
+                            y: rect.y + h - 1, // blank leading row for ROOMS
+                            height: 1,
+                            ..rect
+                        },
+                    );
+                }
+                Item::Card(idx) => {
+                    let selected = *idx == self.nav.selected;
+                    self.row_rects.push((rect, *idx));
+                    let (title, body) = match all[*idx] {
+                        Row::Bot(i) => {
+                            let bot = &s.config.bots[i];
+                            let colour = bird_color(i);
+                            let mut title = vec![
+                                Span::raw(format!(" {} ", bot.glyph)),
+                                Span::styled(
+                                    format!("{:<9}", truncate(&bot.name, 9)),
+                                    if selected {
+                                        Style::default().fg(colour).add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(colour)
+                                    },
+                                ),
+                                status_span(s.agents.status(&bot.id)),
+                            ];
+                            if s.agents.is_unread(&bot.id) {
+                                // Grok-Bot unread dot: news since you last looked.
+                                title.push(Span::styled(" ●", Style::default().fg(ACCENT)));
+                            }
+
+                            // Body: collab tag, then last prompt or branch.
+                            let collab = s.agents.collab(&bot.id).map(|c| c.tag());
+                            let tag_w = collab.as_ref().map_or(0, |t| t.chars().count() + 1);
+                            let preview = s
+                                .agents
+                                .get(&bot.id)
+                                .and_then(|sess| sess.last_prompt.clone())
+                                .map(|p| {
+                                    format!("“{}”", truncate(&p, name_w.saturating_sub(tag_w)))
+                                })
+                                .or_else(|| {
+                                    s.branches.data.as_ref().and_then(|v| {
+                                        v.iter().find(|b| b.bot == bot.id).map(|b| {
+                                            format!(
+                                                "⎇ {}{}",
+                                                truncate(
+                                                    &b.branch,
+                                                    name_w.saturating_sub(4 + tag_w)
+                                                ),
+                                                if b.dirty { " ●" } else { "" }
+                                            )
+                                        })
+                                    })
+                                });
+                            let mut body = vec![Span::raw(" ")];
+                            if let Some(tag) = collab {
+                                body.push(Span::styled(
+                                    format!("{tag} "),
+                                    Style::default().fg(crate::ui::WARN),
+                                ));
+                            }
+                            match preview {
+                                Some(p) => body.push(dim(p)),
+                                None => body.push(dim("resting")),
+                            }
+                            (Line::from(title), Line::from(body))
+                        }
+                        Row::Room(i) => {
+                            let room = &s.config.rooms[i];
+                            let title = vec![
+                                Span::styled(
+                                    format!(" # {:<10}", truncate(&room.name, 10)),
+                                    if selected {
+                                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(MUTED)
+                                    },
+                                ),
+                                dim(format!("{} birds", room.members.len())),
+                            ];
+                            let members: Vec<String> =
+                                room.members.iter().map(|m| format!("@{m}")).collect();
+                            let body = vec![
+                                Span::raw(" "),
+                                dim(truncate(&members.join(" "), name_w + 4)),
+                            ];
+                            (Line::from(title), Line::from(body))
+                        }
+                    };
+
+                    let card = Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(if selected { ACCENT } else { DIM }));
+                    let card_inner = card.inner(rect);
+                    frame.render_widget(card, rect);
+                    frame.render_widget(Paragraph::new(vec![title, body]), card_inner);
                 }
             }
         }
 
         if s.config.bots.is_empty() {
-            lines.push(Line::from(dim(" no birds — n adds one")));
-            line_rows.push(None);
+            frame.render_widget(
+                Paragraph::new(Line::from(dim(" no birds — n adds one"))),
+                Rect {
+                    x: inner.x,
+                    y: inner.y + 1,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
         }
-
-        for (offset, maybe_idx) in line_rows.iter().enumerate() {
-            if let Some(idx) = maybe_idx {
-                let y = inner.y + offset as u16;
-                if y + 1 < inner.y + inner.height {
-                    self.row_rects.push((
-                        Rect {
-                            x: inner.x,
-                            y,
-                            width: inner.width,
-                            height: 1,
-                        },
-                        *idx,
-                    ));
-                }
-            }
+        if clipped > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(dim(format!(" ↕ {clipped} more off-screen"))))
+                    .alignment(ratatui::layout::Alignment::Right),
+                Rect {
+                    x: inner.x,
+                    y: inner.y + avail.saturating_sub(1),
+                    width: inner.width,
+                    height: 1,
+                },
+            );
         }
-
-        frame.render_widget(Paragraph::new(lines), inner);
 
         // Footer buttons, pinned to the sidebar's bottom line.
         let footer_y = inner.y + inner.height.saturating_sub(1);
