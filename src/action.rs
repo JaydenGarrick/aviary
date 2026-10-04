@@ -7,6 +7,13 @@
 use crate::command::Command;
 use crate::config::BotId;
 
+/// What a roster deletion points at.
+#[derive(Clone)]
+pub enum RosterTarget {
+    Bird(BotId),
+    Room(String),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     // -- global
@@ -30,6 +37,8 @@ pub enum Action {
     FreshStart,
     /// Open the selected bird's profile (persona, routines, notifications).
     Profile,
+    /// Remove the selected bird/room from the roster (confirmed first).
+    Delete,
     // -- scrolling panes
     PageUp,
     PageDown,
@@ -48,6 +57,14 @@ pub enum Msg {
     OpenNewRoom,
     /// Open a bird's profile overlay.
     OpenProfile(BotId),
+    /// Ask before removing a bird/room from the roster.
+    ConfirmDelete(RosterTarget),
+    /// Open the right-click context menu for a card, anchored at the click.
+    OpenContext {
+        target: RosterTarget,
+        x: u16,
+        y: u16,
+    },
     /// Open the compose overlay. With a `source`, that bird packages a handoff;
     /// without one the text goes straight to the target.
     Compose {

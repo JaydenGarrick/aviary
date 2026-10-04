@@ -83,6 +83,12 @@ pub static KEYMAP: &[Binding] = &[
         None,
         "bird profile: persona, routines, notifications",
     ),
+    bind(
+        ch('D'),
+        Action::Delete,
+        None,
+        "remove the selected bird/room from the roster (asks first)",
+    ),
 ];
 
 impl Roster {
@@ -194,6 +200,18 @@ impl Component for Roster {
                     fx.msg(Msg::OpenProfile(s.config.bots[*i].id.clone()));
                 }
             }
+            Action::Delete => {
+                let target = match rows(&s.config).get(self.nav.selected) {
+                    Some(Row::Bot(i)) => {
+                        crate::action::RosterTarget::Bird(s.config.bots[*i].id.clone())
+                    }
+                    Some(Row::Room(i)) => {
+                        crate::action::RosterTarget::Room(s.config.rooms[*i].id.clone())
+                    }
+                    None => return,
+                };
+                fx.msg(Msg::ConfirmDelete(target));
+            }
             Action::Reload => self.reload_branches(s, fx),
             _ => {}
         }
@@ -229,6 +247,32 @@ impl Component for Roster {
 
     fn handle_mouse(&mut self, m: MouseEvent, s: &mut Shared, fx: &mut Effects) {
         match m.kind {
+            // Right-click: select the card and open its context menu there.
+            MouseEventKind::Down(MouseButton::Right) => {
+                let hit = self
+                    .row_rects
+                    .iter()
+                    .find(|(r, _)| hits(*r, m.column, m.row))
+                    .map(|(_, idx)| *idx);
+                if let Some(idx) = hit {
+                    self.nav.selected = idx;
+                    self.sync(s);
+                    let target = match rows(&s.config).get(idx) {
+                        Some(Row::Bot(i)) => {
+                            crate::action::RosterTarget::Bird(s.config.bots[*i].id.clone())
+                        }
+                        Some(Row::Room(i)) => {
+                            crate::action::RosterTarget::Room(s.config.rooms[*i].id.clone())
+                        }
+                        None => return,
+                    };
+                    fx.msg(Msg::OpenContext {
+                        target,
+                        x: m.column,
+                        y: m.row,
+                    });
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if hits(self.new_bot_rect, m.column, m.row) {
                     fx.msg(Msg::OpenNewBot);

@@ -196,6 +196,40 @@ impl Config {
         Ok(())
     }
 
+    /// Remove a bird from the roster. Its persona file and claude session
+    /// survive (resumable with `claude --resume aviary-<id>`); it also leaves
+    /// every room, and a room left with fewer than two birds dissolves too.
+    /// Returns the ids of rooms that dissolved.
+    pub fn remove_bot(&mut self, id: &BotId) -> Result<Vec<String>> {
+        if self.bot(id).is_none() {
+            bail!("no bot named {:?}", id.0);
+        }
+        self.bots.retain(|b| &b.id != id);
+        let mut dissolved = Vec::new();
+        for room in &mut self.rooms {
+            room.members.retain(|m| m != id);
+        }
+        self.rooms.retain(|r| {
+            if r.members.len() < 2 {
+                dissolved.push(r.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.save()?;
+        Ok(dissolved)
+    }
+
+    /// Remove a room from the roster. The transcript file stays on disk.
+    pub fn remove_room(&mut self, id: &str) -> Result<()> {
+        if self.room(id).is_none() {
+            bail!("no room named {id:?}");
+        }
+        self.rooms.retain(|r| r.id != id);
+        self.save()
+    }
+
     /// Flip a bird's notification toggle and persist it.
     pub fn set_notify(&mut self, id: &BotId, on: bool) -> Result<()> {
         if let Some(bot) = self.bots.iter_mut().find(|b| &b.id == id) {

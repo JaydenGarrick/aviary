@@ -351,6 +351,8 @@ impl App {
                 Overlay::NewRoom(f) => f.handle_key(key),
                 Overlay::Compose(f) => f.handle_key(key),
                 Overlay::Profile(f) => f.handle_key(key),
+                Overlay::Confirm(f) => f.handle_key(key),
+                Overlay::Context(f) => f.handle_key(key),
                 _ => return,
             };
             self.on_form_event(event);
@@ -489,7 +491,90 @@ impl App {
                 self.overlay = Overlay::None;
                 self.shared.fresh_bot(&id);
             }
+            FormEvent::Delete(target) => {
+                self.overlay = Overlay::None;
+                self.perform_delete(target);
+            }
+            // Context-menu picks: close the menu, run the existing path.
+            FormEvent::Talk(id) => {
+                self.overlay = Overlay::None;
+                let prompt = self.shared.opening_prompt(&id);
+                self.shared.boot_bot(&id, prompt.as_deref());
+                self.shared.agent_focused = true;
+            }
+            FormEvent::Handoff(id) => {
+                self.overlay = Overlay::None;
+                let mut fx = Effects::default();
+                fx.msg(Msg::Compose {
+                    source: Some(id),
+                    preselect: None,
+                });
+                self.apply(fx);
+            }
+            FormEvent::Profile(id) => {
+                self.overlay = Overlay::Profile(crate::overlays::ProfileView::new(id));
+            }
+            FormEvent::StopBird(id) => {
+                self.overlay = Overlay::None;
+                self.shared.agents.stop(&id);
+                self.shared.agent_focused = false;
+                self.shared
+                    .flash(format!("{id} stopped — its session resumes by name"));
+            }
+            FormEvent::WriteRoom(id) => {
+                self.overlay = Overlay::None;
+                let mut fx = Effects::default();
+                fx.msg(Msg::OpenRoom(id));
+                self.apply(fx);
+            }
+            FormEvent::AskDelete(target) => {
+                let mut fx = Effects::default();
+                fx.msg(Msg::ConfirmDelete(target));
+                self.apply(fx);
+            }
         }
+    }
+
+    fn perform_delete(&mut self, target: crate::action::RosterTarget) {
+        use crate::action::RosterTarget;
+        match target {
+            RosterTarget::Bird(id) => {
+                self.shared.agents.release(&self.shared.config, &id);
+                match self.shared.config.remove_bot(&id) {
+                    Ok(dissolved) => {
+                        if self.shared.current_bot.as_ref() == Some(&id) {
+                            self.shared.current_bot = None;
+                            self.shared.agent_focused = false;
+                        }
+                        if let Some(room) = &self.shared.current_room {
+                            if dissolved.contains(room) {
+                                self.shared.current_room = None;
+                            }
+                        }
+                        let mut note = format!(
+                            "released {id} — claude --resume {} brings it back",
+                            id.session_name()
+                        );
+                        if !dissolved.is_empty() {
+                            note.push_str(&format!(" · dissolved #{}", dissolved.join(" #")));
+                        }
+                        self.shared.flash(note);
+                    }
+                    Err(e) => self.shared.flash(format!("{e:#}")),
+                }
+            }
+            RosterTarget::Room(id) => match self.shared.config.remove_room(&id) {
+                Ok(()) => {
+                    if self.shared.current_room.as_deref() == Some(id.as_str()) {
+                        self.shared.current_room = None;
+                    }
+                    self.shared
+                        .flash(format!("deleted #{id} — transcript kept in rooms/"));
+                }
+                Err(e) => self.shared.flash(format!("{e:#}")),
+            },
+        }
+        self.components.roster.sync(&mut self.shared);
     }
 
     /// The handoff/direct-message submit. With a source bird, the SOURCE owns
@@ -542,6 +627,8 @@ impl App {
                 Overlay::NewRoom(f) => f.handle_mouse(m),
                 Overlay::Compose(f) => f.handle_mouse(m),
                 Overlay::Profile(f) => f.handle_mouse(m),
+                Overlay::Confirm(f) => f.handle_mouse(m),
+                Overlay::Context(f) => f.handle_mouse(m),
                 _ => return,
             };
             self.on_form_event(event);
@@ -582,6 +669,39 @@ impl App {
                 Msg::OpenNewRoom => self.open_new_room(),
                 Msg::OpenProfile(id) => {
                     self.overlay = Overlay::Profile(crate::overlays::ProfileView::new(id));
+                }
+                Msg::ConfirmDelete(target) => {
+                    use crate::action::RosterTarget;
+                    let (question, note) = match &target {
+                        RosterTarget::Bird(id) => {
+                            let name = self
+                                .shared
+                                .config
+                                .bot(id)
+                                .map(|b| format!("{} {}", b.glyph, b.name))
+                                .unwrap_or_else(|| id.to_string());
+                            (
+                                format!("Release {name} from the roster?"),
+                                format!(
+                                    "Its persona file and conversation survive — `claude --resume {}` \
+                                     brings it back from any terminal. It also leaves every room; a \
+                                     room left with one bird dissolves.",
+                                    id.session_name()
+                                ),
+                            )
+                        }
+                        RosterTarget::Room(id) => (
+                            format!("Delete #{id}?"),
+                            "The transcript file stays in ~/.config/aviary/rooms/ — only the \
+                             roster entry goes."
+                                .to_string(),
+                        ),
+                    };
+                    self.overlay =
+                        Overlay::Confirm(crate::overlays::ConfirmForm::new(target, question, note));
+                }
+                Msg::OpenContext { target, x, y } => {
+                    self.overlay = Overlay::Context(crate::overlays::ContextMenu::new(target, x, y));
                 }
                 Msg::Compose { source, preselect } => {
                     match ComposeForm::new(&self.shared, source, preselect) {
@@ -671,6 +791,8 @@ impl App {
             Overlay::NewRoom(f) => f.draw(frame, frame.area()),
             Overlay::Compose(f) => f.draw(frame, frame.area()),
             Overlay::Profile(f) => f.draw(frame, frame.area(), &self.shared),
+            Overlay::Confirm(f) => f.draw(frame, frame.area()),
+            Overlay::Context(f) => f.draw(frame, frame.area()),
         }
     }
 }

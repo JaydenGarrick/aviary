@@ -440,6 +440,17 @@ impl AgentStore {
         self.collab.remove(id);
         self.observed.remove(id);
     }
+
+    /// A bird leaving the roster: stop it and drop all bookkeeping. The
+    /// claude session itself survives — `claude --resume aviary-<id>` works
+    /// from any terminal.
+    pub fn release(&mut self, cfg: &Config, id: &BotId) {
+        self.stop(id);
+        self.last_output.remove(id);
+        self.kind_since.remove(id);
+        self.unread.remove(id);
+        self.state.forget(&cfg.dir, id);
+    }
 }
 
 #[derive(PartialEq, Eq)]

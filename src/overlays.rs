@@ -23,6 +23,8 @@ pub enum Overlay {
     NewRoom(NewRoomForm),
     Compose(ComposeForm),
     Profile(ProfileView),
+    Confirm(ConfirmForm),
+    Context(ContextMenu),
 }
 
 impl Overlay {
@@ -53,6 +55,16 @@ pub enum FormEvent {
     OpenPersona(BotId),
     /// Profile shortcut for a fresh conversation (closes the overlay).
     FreshStart(BotId),
+    /// The confirm dialog said yes: remove this from the roster.
+    Delete(crate::action::RosterTarget),
+    // -- context-menu picks, executed by the shell
+    Talk(BotId),
+    Handoff(BotId),
+    Profile(BotId),
+    StopBird(BotId),
+    WriteRoom(String),
+    /// Open the release/delete CONFIRM dialog (menus never delete directly).
+    AskDelete(crate::action::RosterTarget),
 }
 
 const GLYPHS: [&str; 6] = ["🐦", "🦉", "🦅", "🪿", "🐧", "🦜"];
@@ -586,6 +598,250 @@ fn tail(s: &str, max: usize) -> String {
     }
     let kept: String = s.chars().skip(n - (max - 1)).collect();
     format!("…{kept}")
+}
+
+// --------------------------------------------------------------------- context
+
+#[derive(Clone, Copy)]
+enum MenuAct {
+    Talk,
+    Handoff,
+    Profile,
+    Fresh,
+    Stop,
+    Release,
+    Write,
+    DeleteRoom,
+}
+
+/// The right-click menu for a sidebar card, anchored at the click. Keyboard
+/// works too (j/k + ⏎); hovering moves the cursor; clicking outside closes.
+pub struct ContextMenu {
+    target: crate::action::RosterTarget,
+    items: Vec<(&'static str, MenuAct)>,
+    cursor: usize,
+    anchor: (u16, u16),
+    popup: Rect,
+    item_rects: Vec<Rect>,
+}
+
+impl ContextMenu {
+    pub fn new(target: crate::action::RosterTarget, x: u16, y: u16) -> ContextMenu {
+        use crate::action::RosterTarget;
+        let items: Vec<(&'static str, MenuAct)> = match &target {
+            RosterTarget::Bird(_) => vec![
+                ("talk — keyboard to the bird", MenuAct::Talk),
+                ("handoff to a teammate", MenuAct::Handoff),
+                ("profile — persona · routines", MenuAct::Profile),
+                ("fresh conversation", MenuAct::Fresh),
+                ("stop the session", MenuAct::Stop),
+                ("release from the roster", MenuAct::Release),
+            ],
+            RosterTarget::Room(_) => vec![
+                ("write to the room", MenuAct::Write),
+                ("delete the room", MenuAct::DeleteRoom),
+            ],
+        };
+        ContextMenu {
+            target,
+            items,
+            cursor: 0,
+            anchor: (x, y),
+            popup: Rect::default(),
+            item_rects: Vec::new(),
+        }
+    }
+
+    fn pick(&self, act: MenuAct) -> FormEvent {
+        use crate::action::RosterTarget;
+        match (&self.target, act) {
+            (RosterTarget::Bird(id), MenuAct::Talk) => FormEvent::Talk(id.clone()),
+            (RosterTarget::Bird(id), MenuAct::Handoff) => FormEvent::Handoff(id.clone()),
+            (RosterTarget::Bird(id), MenuAct::Profile) => FormEvent::Profile(id.clone()),
+            (RosterTarget::Bird(id), MenuAct::Fresh) => FormEvent::FreshStart(id.clone()),
+            (RosterTarget::Bird(id), MenuAct::Stop) => FormEvent::StopBird(id.clone()),
+            (_, MenuAct::Release | MenuAct::DeleteRoom) => {
+                FormEvent::AskDelete(self.target.clone())
+            }
+            (RosterTarget::Room(id), MenuAct::Write) => FormEvent::WriteRoom(id.clone()),
+            _ => FormEvent::Cancel,
+        }
+    }
+
+    pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => FormEvent::Cancel,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.cursor = (self.cursor + 1) % self.items.len();
+                FormEvent::Consumed
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.cursor = (self.cursor + self.items.len() - 1) % self.items.len();
+                FormEvent::Consumed
+            }
+            KeyCode::Enter => self.pick(self.items[self.cursor].1),
+            _ => FormEvent::Consumed,
+        }
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        if let MouseEventKind::Moved | MouseEventKind::Drag(_) = m.kind {
+            if let Some(i) = self
+                .item_rects
+                .iter()
+                .position(|r| hits(*r, m.column, m.row))
+            {
+                self.cursor = i;
+            }
+            return FormEvent::Consumed;
+        }
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if let Some(i) = self.item_rects.iter().position(|r| hits(*r, x, y)) {
+            return self.pick(self.items[i].1);
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let width = (self
+            .items
+            .iter()
+            .map(|(label, _)| label.width())
+            .max()
+            .unwrap_or(10) as u16
+            + 4)
+            .min(area.width);
+        let height = (self.items.len() as u16 + 2).min(area.height);
+        let x = self.anchor.0.min(area.width.saturating_sub(width));
+        let y = self.anchor.1.min(area.height.saturating_sub(height));
+        self.popup = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+
+        frame.render_widget(Clear, self.popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT));
+        let inner = block.inner(self.popup);
+        frame.render_widget(block, self.popup);
+
+        self.item_rects.clear();
+        let lines: Vec<Line> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (label, act))| {
+                self.item_rects.push(Rect {
+                    x: inner.x,
+                    y: inner.y + i as u16,
+                    width: inner.width,
+                    height: 1,
+                });
+                let destructive = matches!(act, MenuAct::Release | MenuAct::DeleteRoom);
+                let style = if i == self.cursor {
+                    Style::default()
+                        .fg(if destructive { BAD } else { ACCENT })
+                        .add_modifier(Modifier::REVERSED)
+                } else if destructive {
+                    Style::default().fg(BAD)
+                } else {
+                    Style::default().fg(crate::ui::MUTED)
+                };
+                Line::from(Span::styled(format!(" {label} "), style))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+// --------------------------------------------------------------------- confirm
+
+/// A small yes/no gate for roster deletions — destructive enough to ask,
+/// cheap enough that the answer is one keystroke.
+pub struct ConfirmForm {
+    target: crate::action::RosterTarget,
+    question: String,
+    note: String,
+    popup: Rect,
+    yes: Rect,
+    no: Rect,
+}
+
+impl ConfirmForm {
+    pub fn new(target: crate::action::RosterTarget, question: String, note: String) -> ConfirmForm {
+        ConfirmForm {
+            target,
+            question,
+            note,
+            popup: Rect::default(),
+            yes: Rect::default(),
+            no: Rect::default(),
+        }
+    }
+
+    pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
+        match k.code {
+            KeyCode::Char('y') | KeyCode::Enter => FormEvent::Delete(self.target.clone()),
+            KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => FormEvent::Cancel,
+            _ => FormEvent::Consumed,
+        }
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if hits(self.yes, x, y) {
+            return FormEvent::Delete(self.target.clone());
+        }
+        if hits(self.no, x, y) {
+            return FormEvent::Cancel;
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {}", self.question),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+        for chunk in wrap(&self.note, 58) {
+            lines.push(Line::from(dim(format!("  {chunk}"))));
+        }
+        lines.push(Line::from(""));
+        let buttons_idx = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "   y release   ",
+                Style::default().fg(BAD).add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                "   n keep   ",
+                Style::default().fg(DIM).add_modifier(Modifier::REVERSED),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
+        self.popup = popup(frame, area, "sure?", lines);
+        let row = line_rect(self.popup, buttons_idx);
+        self.yes = Rect { width: 15, ..row };
+        self.no = Rect {
+            x: row.x + 18,
+            width: 12,
+            ..row
+        };
+    }
 }
 
 // --------------------------------------------------------------------- profile
