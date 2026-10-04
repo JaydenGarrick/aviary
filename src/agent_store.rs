@@ -115,27 +115,14 @@ impl AgentStore {
         }
         let persona = bot.persona_path(&cfg.dir);
 
-        let mut args: Vec<String> = if resume {
-            vec!["--resume".into(), bot.id.session_name()]
-        } else {
-            vec!["--name".into(), bot.id.session_name()]
-        };
-        args.extend([
-            "--append-system-prompt-file".into(),
-            persona.display().to_string(),
-            // Rooms + handoffs live under the config dir; make writes there
-            // first-class instead of out-of-scope.
-            "--add-dir".into(),
-            cfg.dir.display().to_string(),
-            // The Linear + Figma hooks, independent of repo-level MCP config.
-            "--mcp-config".into(),
-            cfg.mcp_config_path().display().to_string(),
-        ]);
-        if let Some(p) = prompt {
-            // The prompt rides argv: typing into a BOOTING pty races the
-            // child's first paint, but a positional prompt cannot be dropped.
-            args.push(p.to_string());
-        }
+        let args = launch_args(
+            bot.id.session_name(),
+            &persona,
+            &cfg.dir,
+            &cfg.mcp_config_path(),
+            prompt,
+            resume,
+        );
 
         let term = pty::Terminal::spawn(bot.id.clone(), "claude", &args, &repo, 24, 80, tx.clone())?;
         self.sessions.insert(
@@ -198,4 +185,91 @@ pub enum RelaunchHint {
     No,
     /// A resumed session is gone — spawn fresh.
     FreshSpawn,
+}
+
+/// Argv for a bird's launch. ORDER IS LOAD-BEARING: `--mcp-config` and
+/// `--add-dir` are VARIADIC in the claude CLI and consume values until the
+/// next flag — unterminated, they swallow the positional prompt as another
+/// config path ("MCP config file not found: <repo>/<prompt text>"). Each is
+/// therefore followed by another flag, and the prompt only ever follows the
+/// single-value `--append-system-prompt-file`.
+fn launch_args(
+    session: String,
+    persona: &std::path::Path,
+    cfg_dir: &std::path::Path,
+    mcp: &std::path::Path,
+    prompt: Option<&str>,
+    resume: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = if resume {
+        vec!["--resume".into(), session]
+    } else {
+        vec!["--name".into(), session]
+    };
+    args.extend([
+        // The Linear + Figma hooks, independent of repo-level MCP config.
+        "--mcp-config".into(),
+        mcp.display().to_string(),
+        // Rooms + handoffs live under the config dir; make writes there
+        // first-class instead of out-of-scope.
+        "--add-dir".into(),
+        cfg_dir.display().to_string(),
+        "--append-system-prompt-file".into(),
+        persona.display().to_string(),
+    ]);
+    if let Some(p) = prompt {
+        // The prompt rides argv: typing into a BOOTING pty races the child's
+        // first paint, but a positional prompt cannot be dropped.
+        args.push(p.to_string());
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::launch_args;
+    use std::path::Path;
+
+    /// The regression this guards: a variadic flag directly before the
+    /// positional prompt eats it ("MCP config file not found: …<prompt>").
+    #[test]
+    fn variadic_flags_never_precede_the_prompt() {
+        let args = launch_args(
+            "aviary-swift".into(),
+            Path::new("/cfg/birds/swift.md"),
+            Path::new("/cfg"),
+            Path::new("/cfg/mcp.json"),
+            Some("You've just been perched."),
+            false,
+        );
+        assert_eq!(args.last().map(String::as_str), Some("You've just been perched."));
+        // Every variadic flag's values are terminated by another flag.
+        for variadic in ["--mcp-config", "--add-dir"] {
+            let i = args.iter().position(|a| a == variadic).unwrap();
+            assert!(
+                args[i + 2].starts_with("--"),
+                "{variadic} must be followed by exactly one value then a flag"
+            );
+        }
+        // The prompt sits right after the single-value persona flag's value.
+        let i = args.iter().position(|a| a == "--append-system-prompt-file").unwrap();
+        assert_eq!(args[i + 1], "/cfg/birds/swift.md");
+        assert_eq!(i + 2, args.len() - 1);
+    }
+
+    #[test]
+    fn resume_swaps_name_for_resume_and_tolerates_no_prompt() {
+        let args = launch_args(
+            "aviary-raven".into(),
+            Path::new("/cfg/birds/raven.md"),
+            Path::new("/cfg"),
+            Path::new("/cfg/mcp.json"),
+            None,
+            true,
+        );
+        assert_eq!(args[0], "--resume");
+        assert_eq!(args[1], "aviary-raven");
+        // No prompt: the single-value persona flag's value ends the argv.
+        assert_eq!(args.last().map(String::as_str), Some("/cfg/birds/raven.md"));
+    }
 }

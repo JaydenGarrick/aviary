@@ -32,6 +32,10 @@ architecture throughout — read this map before touching the shell.
   @-mentions. Loosening this reintroduces unbounded bot chatter; don't.
 - **Prompts into FRESH sessions ride argv**, never typed into a booting PTY.
   Typed input is only for sessions already running.
+- **Launch argv order is load-bearing:** `--mcp-config` and `--add-dir` are
+  VARIADIC claude flags — each must be followed by another flag or it swallows
+  the positional prompt as another value. `launch_args()` owns the order and
+  a unit test guards it; never append args after the prompt or reorder it.
 
 ## Verify
 
