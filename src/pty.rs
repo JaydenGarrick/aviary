@@ -9,7 +9,7 @@
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -19,10 +19,16 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use crate::config::BotId;
 use crate::event::Event;
 
+/// How long after an injected prompt before its Enter is sent. Claude Code
+/// detects a rapid input burst as a PASTE, and an Enter inside the burst is
+/// swallowed as paste content instead of submitting — the delay makes it a
+/// real keystroke.
+const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
 pub struct Terminal {
     pub parser: Arc<RwLock<vt100::Parser>>,
     running: Arc<AtomicBool>,
-    writer: Box<dyn std::io::Write + Send>,
+    writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     size: (u16, u16),
 }
@@ -116,7 +122,7 @@ impl Terminal {
         Ok(Terminal {
             parser,
             running,
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             master: pair.master,
             size: (rows, cols),
         })
@@ -151,8 +157,25 @@ impl Terminal {
         // Typing always snaps back to live output — reading history and
         // talking to the child are different moments.
         self.snap_live();
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
+    }
+
+    /// Inject a PROMPT: the text lands now, the Enter follows on its own
+    /// after [`SUBMIT_DELAY`] so the child's paste detection can't swallow it.
+    pub fn send_line(&mut self, text: &str) {
+        self.send(text.as_bytes());
+        let writer = self.writer.clone();
+        thread::spawn(move || {
+            thread::sleep(SUBMIT_DELAY);
+            use std::io::Write;
+            if let Ok(mut w) = writer.lock() {
+                let _ = w.write_all(b"\r");
+                let _ = w.flush();
+            }
+        });
     }
 
     pub fn send_key(&mut self, key: KeyEvent) {
@@ -185,8 +208,10 @@ impl Terminal {
             // Straight to the writer — send() would pointlessly snap a
             // scrollback that cannot exist on the alt screen.
             use std::io::Write;
-            let _ = self.writer.write_all(&payload);
-            let _ = self.writer.flush();
+            if let Ok(mut w) = self.writer.lock() {
+                let _ = w.write_all(&payload);
+                let _ = w.flush();
+            }
             return;
         }
 

@@ -319,8 +319,9 @@ impl AgentStore {
         if let Some(session) = self.sessions.get_mut(&bot.id) {
             if session.term.is_running() {
                 if let Some(p) = prompt {
-                    session.term.send(p.as_bytes());
-                    session.term.send(b"\r");
+                    // send_line, never a trailing \r in the same burst — the
+                    // child's paste detection would swallow the submit.
+                    session.term.send_line(p);
                     session.last_prompt = Some(p.to_string());
                 }
                 return Ok(());
