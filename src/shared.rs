@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent_store::AgentStore;
 use crate::command::{BranchInfo, Slot};
-use crate::config::{BotId, Config};
+use crate::config::{BotId, Config, SessionKey};
 use crate::event::Event;
 use crate::events::EventsReader;
 use crate::prompts;
@@ -25,6 +25,8 @@ pub struct Shared {
     pub events: EventsReader,
     /// The thread screen's bot / the room screen's room.
     pub current_bot: Option<BotId>,
+    /// Which of the bot's session tabs the thread pane shows (1 = primary).
+    pub current_tab: u8,
     pub current_room: Option<String>,
     /// The embedded terminal holds the keyboard (every key but ctrl+a).
     pub agent_focused: bool,
@@ -46,6 +48,7 @@ impl Shared {
             agents_poll: Slot::default(),
             events: EventsReader::default(),
             current_bot: None,
+            current_tab: 1,
             current_room: None,
             agent_focused: false,
             flash: None,
@@ -68,31 +71,54 @@ impl Shared {
         self.flash = Some((Instant::now(), text.into()));
     }
 
-    /// Spawn/resume a bot's session, typing `prompt` into it; errors become a
-    /// flash instead of a crash — a missing repo must not take the TUI down.
+    /// The session the thread pane is showing right now.
+    pub fn current_key(&self) -> Option<SessionKey> {
+        self.current_bot.clone().map(|bot| SessionKey {
+            bot,
+            tab: self.current_tab,
+        })
+    }
+
+    /// Spawn/resume a bot's PRIMARY session, typing `prompt` into it. Every
+    /// external signal lands here; extra tabs are only ever booted by a human
+    /// via [`Shared::boot_key`].
     pub fn boot_bot(&mut self, id: &BotId, prompt: Option<&str>) {
-        let Some(bot) = self.config.bot(id).cloned() else {
-            self.flash(format!("no bot named {id:?}"));
+        self.boot_key(&SessionKey::primary(id.clone()), prompt);
+    }
+
+    /// Spawn/resume one session of a bot, typing `prompt` into it; errors
+    /// become a flash instead of a crash — a missing repo must not take the
+    /// TUI down.
+    pub fn boot_key(&mut self, key: &SessionKey, prompt: Option<&str>) {
+        let Some(bot) = self.config.bot(&key.bot).cloned() else {
+            self.flash(format!("no bot named {:?}", key.bot));
             return;
         };
         let tx = self.tx.clone();
-        if let Err(e) = self.agents.ensure_running(&self.config, &bot, prompt, &tx) {
+        if let Err(e) = self
+            .agents
+            .ensure_running_key(&self.config, &bot, key.tab, prompt, &tx)
+        {
             self.flash(format!("{e:#}"));
         }
     }
 
-    /// First prompt for a never-before-spawned bird, None otherwise.
-    pub fn opening_prompt(&self, id: &BotId) -> Option<String> {
-        let bot = self.config.bot(id)?;
-        (!self.agents.has_session_record(id)).then(|| prompts::first_flight(bot))
+    /// First prompt for a never-before-spawned session, None otherwise.
+    pub fn opening_prompt(&self, key: &SessionKey) -> Option<String> {
+        let bot = self.config.bot(&key.bot)?;
+        (!self.agents.has_session_record(key)).then(|| prompts::first_flight(bot))
     }
 
-    /// Abandon the bird's conversation on purpose and start a new one.
+    /// Abandon the bird's PRIMARY conversation on purpose and start a new one.
     pub fn fresh_bot(&mut self, id: &BotId) {
         let Some(bot) = self.config.bot(id).cloned() else {
             self.flash(format!("no bot named {id:?}"));
             return;
         };
+        // Show the session that was just hatched, not a stale tab.
+        if self.current_bot.as_ref() == Some(id) {
+            self.current_tab = 1;
+        }
         let tx = self.tx.clone();
         let prompt = prompts::first_flight(&bot);
         if let Err(e) = self

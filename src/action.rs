@@ -44,6 +44,13 @@ pub enum Action {
     ToggleMouse,
     /// Copy the selected bird's visible pane to the clipboard.
     Yank,
+    // -- session tabs (the thread pane's parallel sessions of one bird)
+    NextTab,
+    PrevTab,
+    /// Open one more session of the selected bird, on the lowest free tab.
+    NewTab,
+    /// Stop the viewed tab and forget its resume record (tab 1 refuses).
+    CloseTab,
     // -- scrolling panes
     PageUp,
     PageDown,

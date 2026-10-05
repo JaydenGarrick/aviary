@@ -1,8 +1,10 @@
-//! The birds themselves: one Claude Code session per bot, keyed by [`BotId`].
+//! The birds themselves: Claude Code sessions keyed by [`SessionKey`] — the
+//! bird's primary session (tab 1) plus any human-driven extra tabs.
 //!
-//! Identity is the session NAME (`aviary-<id>`, via `--name`), which makes
-//! resume trivial (`--resume aviary-<id>`) and makes every bird a stable
-//! SendMessage target for its teammates.
+//! Identity is the session NAME (`aviary-<id>`, tabs `aviary-<id>.<n>`, via
+//! `--name`), which makes resume trivial (`--resume <name>`) and makes every
+//! bird a stable SendMessage target for its teammates. External signals
+//! (rooms, handoffs, routines, webhooks) only ever address the primary.
 //!
 //! Status is layered, most-truthful-first:
 //!   1. PTY output in the last 2s → Working (streaming IS activity),
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 
 use crate::command::SessionInfo;
-use crate::config::{Bot, BotId, Config, State};
+use crate::config::{Bot, BotId, Config, SessionKey, State};
 use crate::event::Event;
 use crate::pty;
 
@@ -49,7 +51,7 @@ pub enum StatusKind {
 }
 
 /// What the UI shows (Done carries its age).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BotStatus {
     NotStarted,
     Working,
@@ -62,7 +64,7 @@ pub enum BotStatus {
 
 /// A status change worth reacting to (unread dot, notification).
 pub struct Transition {
-    pub id: BotId,
+    pub key: SessionKey,
     pub from: StatusKind,
     pub to: StatusKind,
 }
@@ -132,12 +134,14 @@ impl Collab {
 }
 
 pub struct AgentStore {
-    sessions: HashMap<BotId, AgentSession>,
-    last_output: HashMap<BotId, Instant>,
-    /// Latest poll/hook observation per bot.
-    observed: HashMap<BotId, (StatusKind, Instant)>,
+    sessions: HashMap<SessionKey, AgentSession>,
+    last_output: HashMap<SessionKey, Instant>,
+    /// Latest poll/hook observation per session.
+    observed: HashMap<SessionKey, (StatusKind, Instant)>,
     /// When the observed kind last CHANGED (Done age on the chip).
-    kind_since: HashMap<BotId, (StatusKind, Instant)>,
+    kind_since: HashMap<SessionKey, (StatusKind, Instant)>,
+    // Unread and collab are deliberately per-BIRD: the roster card is the unit
+    // of attention, whatever tab produced the signal.
     unread: HashMap<BotId, bool>,
     collab: HashMap<BotId, (Collab, Instant)>,
     state: State,
@@ -189,21 +193,32 @@ impl AgentStore {
 
     // -------------------------------------------------------------- status
 
-    pub fn get(&self, id: &BotId) -> Option<&AgentSession> {
-        self.sessions.get(id)
+    pub fn get(&self, key: &SessionKey) -> Option<&AgentSession> {
+        self.sessions.get(key)
     }
 
-    pub fn get_mut(&mut self, id: &BotId) -> Option<&mut AgentSession> {
-        self.sessions.get_mut(id)
+    pub fn get_mut(&mut self, key: &SessionKey) -> Option<&mut AgentSession> {
+        self.sessions.get_mut(key)
     }
 
     pub fn running_count(&self) -> usize {
         self.sessions.values().filter(|s| s.term.is_running()).count()
     }
 
-    /// Has this bot EVER had a session (drives resume vs the first-flight prompt)?
-    pub fn has_session_record(&self, id: &BotId) -> bool {
-        self.state.spawned_once(id)
+    /// Has this session EVER existed (drives resume vs the first-flight prompt)?
+    pub fn has_session_record(&self, key: &SessionKey) -> bool {
+        self.state.spawned_once(&key.state_key())
+    }
+
+    /// Every tab the strip should show: resumable records ∪ live sessions,
+    /// sorted; tab 1 is always present.
+    pub fn tabs(&self, id: &BotId) -> Vec<u8> {
+        let mut tabs = self.state.spawned_tabs(id);
+        tabs.extend(self.sessions.keys().filter(|k| k.bot == *id).map(|k| k.tab));
+        tabs.push(1);
+        tabs.sort_unstable();
+        tabs.dedup();
+        tabs
     }
 
     pub fn routine_last_run(&self, bot: &BotId, routine_id: &str) -> Option<u64> {
@@ -214,25 +229,37 @@ impl AgentStore {
         self.state.mark_routine_run(&cfg.dir, bot, routine_id, epoch);
     }
 
+    /// The roster chip: the most attention-worthy status across the bird's
+    /// sessions — NeedsInput > Working > Done (youngest) > Exited.
     pub fn status(&self, id: &BotId) -> BotStatus {
-        let Some(session) = self.sessions.get(id) else {
+        aggregate_status(
+            self.sessions
+                .keys()
+                .filter(|k| k.bot == *id)
+                .map(|k| self.status_key(k)),
+        )
+    }
+
+    /// One session's status, layered most-truthful-first (see module doc).
+    pub fn status_key(&self, key: &SessionKey) -> BotStatus {
+        let Some(session) = self.sessions.get(key) else {
             return BotStatus::NotStarted;
         };
         if !session.term.is_running() {
             return BotStatus::Exited;
         }
-        let output_age = self.last_output.get(id).map(|t| t.elapsed());
+        let output_age = self.last_output.get(key).map(|t| t.elapsed());
         // Streaming overrides everything — a laggy poll can say "idle" while
         // tokens are visibly arriving.
         if output_age.is_some_and(|a| a < OUTPUT_OVERRIDE) {
             return BotStatus::Working;
         }
-        if let Some((kind, at)) = self.observed.get(id) {
+        if let Some((kind, at)) = self.observed.get(key) {
             if at.elapsed() < POLL_TRUST {
                 return match kind {
                     StatusKind::Working => BotStatus::Working,
                     StatusKind::NeedsInput => BotStatus::NeedsInput,
-                    StatusKind::Done => BotStatus::Done(self.kind_age(id)),
+                    StatusKind::Done => BotStatus::Done(self.kind_age(key)),
                 };
             }
         }
@@ -244,23 +271,23 @@ impl AgentStore {
         }
     }
 
-    fn kind_age(&self, id: &BotId) -> u64 {
+    fn kind_age(&self, key: &SessionKey) -> u64 {
         self.kind_since
-            .get(id)
+            .get(key)
             .map(|(_, t)| t.elapsed().as_secs())
             .unwrap_or(0)
     }
 
     /// Record an observation; returns the transition if the kind changed.
-    fn observe(&mut self, id: &BotId, kind: StatusKind) -> Option<Transition> {
-        self.observed.insert(id.clone(), (kind, Instant::now()));
-        match self.kind_since.get(id) {
+    fn observe(&mut self, key: &SessionKey, kind: StatusKind) -> Option<Transition> {
+        self.observed.insert(key.clone(), (kind, Instant::now()));
+        match self.kind_since.get(key) {
             Some((prev, _)) if *prev == kind => None,
             prev => {
                 let from = prev.map(|(k, _)| *k).unwrap_or(StatusKind::Working);
-                self.kind_since.insert(id.clone(), (kind, Instant::now()));
+                self.kind_since.insert(key.clone(), (kind, Instant::now()));
                 Some(Transition {
-                    id: id.clone(),
+                    key: key.clone(),
                     from,
                     to: kind,
                 })
@@ -268,55 +295,57 @@ impl AgentStore {
         }
     }
 
-    /// Fold one `claude agents --json` poll in; returns status transitions.
-    pub fn apply_poll(&mut self, cfg: &Config, sessions: &[SessionInfo]) -> Vec<Transition> {
-        let mut out = Vec::new();
-        for bot in &cfg.bots {
-            // Only track birds whose PTY we actually hold — a user's own
-            // session that happens to share a name is not ours to badge.
-            if !self.sessions.get(&bot.id).is_some_and(|s| s.term.is_running()) {
-                continue;
-            }
-            let name = bot.id.session_name();
-            if let Some(info) = sessions.iter().find(|s| s.name == name) {
-                let kind = map_status_str(&info.status);
-                if let Some(t) = self.observe(&bot.id, kind) {
-                    out.push(t);
-                }
-            }
-        }
-        out
+    /// Only badge sessions whose PTY we actually hold — a user's own session
+    /// that happens to share a name is not ours.
+    fn live_keys(&self) -> Vec<SessionKey> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.term.is_running())
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
-    /// Fold one hook event in (cwd attributes it to a bird's repo).
+    /// Fold one `claude agents --json` poll in; returns status transitions.
+    pub fn apply_poll(&mut self, sessions: &[SessionInfo]) -> Vec<Transition> {
+        poll_matches(&self.live_keys(), sessions)
+            .into_iter()
+            .filter_map(|(key, kind)| self.observe(&key, kind))
+            .collect()
+    }
+
+    /// Fold one hook event in. A new-format event names its session
+    /// (`aviary_session`, injected by `aviary --hook --session <name>`) and
+    /// resolves to that exact key; an old or foreign payload falls back to
+    /// cwd matching, which can only mean the PRIMARY — tabs share the repo.
     pub fn apply_hook(
         &mut self,
         cfg: &Config,
+        aviary_session: Option<&str>,
         cwd: &str,
         event_name: &str,
         detail: &str,
     ) -> Option<Transition> {
         let kind = map_hook_event(event_name, detail)?;
-        let cwd = Path::new(cwd);
-        let bot = cfg.bots.iter().find(|b| b.repo_path() == cwd)?;
-        if !self.sessions.get(&bot.id).is_some_and(|s| s.term.is_running()) {
-            return None;
-        }
-        self.observe(&bot.id.clone(), kind)
+        let key = resolve_hook_key(&cfg.bots, &self.live_keys(), cwd, aviary_session)?;
+        self.observe(&key, kind)
     }
 
     // ------------------------------------------------------------ lifecycle
 
-    /// Make sure the bot has a LIVE session, spawning or resuming as needed.
-    /// `prompt`: rides argv on a launch, typed into a running session.
-    pub fn ensure_running(
+    /// Make sure ONE session of the bot is live, spawning or resuming as
+    /// needed. `prompt`: rides argv on a launch, typed into a running session.
+    /// External signals only ever arrive with tab 1 (via `Shared::boot_bot`);
+    /// extra tabs are human-driven only.
+    pub fn ensure_running_key(
         &mut self,
         cfg: &Config,
         bot: &Bot,
+        tab: u8,
         prompt: Option<&str>,
         tx: &Sender<Event>,
     ) -> Result<()> {
-        if let Some(session) = self.sessions.get_mut(&bot.id) {
+        let key = SessionKey { bot: bot.id.clone(), tab };
+        if let Some(session) = self.sessions.get_mut(&key) {
             if session.term.is_running() {
                 if let Some(p) = prompt {
                     // send_line, never a trailing \r in the same burst — the
@@ -326,16 +355,17 @@ impl AgentStore {
                 }
                 return Ok(());
             }
-            self.sessions.remove(&bot.id); // exited — replace it
+            self.sessions.remove(&key); // exited — replace it
         }
-        let resume = self.state.spawned_once(&bot.id);
-        self.launch(cfg, bot, prompt, tx, resume)
+        let resume = self.state.spawned_once(&key.state_key());
+        self.launch(cfg, bot, &key, prompt, tx, resume)
     }
 
     fn launch(
         &mut self,
         cfg: &Config,
         bot: &Bot,
+        key: &SessionKey,
         prompt: Option<&str>,
         tx: &Sender<Event>,
         resume: bool,
@@ -351,9 +381,9 @@ impl AgentStore {
         }
 
         let persona = bot.persona_path(&cfg.dir);
-        let settings = cfg.settings_file_for(bot)?;
+        let settings = cfg.settings_file_for(bot, key)?;
         let args = launch_args(
-            bot.id.session_name(),
+            key.session_name(),
             &persona,
             &settings,
             &cfg.dir,
@@ -362,9 +392,9 @@ impl AgentStore {
             resume,
         );
 
-        let term = pty::Terminal::spawn(bot.id.clone(), "claude", &args, &repo, 24, 80, tx.clone())?;
+        let term = pty::Terminal::spawn(key.clone(), "claude", &args, &repo, 24, 80, tx.clone())?;
         self.sessions.insert(
-            bot.id.clone(),
+            key.clone(),
             AgentSession {
                 term,
                 last_prompt: prompt.map(str::to_string),
@@ -375,12 +405,13 @@ impl AgentStore {
             },
         );
         self.kind_since
-            .insert(bot.id.clone(), (StatusKind::Working, Instant::now()));
+            .insert(key.clone(), (StatusKind::Working, Instant::now()));
         Ok(())
     }
 
-    /// Deliberately abandon the current conversation: stop the session, forget
-    /// the resume record, and hatch a brand-new one.
+    /// Deliberately abandon the PRIMARY conversation: stop the session, forget
+    /// the resume record, and hatch a brand-new one. Tabs are untouched —
+    /// closing those is the thread pane's job.
     pub fn fresh_start(
         &mut self,
         cfg: &Config,
@@ -388,26 +419,27 @@ impl AgentStore {
         prompt: Option<&str>,
         tx: &Sender<Event>,
     ) -> Result<()> {
-        self.sessions.remove(&bot.id);
+        let key = SessionKey::primary(bot.id.clone());
+        self.sessions.remove(&key);
         self.collab.remove(&bot.id);
-        self.state.forget(&cfg.dir, &bot.id);
-        self.launch(cfg, bot, prompt, tx, false)
+        self.state.forget(&cfg.dir, &key.state_key());
+        self.launch(cfg, bot, &key, prompt, tx, false)
     }
 
     /// Once a second: a fresh session that has survived [`MARK_AFTER`] becomes
-    /// the bot's resumable session of record.
+    /// that tab's resumable session of record.
     pub fn tick(&mut self, cfg: &Config) {
-        let ripe: Vec<BotId> = self
+        let ripe: Vec<SessionKey> = self
             .sessions
             .iter()
             .filter(|(_, s)| {
                 s.fresh_unmarked && s.term.is_running() && s.spawned_at.elapsed() >= MARK_AFTER
             })
-            .map(|(id, _)| id.clone())
+            .map(|(key, _)| key.clone())
             .collect();
-        for id in ripe {
-            self.state.mark_spawned(&cfg.dir, &id);
-            if let Some(s) = self.sessions.get_mut(&id) {
+        for key in ripe {
+            self.state.mark_spawned(&cfg.dir, &key.state_key());
+            if let Some(s) = self.sessions.get_mut(&key) {
                 s.fresh_unmarked = false;
             }
         }
@@ -415,11 +447,11 @@ impl AgentStore {
 
     /// Note PTY activity (from `Event::AgentOutput`). Returns a relaunch
     /// request when a `--resume` died instantly: the named session no longer
-    /// exists, so the caller should `ensure_running` again — the state file
+    /// exists, so the caller should boot THIS KEY again — the state file
     /// has already been reset to force a fresh spawn.
-    pub fn note_output(&mut self, cfg: &Config, id: &BotId) -> RelaunchHint {
-        self.last_output.insert(id.clone(), Instant::now());
-        let Some(session) = self.sessions.get_mut(id) else {
+    pub fn note_output(&mut self, cfg: &Config, key: &SessionKey) -> RelaunchHint {
+        self.last_output.insert(key.clone(), Instant::now());
+        let Some(session) = self.sessions.get_mut(key) else {
             return RelaunchHint::No;
         };
         if session.term.is_running() || session.exit_handled {
@@ -427,30 +459,103 @@ impl AgentStore {
         }
         session.exit_handled = true;
         if session.resumed && session.spawned_at.elapsed() < RESUME_FAIL_WINDOW {
-            self.state.forget(&cfg.dir, id);
-            self.sessions.remove(id);
+            self.state.forget(&cfg.dir, &key.state_key());
+            self.sessions.remove(key);
             return RelaunchHint::FreshSpawn;
         }
         RelaunchHint::No
     }
 
-    /// Dropping the master closes the PTY, which hangs up the child.
+    /// Stop EVERY session of the bird (the roster's `x`). Dropping the master
+    /// closes the PTY, which hangs up the child.
     pub fn stop(&mut self, id: &BotId) {
-        self.sessions.remove(id);
+        self.sessions.retain(|k, _| k.bot != *id);
+        self.observed.retain(|k, _| k.bot != *id);
         self.collab.remove(id);
-        self.observed.remove(id);
     }
 
-    /// A bird leaving the roster: stop it and drop all bookkeeping. The
-    /// claude session itself survives — `claude --resume aviary-<id>` works
-    /// from any terminal.
+    /// Stop one tab's session only; the bird's other sessions keep flying.
+    pub fn stop_key(&mut self, key: &SessionKey) {
+        self.sessions.remove(key);
+        self.observed.remove(key);
+    }
+
+    /// Close a tab: stop it and forget its resume record, so the strip entry
+    /// disappears. The claude session itself survives, unreferenced.
+    pub fn close_tab(&mut self, cfg: &Config, key: &SessionKey) {
+        self.stop_key(key);
+        self.last_output.remove(key);
+        self.kind_since.remove(key);
+        self.state.forget(&cfg.dir, &key.state_key());
+    }
+
+    /// A bird leaving the roster: stop all its sessions and drop all
+    /// bookkeeping. The claude sessions themselves survive —
+    /// `claude --resume aviary-<id>` works from any terminal.
     pub fn release(&mut self, cfg: &Config, id: &BotId) {
         self.stop(id);
-        self.last_output.remove(id);
-        self.kind_since.remove(id);
+        self.last_output.retain(|k, _| k.bot != *id);
+        self.kind_since.retain(|k, _| k.bot != *id);
         self.unread.remove(id);
-        self.state.forget(&cfg.dir, id);
+        self.state.forget_bot(&cfg.dir, id);
     }
+}
+
+/// Aggregate per-session statuses into the roster chip: attention first.
+fn aggregate_status(statuses: impl Iterator<Item = BotStatus>) -> BotStatus {
+    use BotStatus::*;
+    fn rank(s: &BotStatus) -> u8 {
+        match s {
+            NeedsInput => 4,
+            Working => 3,
+            Done(_) => 2,
+            Exited => 1,
+            NotStarted => 0,
+        }
+    }
+    statuses.fold(NotStarted, |acc, s| match (acc, s) {
+        // Two finished tabs: the chip shows the FRESHEST completion.
+        (Done(a), Done(b)) => Done(a.min(b)),
+        (acc, s) if rank(&s) > rank(&acc) => s,
+        (acc, _) => acc,
+    })
+}
+
+/// Match poll rows to live keys by EXACT session name — `aviary-swift.2`
+/// never badges `aviary-swift`, and a foreign `aviary-swiftly` matches neither.
+fn poll_matches(live: &[SessionKey], sessions: &[SessionInfo]) -> Vec<(SessionKey, StatusKind)> {
+    live.iter()
+        .filter_map(|key| {
+            let name = key.session_name();
+            sessions
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| (key.clone(), map_status_str(&s.status)))
+        })
+        .collect()
+}
+
+/// Which session a hook event belongs to. A named event resolves exactly or
+/// not at all — never mis-badge; an unnamed one falls back to cwd → primary.
+fn resolve_hook_key(
+    bots: &[Bot],
+    live: &[SessionKey],
+    cwd: &str,
+    aviary_session: Option<&str>,
+) -> Option<SessionKey> {
+    if let Some(name) = aviary_session {
+        let key = SessionKey::parse_session_name(name)?;
+        return (bots.iter().any(|b| b.id == key.bot) && live.contains(&key)).then_some(key);
+    }
+    let cwd = Path::new(cwd);
+    let bot = bots.iter().find(|b| b.repo_path() == cwd)?;
+    let key = SessionKey::primary(bot.id.clone());
+    live.contains(&key).then_some(key)
+}
+
+/// The tab `T` opens next: the lowest unused number ≥ 2.
+pub fn lowest_free_tab(tabs: &[u8]) -> u8 {
+    (2..u8::MAX).find(|n| !tabs.contains(n)).unwrap_or(u8::MAX)
 }
 
 #[derive(PartialEq, Eq)]
@@ -574,5 +679,84 @@ mod tests {
         assert_eq!(args[0], "--resume");
         assert_eq!(args[1], "aviary-raven");
         assert_eq!(args.last().map(String::as_str), Some("/cfg/birds/raven.md"));
+    }
+
+    fn key(id: &str, tab: u8) -> SessionKey {
+        SessionKey { bot: BotId(id.into()), tab }
+    }
+
+    #[test]
+    fn aggregate_status_shows_the_most_attention_worthy_tab() {
+        use BotStatus::*;
+        assert_eq!(aggregate_status([].into_iter()), NotStarted);
+        assert_eq!(aggregate_status([Done(30), Working].into_iter()), Working);
+        assert_eq!(
+            aggregate_status([Working, NeedsInput, Done(5)].into_iter()),
+            NeedsInput
+        );
+        // Two finished tabs: the chip shows the freshest completion.
+        assert_eq!(aggregate_status([Done(300), Done(5)].into_iter()), Done(5));
+        assert_eq!(aggregate_status([Exited, Done(9)].into_iter()), Done(9));
+        assert_eq!(aggregate_status([Exited, NotStarted].into_iter()), Exited);
+    }
+
+    #[test]
+    fn poll_matches_by_exact_name_per_key() {
+        let info = |name: &str, status: &str| SessionInfo {
+            name: name.into(),
+            status: status.into(),
+            cwd: String::new(),
+        };
+        let live = [key("swift", 1), key("swift", 2)];
+        let polled = [
+            info("aviary-swift", "busy"),
+            info("aviary-swift.2", "waiting_for_input"),
+            info("aviary-swiftly", "busy"), // foreign bird, not a tab
+        ];
+        let got = poll_matches(&live, &polled);
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&(key("swift", 1), StatusKind::Working)));
+        assert!(got.contains(&(key("swift", 2), StatusKind::NeedsInput)));
+    }
+
+    #[test]
+    fn hook_key_resolution_prefers_the_named_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap().to_string();
+        let bot = Bot {
+            id: BotId("swift".into()),
+            name: "Swift".into(),
+            glyph: "🕊".into(),
+            repo: repo.clone(),
+            persona: "birds/swift.md".into(),
+            notify: true,
+            permissions: None,
+            routines: vec![],
+        };
+        let bots = [bot];
+        let live = [key("swift", 1), key("swift", 2)];
+        // Named events resolve to their exact tab.
+        assert_eq!(
+            resolve_hook_key(&bots, &live, &repo, Some("aviary-swift.2")),
+            Some(key("swift", 2))
+        );
+        // A named but dead/unknown session never badges anything.
+        assert_eq!(resolve_hook_key(&bots, &live, &repo, Some("aviary-swift.3")), None);
+        assert_eq!(resolve_hook_key(&bots, &live, &repo, Some("aviary-ghost")), None);
+        // Unnamed (old-format) events fall back to cwd → the primary.
+        assert_eq!(
+            resolve_hook_key(&bots, &live, &repo, None),
+            Some(key("swift", 1))
+        );
+        assert_eq!(resolve_hook_key(&bots, &live, "/elsewhere", None), None);
+        // cwd fallback needs a live primary — tabs alone don't count.
+        assert_eq!(resolve_hook_key(&bots, &[key("swift", 2)], &repo, None), None);
+    }
+
+    #[test]
+    fn lowest_free_tab_fills_gaps() {
+        assert_eq!(lowest_free_tab(&[1]), 2);
+        assert_eq!(lowest_free_tab(&[1, 2, 4]), 3);
+        assert_eq!(lowest_free_tab(&[1, 2, 3, 4]), 5);
     }
 }

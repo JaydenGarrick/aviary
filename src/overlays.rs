@@ -912,11 +912,17 @@ impl ProfileView {
             Line::from(vec![
                 muted("  session   "),
                 Span::raw(self.id.session_name()),
-                dim(if s.agents.has_session_record(&self.id) {
-                    "  (resumes with full memory)"
-                } else {
-                    "  (never flown)"
-                }),
+                // The profile is about the bird = its PRIMARY session; tabs
+                // live in the thread pane's strip.
+                dim(
+                    if s.agents.has_session_record(&crate::config::SessionKey::primary(
+                        self.id.clone(),
+                    )) {
+                        "  (resumes with full memory)"
+                    } else {
+                        "  (never flown)"
+                    },
+                ),
             ]),
             Line::from(""),
         ];

@@ -1,6 +1,8 @@
 //! The content pane for a bird: its Claude Code session, full height, beside
-//! the sidebar. Draw + mouse only — all bird ACTIONS (wake, stop, fresh,
-//! handoff) belong to the sidebar, which owns the selection.
+//! the sidebar. All bird ACTIONS (wake, stop, fresh, handoff) belong to the
+//! sidebar, which owns the selection — this pane owns only its SESSION TABS:
+//! extra, human-driven parallel sessions of the viewed bird. External signals
+//! never land on a tab; they always wake the primary (tab 1).
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -10,13 +12,29 @@ use ratatui::Frame;
 
 use crate::action::{Action, Effects};
 use crate::components::{hits, Component};
+use crate::config::SessionKey;
+use crate::keymap::{bind, ch, Binding};
 use crate::shared::Shared;
-use crate::ui::{bird_color, dim, muted, status_span, ACCENT};
+use crate::ui::{bird_color, dim, muted, status_glyph, status_span, ACCENT};
 use crate::widgets::agent_pane;
+use crate::widgets::list_nav::{ListNav, Wrap};
+
+/// Session-tab keys, merged into dispatch and hints while a bird's pane is up.
+pub static KEYMAP: &[Binding] = &[
+    bind(ch(']'), Action::NextTab, Some("tabs"), "next session tab"),
+    bind(ch('['), Action::PrevTab, None, "previous session tab"),
+    bind(ch('T'), Action::NewTab, None, "open another session of this bird"),
+    bind(ch('W'), Action::CloseTab, None, "close the viewed tab (tab 1 refuses)"),
+];
+
+/// The tab strip's `[+]` button, stored beside real (1-based) tab numbers.
+const NEW_TAB: u8 = 0;
 
 #[derive(Default)]
 pub struct Thread {
     pane: Rect,
+    /// Click targets in the tab strip: each tab, plus `[+]` as [`NEW_TAB`].
+    tab_rects: Vec<(Rect, u8)>,
     /// Recent handoff briefs involving the viewed bird (empty-state content).
     feed: Vec<String>,
     feed_for: Option<crate::config::BotId>,
@@ -48,11 +66,60 @@ impl Thread {
         self.feed = found.into_iter().take(3).map(|(_, n)| n).collect();
         self.feed_for = Some(id);
     }
+
+    /// Open one more session of the viewed bird and show it.
+    fn new_tab(&self, s: &mut Shared) {
+        let Some(id) = s.current_bot.clone() else { return };
+        let tab = crate::agent_store::lowest_free_tab(&s.agents.tabs(&id));
+        s.current_tab = tab;
+        let key = SessionKey { bot: id, tab };
+        let prompt = s.opening_prompt(&key);
+        s.boot_key(&key, prompt.as_deref());
+        s.agent_focused = true;
+        s.flash(format!("tab {tab} — session {}", key.session_name()));
+    }
+
+    fn select_tab(&self, s: &mut Shared, tab: u8) {
+        if s.current_tab != tab {
+            s.current_tab = tab;
+            // A tab switch re-targets the keyboard; never leave it pointed at
+            // a session that may not be running.
+            s.agent_focused = false;
+        }
+        if let Some(id) = s.current_bot.clone() {
+            s.agents.clear_unread(&id);
+        }
+    }
 }
 
 impl Component for Thread {
-    // The sidebar owns the keys; this pane is display + mouse only.
-    fn update(&mut self, _a: Action, _s: &mut Shared, _fx: &mut Effects) {}
+    fn update(&mut self, a: Action, s: &mut Shared, _fx: &mut Effects) {
+        let Some(id) = s.current_bot.clone() else { return };
+        match a {
+            Action::NextTab | Action::PrevTab => {
+                let tabs = s.agents.tabs(&id);
+                let mut nav = ListNav {
+                    selected: tabs.iter().position(|t| *t == s.current_tab).unwrap_or(0),
+                };
+                let dir = if a == Action::NextTab { Action::Down } else { Action::Up };
+                nav.handle(dir, tabs.len(), Wrap::Cycle);
+                self.select_tab(s, tabs[nav.selected]);
+            }
+            Action::NewTab => self.new_tab(s),
+            Action::CloseTab => {
+                if s.current_tab == 1 {
+                    s.flash("tab 1 is the bird itself — x on the sidebar stops it");
+                    return;
+                }
+                let key = SessionKey { bot: id, tab: s.current_tab };
+                s.agents.close_tab(&s.config, &key);
+                s.current_tab = 1;
+                s.agent_focused = false;
+                s.flash(format!("closed tab {} — back to tab 1", key.tab));
+            }
+            _ => {}
+        }
+    }
 
     fn on_tick(&mut self, s: &mut Shared, _fx: &mut Effects) {
         self.ticks += 1;
@@ -62,14 +129,27 @@ impl Component for Thread {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, s: &mut Shared, _fx: &mut Effects) {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            if let Some((_, tab)) = self
+                .tab_rects
+                .iter()
+                .find(|(r, _)| hits(*r, m.column, m.row))
+            {
+                match *tab {
+                    NEW_TAB => self.new_tab(s),
+                    t => self.select_tab(s, t),
+                }
+                return;
+            }
+        }
         let over_pane = hits(self.pane, m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) if over_pane => {
-                // Clicking the pane wakes the bird and hands it the keyboard,
-                // exactly like ⏎ on the sidebar.
-                if let Some(id) = s.current_bot.clone() {
-                    let prompt = s.opening_prompt(&id);
-                    s.boot_bot(&id, prompt.as_deref());
+                // Clicking the pane wakes the viewed session and hands it the
+                // keyboard, exactly like ⏎ on the sidebar.
+                if let Some(key) = s.current_key() {
+                    let prompt = s.opening_prompt(&key);
+                    s.boot_key(&key, prompt.as_deref());
                     s.agent_focused = true;
                 }
             }
@@ -79,8 +159,8 @@ impl Component for Thread {
                     m.column.saturating_sub(self.pane.x + 1),
                     m.row.saturating_sub(self.pane.y + 1),
                 );
-                if let Some(id) = s.current_bot.clone() {
-                    if let Some(session) = s.agents.get_mut(&id) {
+                if let Some(key) = s.current_key() {
+                    if let Some(session) = s.agents.get_mut(&key) {
                         session.term.wheel(delta, col, row);
                     }
                 }
@@ -90,8 +170,9 @@ impl Component for Thread {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect, s: &mut Shared) {
-        self.pane = area;
+        self.tab_rects.clear();
         let Some(id) = s.current_bot.clone() else {
+            self.pane = area;
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(Line::from(dim("  no bird selected"))),
                 area,
@@ -106,7 +187,45 @@ impl Component for Thread {
             .position(|b| b.id == id)
             .map(bird_color)
             .unwrap_or(ACCENT);
-        let status = s.agents.status(&id);
+
+        // The tab strip: only once there is more than one session to show.
+        let tabs = s.agents.tabs(&id);
+        let mut body = area;
+        if tabs.len() > 1 && area.height > 1 {
+            let strip = Rect { height: 1, ..area };
+            body = Rect {
+                y: area.y + 1,
+                height: area.height - 1,
+                ..area
+            };
+            let mut spans: Vec<Span> = vec![Span::raw(" ")];
+            let mut x = strip.x + 1;
+            for t in &tabs {
+                let key = SessionKey { bot: id.clone(), tab: *t };
+                let selected = *t == s.current_tab;
+                let style = if selected {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(crate::ui::DIM)
+                };
+                let open = format!("[{t} ");
+                // Rect width: the label's chars, the 1-wide glyph, and "]".
+                let width = (open.chars().count() + 2) as u16;
+                spans.push(Span::styled(open, style));
+                spans.push(status_glyph(s.agents.status_key(&key)));
+                spans.push(Span::styled("]", style));
+                spans.push(Span::raw(" "));
+                self.tab_rects.push((Rect { x, width, ..strip }, *t));
+                x += width + 1;
+            }
+            spans.push(dim("[+]"));
+            self.tab_rects.push((Rect { x, width: 3, ..strip }, NEW_TAB));
+            frame.render_widget(ratatui::widgets::Paragraph::new(Line::from(spans)), strip);
+        }
+        self.pane = body;
+
+        let key = SessionKey { bot: id.clone(), tab: s.current_tab };
+        let status = s.agents.status_key(&key);
 
         let mut title = Line::from(vec![
             Span::raw(format!(" {} ", bot.glyph)),
@@ -139,11 +258,12 @@ impl Component for Thread {
             Line::from(""),
             Line::from(dim(format!(
                 "  its session is named {} and resumes with its full memory;",
-                id.session_name()
+                key.session_name()
             ))),
             Line::from(dim("  teammates reach it by that name with SendMessage")),
             Line::from(""),
             Line::from(dim("  N starts a brand-new conversation · p opens its profile")),
+            Line::from(dim("  T opens a parallel session in another tab")),
         ];
         if !self.feed.is_empty() {
             empty.push(Line::from(""));
@@ -161,6 +281,6 @@ impl Component for Thread {
         }
 
         let focused = s.agent_focused;
-        agent_pane::draw(frame, area, title, s.agents.get_mut(&id), focused, empty);
+        agent_pane::draw(frame, body, title, s.agents.get_mut(&key), focused, empty);
     }
 }

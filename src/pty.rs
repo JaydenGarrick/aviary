@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
-use crate::config::BotId;
+use crate::config::SessionKey;
 use crate::event::Event;
 
 /// How long after an injected prompt before its Enter is sent. Claude Code
@@ -35,10 +35,10 @@ pub struct Terminal {
 
 impl Terminal {
     /// Spawn `program` on a PTY of the given size, in `cwd`. The reader thread
-    /// pings the UI channel with the owning bot's id after every chunk, so the
-    /// roster knows WHO spoke without polling.
+    /// pings the UI channel with the owning session's key after every chunk,
+    /// so the roster knows WHO spoke without polling.
     pub fn spawn(
-        bot: BotId,
+        key: SessionKey,
         program: &str,
         args: &[String],
         cwd: &std::path::Path,
@@ -77,11 +77,11 @@ impl Terminal {
         {
             let running = running.clone();
             let notify = notify.clone();
-            let bot = bot.clone();
+            let key = key.clone();
             thread::spawn(move || {
                 let _ = child.wait();
                 running.store(false, Ordering::Relaxed);
-                let _ = notify.send(Event::AgentOutput(bot));
+                let _ = notify.send(Event::AgentOutput(key));
             });
         }
 
@@ -105,7 +105,7 @@ impl Terminal {
                             }
                             // The run loop coalesces these — a chatty child
                             // cannot spin the renderer.
-                            if notify.send(Event::AgentOutput(bot.clone())).is_err() {
+                            if notify.send(Event::AgentOutput(key.clone())).is_err() {
                                 break;
                             }
                         }

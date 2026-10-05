@@ -107,6 +107,8 @@ impl Roster {
                 let id = s.config.bots[*i].id.clone();
                 if s.current_bot.as_ref() != Some(&id) {
                     s.agent_focused = false;
+                    // A different bird starts on its primary tab.
+                    s.current_tab = 1;
                 }
                 // Looking at a bird reads its news.
                 s.agents.clear_unread(&id);
@@ -117,11 +119,13 @@ impl Roster {
                 let id = s.config.rooms[*i].id.clone();
                 s.current_room = Some(id);
                 s.current_bot = None;
+                s.current_tab = 1;
                 s.agent_focused = false;
             }
             None => {
                 s.current_bot = None;
                 s.current_room = None;
+                s.current_tab = 1;
                 s.agent_focused = false;
             }
         }
@@ -141,9 +145,11 @@ impl Roster {
         self.sync(s);
         match rows(&s.config).get(self.nav.selected) {
             Some(Row::Bot(_)) => {
-                if let Some(id) = s.current_bot.clone() {
-                    let prompt = s.opening_prompt(&id);
-                    s.boot_bot(&id, prompt.as_deref());
+                // Wake the tab in view — ⏎ with tab 2 up must not boot tab 1
+                // underneath the keyboard focus.
+                if let Some(key) = s.current_key() {
+                    let prompt = s.opening_prompt(&key);
+                    s.boot_key(&key, prompt.as_deref());
                     s.agent_focused = true;
                 }
             }
@@ -424,7 +430,7 @@ impl Component for Roster {
                             let tag_w = collab.as_ref().map_or(0, |t| t.chars().count() + 1);
                             let preview = s
                                 .agents
-                                .get(&bot.id)
+                                .get(&crate::config::SessionKey::primary(bot.id.clone()))
                                 .and_then(|sess| sess.last_prompt.clone())
                                 .map(|p| {
                                     format!("“{}”", truncate(&p, name_w.saturating_sub(tag_w)))

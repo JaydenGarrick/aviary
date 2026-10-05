@@ -36,6 +36,61 @@ impl BotId {
     }
 }
 
+/// One live session of one bird: the primary (tab 1, every external signal's
+/// target) or an extra human-driven tab. Tab 1 keeps the bird's historical
+/// names so existing resume records, handoff targets, and mentions stay valid.
+/// The `.` separator cannot collide with a bot id — [`slug`] never emits one.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SessionKey {
+    pub bot: BotId,
+    /// 1-based; 1 is the primary.
+    pub tab: u8,
+}
+
+impl SessionKey {
+    pub fn primary(bot: BotId) -> SessionKey {
+        SessionKey { bot, tab: 1 }
+    }
+
+    /// `aviary-<id>` for the primary, `aviary-<id>.<n>` for tabs.
+    pub fn session_name(&self) -> String {
+        match self.tab {
+            1 => self.bot.session_name(),
+            n => format!("{}.{n}", self.bot.session_name()),
+        }
+    }
+
+    /// The `state.json` spawned-set entry: `<id>` or `<id>.<n>`.
+    pub fn state_key(&self) -> String {
+        match self.tab {
+            1 => self.bot.0.clone(),
+            n => format!("{}.{n}", self.bot.0),
+        }
+    }
+
+    /// Inverse of [`SessionKey::session_name`].
+    pub fn parse_session_name(name: &str) -> Option<SessionKey> {
+        Self::parse_state_key(name.strip_prefix("aviary-")?)
+    }
+
+    /// Inverse of [`SessionKey::state_key`].
+    pub fn parse_state_key(key: &str) -> Option<SessionKey> {
+        if key.is_empty() {
+            return None;
+        }
+        match key.split_once('.') {
+            None => Some(SessionKey::primary(BotId(key.to_string()))),
+            Some((id, n)) => {
+                let tab: u8 = n.parse().ok()?;
+                (tab >= 2 && !id.is_empty()).then(|| SessionKey {
+                    bot: BotId(id.to_string()),
+                    tab,
+                })
+            }
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -239,11 +294,13 @@ impl Config {
         Ok(())
     }
 
-    /// The per-session `--settings` file for one bird: Stop + Notification
-    /// hooks (the truthful done/needs-input signals, probed working via
-    /// `--settings`), merged with the bird's optional permission allowlist.
-    /// Regenerated every launch — the hook command embeds the current exe.
-    pub fn settings_file_for(&self, bot: &Bot) -> Result<PathBuf> {
+    /// The per-session `--settings` file: Stop + Notification hooks (the
+    /// truthful done/needs-input signals, probed working via `--settings`),
+    /// merged with the bird's optional permission allowlist. Regenerated every
+    /// launch — the hook command embeds the current exe and the session name
+    /// (`--session`), which is what lets hook events name their tab; cwd alone
+    /// cannot, since every tab shares the repo.
+    pub fn settings_file_for(&self, bot: &Bot, key: &SessionKey) -> Result<PathBuf> {
         let dir = self.dir.join("settings");
         std::fs::create_dir_all(&dir)?;
         let exe = std::env::current_exe()
@@ -251,7 +308,7 @@ impl Config {
             .unwrap_or_else(|_| "aviary".into());
         let hook = serde_json::json!([{ "hooks": [{
             "type": "command",
-            "command": format!("\"{exe}\" --hook"),
+            "command": format!("\"{exe}\" --hook --session {}", key.session_name()),
         }]}]);
         let mut root = serde_json::json!({
             "hooks": { "Stop": hook.clone(), "Notification": hook }
@@ -272,7 +329,7 @@ impl Config {
             }
         }
 
-        let path = dir.join(format!("{}.json", bot.id));
+        let path = dir.join(format!("{}.json", key.state_key()));
         std::fs::write(&path, serde_json::to_string_pretty(&root)? + "\n")?;
         Ok(path)
     }
@@ -498,19 +555,40 @@ impl State {
             .unwrap_or_default()
     }
 
-    pub fn spawned_once(&self, id: &BotId) -> bool {
-        self.spawned.contains(&id.0)
+    pub fn spawned_once(&self, state_key: &str) -> bool {
+        self.spawned.contains(state_key)
     }
 
-    pub fn mark_spawned(&mut self, dir: &Path, id: &BotId) {
-        self.spawned.insert(id.0.clone());
+    pub fn mark_spawned(&mut self, dir: &Path, state_key: &str) {
+        self.spawned.insert(state_key.to_string());
         self.write(dir);
     }
 
     /// A `--resume` that died instantly means the named session is gone —
     /// forget it so the next launch starts fresh.
-    pub fn forget(&mut self, dir: &Path, id: &BotId) {
-        self.spawned.remove(&id.0);
+    pub fn forget(&mut self, dir: &Path, state_key: &str) {
+        self.spawned.remove(state_key);
+        self.write(dir);
+    }
+
+    /// Every tab of this bird with a session of record (`<id>` → 1,
+    /// `<id>.<n>` → n). Order is ascending by tab.
+    pub fn spawned_tabs(&self, id: &BotId) -> Vec<u8> {
+        let mut tabs: Vec<u8> = self
+            .spawned
+            .iter()
+            .filter_map(|k| SessionKey::parse_state_key(k))
+            .filter(|k| k.bot == *id)
+            .map(|k| k.tab)
+            .collect();
+        tabs.sort_unstable();
+        tabs
+    }
+
+    /// Drop every session record of one bird — primary and tabs alike.
+    pub fn forget_bot(&mut self, dir: &Path, id: &BotId) {
+        self.spawned
+            .retain(|k| SessionKey::parse_state_key(k).is_none_or(|key| key.bot != *id));
         self.write(dir);
     }
 
@@ -603,12 +681,70 @@ mod tests {
     #[test]
     fn state_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let id = BotId("swift".into());
         let mut st = State::default();
-        assert!(!st.spawned_once(&id));
-        st.mark_spawned(tmp.path(), &id);
-        assert!(State::load(tmp.path()).spawned_once(&id));
-        st.forget(tmp.path(), &id);
-        assert!(!State::load(tmp.path()).spawned_once(&id));
+        assert!(!st.spawned_once("swift"));
+        st.mark_spawned(tmp.path(), "swift");
+        assert!(State::load(tmp.path()).spawned_once("swift"));
+        st.forget(tmp.path(), "swift");
+        assert!(!State::load(tmp.path()).spawned_once("swift"));
+
+        // Tab entries share the set; forget_bot sweeps a bird's whole family
+        // without touching a bird whose id merely shares the prefix.
+        st.mark_spawned(tmp.path(), "swift");
+        st.mark_spawned(tmp.path(), "swift.2");
+        st.mark_spawned(tmp.path(), "swiftly");
+        let loaded = State::load(tmp.path());
+        assert!(loaded.spawned_once("swift.2"));
+        assert_eq!(loaded.spawned_tabs(&BotId("swift".into())), vec![1, 2]);
+        st.forget_bot(tmp.path(), &BotId("swift".into()));
+        let loaded = State::load(tmp.path());
+        assert!(!loaded.spawned_once("swift"));
+        assert!(!loaded.spawned_once("swift.2"));
+        assert!(loaded.spawned_once("swiftly"));
+    }
+
+    #[test]
+    fn session_key_names_and_state_keys() {
+        let primary = SessionKey::primary(BotId("swift".into()));
+        assert_eq!(primary.session_name(), "aviary-swift");
+        assert_eq!(primary.state_key(), "swift");
+        let tab = SessionKey { bot: BotId("night-jar".into()), tab: 3 };
+        assert_eq!(tab.session_name(), "aviary-night-jar.3");
+        assert_eq!(tab.state_key(), "night-jar.3");
+
+        assert_eq!(SessionKey::parse_session_name("aviary-swift"), Some(primary));
+        assert_eq!(SessionKey::parse_session_name("aviary-night-jar.3"), Some(tab.clone()));
+        assert_eq!(SessionKey::parse_state_key("night-jar.3"), Some(tab));
+        // Not ours / malformed: no prefix, tab 1 spelled out, junk suffix.
+        assert_eq!(SessionKey::parse_session_name("swift"), None);
+        assert_eq!(SessionKey::parse_state_key("swift.1"), None);
+        assert_eq!(SessionKey::parse_state_key("swift.x"), None);
+        assert_eq!(SessionKey::parse_state_key(".2"), None);
+    }
+
+    #[test]
+    fn slug_never_emits_the_tab_separator() {
+        // The `.` in `<id>.<n>` is only unambiguous because no bot id can
+        // contain one — a bird named "night.jar" slugs the dot away.
+        assert_eq!(slug("night.jar"), "night-jar");
+        assert_eq!(slug("v2.0 bird"), "v2-0-bird");
+        assert!(!slug("a.b.c-2.9").contains('.'));
+    }
+
+    #[test]
+    fn settings_file_embeds_session_flag() {
+        let (tmp, cfg) = temp_config();
+        let bot = cfg.bots[0].clone();
+        let key = SessionKey { bot: bot.id.clone(), tab: 2 };
+        let path = cfg.settings_file_for(&bot, &key).unwrap();
+        assert!(path.ends_with("settings/swift.2.json"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("--hook --session aviary-swift.2"));
+        // The primary keeps its historical filename.
+        let primary = cfg
+            .settings_file_for(&bot, &SessionKey::primary(bot.id.clone()))
+            .unwrap();
+        assert!(primary.ends_with("settings/swift.json"));
+        drop(tmp);
     }
 }

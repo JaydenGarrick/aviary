@@ -58,6 +58,17 @@ pub fn status_span(status: BotStatus) -> Span<'static> {
     }
 }
 
+/// The chip's glyph alone — tab-strip sized, same shapes and colours.
+pub fn status_glyph(status: BotStatus) -> Span<'static> {
+    match status {
+        BotStatus::Working => Span::styled("●", Style::default().fg(OK)),
+        BotStatus::NeedsInput => Span::styled("⏸", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+        BotStatus::Done(_) => Span::styled("✔", Style::default().fg(MUTED)),
+        BotStatus::NotStarted => Span::styled("○", Style::default().fg(DIM)),
+        BotStatus::Exited => Span::styled("✗", Style::default().fg(BAD)),
+    }
+}
+
 pub fn human_duration(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
