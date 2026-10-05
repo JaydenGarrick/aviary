@@ -188,10 +188,11 @@ impl Component for Thread {
             .map(bird_color)
             .unwrap_or(ACCENT);
 
-        // The tab strip: only once there is more than one session to show.
+        // The tab strip — always up, so [+] is discoverable before any second
+        // tab exists.
         let tabs = s.agents.tabs(&id);
         let mut body = area;
-        if tabs.len() > 1 && area.height > 1 {
+        if area.height > 1 {
             let strip = Rect { height: 1, ..area };
             body = Rect {
                 y: area.y + 1,
