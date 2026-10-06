@@ -104,7 +104,9 @@ Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 
 Mouse: click rows to select (again to step in), click chips/fields/members in
 any form, click outside a popup to dismiss it, wheel scrolls everything —
-including the bird's own transcript inside its pane.
+including the bird's own transcript inside its pane. Right-click a session tab
+for its menu (name · new · close); the strip wraps onto more rows when the
+labels outgrow the pane.
 
 ## Doctor, routines, webhooks
 

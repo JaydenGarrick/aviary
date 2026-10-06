@@ -376,6 +376,7 @@ impl App {
                 Overlay::Confirm(f) => f.handle_key(key),
                 Overlay::Context(f) => f.handle_key(key),
                 Overlay::RenameTab(f) => f.handle_key(key),
+                Overlay::TabMenu(f) => f.handle_key(key),
                 _ => return,
             };
             self.on_form_event(event);
@@ -607,6 +608,14 @@ impl App {
                 fx.msg(Msg::ConfirmDelete(target));
                 self.apply(fx);
             }
+            FormEvent::Tab(action) => {
+                self.overlay = Overlay::None;
+                if !self.room_selected() {
+                    let mut fx = Effects::default();
+                    self.components.thread.update(action, &mut self.shared, &mut fx);
+                    self.apply(fx);
+                }
+            }
             FormEvent::RenameTab { key, name } => {
                 self.overlay = Overlay::None;
                 self.shared.agents.set_tab_name(&self.shared.config, &key, &name);
@@ -716,6 +725,7 @@ impl App {
                 Overlay::Confirm(f) => f.handle_mouse(m),
                 Overlay::Context(f) => f.handle_mouse(m),
                 Overlay::RenameTab(f) => f.handle_mouse(m),
+                Overlay::TabMenu(f) => f.handle_mouse(m),
                 _ => return,
             };
             self.on_form_event(event);
@@ -789,6 +799,13 @@ impl App {
                 }
                 Msg::OpenContext { target, x, y } => {
                     self.overlay = Overlay::Context(crate::overlays::ContextMenu::new(target, x, y));
+                }
+                Msg::OpenTabMenu { x, y } => {
+                    self.overlay = Overlay::TabMenu(crate::overlays::TabMenu::new(
+                        self.shared.current_tab,
+                        x,
+                        y,
+                    ));
                 }
                 Msg::OpenRenameTab(key) => {
                     let current = self
@@ -900,6 +917,7 @@ impl App {
             Overlay::Confirm(f) => f.draw(frame, frame.area()),
             Overlay::Context(f) => f.draw(frame, frame.area()),
             Overlay::RenameTab(f) => f.draw(frame, frame.area()),
+            Overlay::TabMenu(f) => f.draw(frame, frame.area()),
         }
     }
 }

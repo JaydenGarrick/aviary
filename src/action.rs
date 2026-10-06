@@ -87,6 +87,8 @@ pub enum Msg {
     },
     /// Open the rename-tab form for one session tab.
     OpenRenameTab(crate::config::SessionKey),
+    /// Open the right-click menu for the CURRENT tab, anchored at the click.
+    OpenTabMenu { x: u16, y: u16 },
     /// Show a transient status line in the chrome.
     Flash(String),
 }

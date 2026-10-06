@@ -6,7 +6,7 @@
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -135,16 +135,24 @@ impl Component for Thread {
         }
     }
 
-    fn handle_mouse(&mut self, m: MouseEvent, s: &mut Shared, _fx: &mut Effects) {
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+    fn handle_mouse(&mut self, m: MouseEvent, s: &mut Shared, fx: &mut Effects) {
+        if let MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right)) = m.kind {
             if let Some((_, tab)) = self
                 .tab_rects
                 .iter()
                 .find(|(r, _)| hits(*r, m.column, m.row))
             {
-                match *tab {
-                    NEW_TAB => self.new_tab(s),
-                    t => self.select_tab(s, t),
+                match (*tab, button) {
+                    (NEW_TAB, _) => self.new_tab(s),
+                    (t, MouseButton::Left) => self.select_tab(s, t),
+                    // Right click: select the tab, then its menu acts on it.
+                    (t, _) => {
+                        self.select_tab(s, t);
+                        fx.msg(crate::action::Msg::OpenTabMenu {
+                            x: m.column,
+                            y: m.row,
+                        });
+                    }
                 }
                 return;
             }
@@ -196,46 +204,83 @@ impl Component for Thread {
             .unwrap_or(ACCENT);
 
         // The tab strip — always up, so [+] is discoverable before any second
-        // tab exists.
+        // tab exists. Chips wrap onto more rows instead of clipping a long
+        // label; the selected chip spells its status out, the rest glyph only.
         let tabs = s.agents.tabs(&id);
         let mut body = area;
         if area.height > 1 {
-            let strip = Rect { height: 1, ..area };
-            body = Rect {
-                y: area.y + 1,
-                height: area.height - 1,
-                ..area
-            };
-            let mut spans: Vec<Span> = vec![Span::raw(" ")];
-            let mut x = strip.x + 1;
+            // A chip is (its spans, width, tab number). Widths assume the
+            // status glyphs render 1 cell wide, like the rest of the UI does.
+            let mut chips: Vec<(Vec<Span>, u16, u8)> = Vec::new();
             for t in &tabs {
                 let key = SessionKey { bot: id.clone(), tab: *t };
-                let selected = *t == s.current_tab;
-                let style = if selected {
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                let colour = bird_color(*t as usize - 1);
+                let label = match s.agents.tab_name(&key) {
+                    Some(n) => format!("{t}:{n}"),
+                    None => format!("{t}"),
+                };
+                let status = s.agents.status_key(&key);
+                if *t == s.current_tab {
+                    let text = format!(" {label} {} ", crate::ui::status_text(status));
+                    let w = text.chars().count() as u16;
+                    let chip = Span::styled(
+                        text,
+                        Style::default()
+                            .bg(colour)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    chips.push((vec![chip], w, *t));
                 } else {
-                    Style::default().fg(crate::ui::DIM)
-                };
-                let label = s
-                    .agents
-                    .tab_name(&key)
-                    .map(|n| n.chars().take(12).collect::<String>());
-                let open = match label {
-                    Some(n) => format!("[{t}:{n} "),
-                    None => format!("[{t} "),
-                };
-                // Rect width: the label's chars, the 1-wide glyph, and "]".
-                let width = (open.chars().count() + 2) as u16;
-                spans.push(Span::styled(open, style));
-                spans.push(status_glyph(s.agents.status_key(&key)));
-                spans.push(Span::styled("]", style));
-                spans.push(Span::raw(" "));
-                self.tab_rects.push((Rect { x, width, ..strip }, *t));
-                x += width + 1;
+                    let open = format!("[{label} ");
+                    let w = (open.chars().count() + 2) as u16;
+                    let style = Style::default().fg(colour);
+                    chips.push((
+                        vec![
+                            Span::styled(open, style),
+                            status_glyph(status),
+                            Span::styled("]", style),
+                        ],
+                        w,
+                        *t,
+                    ));
+                }
             }
-            spans.push(dim("[+]"));
-            self.tab_rects.push((Rect { x, width: 3, ..strip }, NEW_TAB));
-            frame.render_widget(ratatui::widgets::Paragraph::new(Line::from(spans)), strip);
+            chips.push((vec![dim("[+]")], 3, NEW_TAB));
+
+            // Wrap chips into rows; never let the strip eat the whole pane.
+            let max_rows = area.height.saturating_sub(4).max(1);
+            let right = area.x + area.width;
+            let (mut x, mut row) = (area.x + 1, 0u16);
+            let mut rows: Vec<Vec<Span>> = vec![vec![Span::raw(" ")]];
+            for (spans, w, t) in chips {
+                if x + w > right && x > area.x + 1 && row + 1 < max_rows {
+                    row += 1;
+                    x = area.x + 1;
+                    rows.push(vec![Span::raw(" ")]);
+                }
+                self.tab_rects.push((
+                    Rect { x, y: area.y + row, width: w.min(right.saturating_sub(x)), height: 1 },
+                    t,
+                ));
+                let line = rows.last_mut().expect("rows starts non-empty");
+                line.extend(spans);
+                line.push(Span::raw(" "));
+                x += w + 1;
+            }
+            let strip_h = rows.len() as u16;
+            let strip = Rect { height: strip_h, ..area };
+            body = Rect {
+                y: area.y + strip_h,
+                height: area.height - strip_h,
+                ..area
+            };
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(
+                    rows.into_iter().map(Line::from).collect::<Vec<_>>(),
+                ),
+                strip,
+            );
         }
         self.pane = body;
 

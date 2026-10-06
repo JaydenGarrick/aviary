@@ -39,23 +39,30 @@ pub fn dim(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(DIM))
 }
 
+/// The chip's words (glyph + state), unstyled — for surfaces that carry their
+/// own styling, like the selected tab.
+pub fn status_text(status: BotStatus) -> String {
+    match status {
+        BotStatus::Working => "● working".into(),
+        BotStatus::NeedsInput => "⏸ needs you".into(),
+        BotStatus::Done(secs) => format!("✔ done {}", human_duration(secs)),
+        BotStatus::NotStarted => "○ not started".into(),
+        BotStatus::Exited => "✗ exited".into(),
+    }
+}
+
 /// Status chip: shape AND colour, so the roster reads without colour too.
 /// "done" = finished responding, waiting at its prompt; "needs you" = blocked
 /// on a permission prompt or question (from polls/hooks — the real signal).
 pub fn status_span(status: BotStatus) -> Span<'static> {
-    match status {
-        BotStatus::Working => Span::styled("● working", Style::default().fg(OK)),
-        BotStatus::NeedsInput => Span::styled(
-            "⏸ needs you",
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-        ),
-        BotStatus::Done(secs) => Span::styled(
-            format!("✔ done {}", human_duration(secs)),
-            Style::default().fg(MUTED),
-        ),
-        BotStatus::NotStarted => Span::styled("○ not started", Style::default().fg(DIM)),
-        BotStatus::Exited => Span::styled("✗ exited", Style::default().fg(BAD)),
-    }
+    let style = match status {
+        BotStatus::Working => Style::default().fg(OK),
+        BotStatus::NeedsInput => Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        BotStatus::Done(_) => Style::default().fg(MUTED),
+        BotStatus::NotStarted => Style::default().fg(DIM),
+        BotStatus::Exited => Style::default().fg(BAD),
+    };
+    Span::styled(status_text(status), style)
 }
 
 /// The chip's glyph alone — tab-strip sized, same shapes and colours.
