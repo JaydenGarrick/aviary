@@ -142,10 +142,13 @@ impl Component for Thread {
                 .iter()
                 .find(|(r, _)| hits(*r, m.column, m.row))
             {
+                // Clicking the SELECTED tab again opens its menu (the roster's
+                // "click again to step in" idiom) — right-click does too, but
+                // iTerm2 keeps right-clicks for its own menu by default, so
+                // the left-click path is the one that works everywhere.
                 match (*tab, button) {
                     (NEW_TAB, _) => self.new_tab(s),
-                    (t, MouseButton::Left) => self.select_tab(s, t),
-                    // Right click: select the tab, then its menu acts on it.
+                    (t, MouseButton::Left) if t != s.current_tab => self.select_tab(s, t),
                     (t, _) => {
                         self.select_tab(s, t);
                         fx.msg(crate::action::Msg::OpenTabMenu {
