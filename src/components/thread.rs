@@ -25,6 +25,7 @@ pub static KEYMAP: &[Binding] = &[
     bind(ch('['), Action::PrevTab, None, "previous session tab"),
     bind(ch('T'), Action::NewTab, None, "open another session of this bird"),
     bind(ch('W'), Action::CloseTab, None, "close the viewed tab (tab 1 refuses)"),
+    bind(ch('R'), Action::RenameTab, None, "label the viewed tab"),
 ];
 
 /// The tab strip's `[+]` button, stored beside real (1-based) tab numbers.
@@ -93,7 +94,7 @@ impl Thread {
 }
 
 impl Component for Thread {
-    fn update(&mut self, a: Action, s: &mut Shared, _fx: &mut Effects) {
+    fn update(&mut self, a: Action, s: &mut Shared, fx: &mut Effects) {
         let Some(id) = s.current_bot.clone() else { return };
         match a {
             Action::NextTab | Action::PrevTab => {
@@ -106,6 +107,12 @@ impl Component for Thread {
                 self.select_tab(s, tabs[nav.selected]);
             }
             Action::NewTab => self.new_tab(s),
+            Action::RenameTab => {
+                fx.msg(crate::action::Msg::OpenRenameTab(SessionKey {
+                    bot: id,
+                    tab: s.current_tab,
+                }));
+            }
             Action::CloseTab => {
                 if s.current_tab == 1 {
                     s.flash("tab 1 is the bird itself — x on the sidebar stops it");
@@ -209,7 +216,14 @@ impl Component for Thread {
                 } else {
                     Style::default().fg(crate::ui::DIM)
                 };
-                let open = format!("[{t} ");
+                let label = s
+                    .agents
+                    .tab_name(&key)
+                    .map(|n| n.chars().take(12).collect::<String>());
+                let open = match label {
+                    Some(n) => format!("[{t}:{n} "),
+                    None => format!("[{t} "),
+                };
                 // Rect width: the label's chars, the 1-wide glyph, and "]".
                 let width = (open.chars().count() + 2) as u16;
                 spans.push(Span::styled(open, style));

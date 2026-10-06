@@ -51,6 +51,8 @@ pub enum Action {
     NewTab,
     /// Stop the viewed tab and forget its resume record (tab 1 refuses).
     CloseTab,
+    /// Label the viewed tab (display only).
+    RenameTab,
     // -- scrolling panes
     PageUp,
     PageDown,
@@ -83,6 +85,8 @@ pub enum Msg {
         source: Option<BotId>,
         preselect: Option<BotId>,
     },
+    /// Open the rename-tab form for one session tab.
+    OpenRenameTab(crate::config::SessionKey),
     /// Show a transient status line in the chrome.
     Flash(String),
 }

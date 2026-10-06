@@ -210,6 +210,16 @@ impl AgentStore {
         self.state.spawned_once(&key.state_key())
     }
 
+    /// The tab's human label, if the user set one (display only).
+    pub fn tab_name(&self, key: &SessionKey) -> Option<&str> {
+        self.state.tab_name(&key.state_key())
+    }
+
+    /// Label a tab for the strip; an empty name clears the label.
+    pub fn set_tab_name(&mut self, cfg: &Config, key: &SessionKey, name: &str) {
+        self.state.set_tab_name(&cfg.dir, &key.state_key(), name);
+    }
+
     /// Every tab the strip should show: resumable records ∪ live sessions,
     /// sorted; tab 1 is always present.
     pub fn tabs(&self, id: &BotId) -> Vec<u8> {

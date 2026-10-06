@@ -25,6 +25,7 @@ pub enum Overlay {
     Profile(ProfileView),
     Confirm(ConfirmForm),
     Context(ContextMenu),
+    RenameTab(RenameTabForm),
 }
 
 impl Overlay {
@@ -65,6 +66,11 @@ pub enum FormEvent {
     WriteRoom(String),
     /// Open the release/delete CONFIRM dialog (menus never delete directly).
     AskDelete(crate::action::RosterTarget),
+    /// Label a session tab (display only; empty clears).
+    RenameTab {
+        key: crate::config::SessionKey,
+        name: String,
+    },
 }
 
 const GLYPHS: [&str; 6] = ["🐦", "🦉", "🦅", "🪿", "🐧", "🦜"];
@@ -263,6 +269,76 @@ impl AddBotForm {
         for (i, slot) in self.field_rects.iter_mut().enumerate() {
             *slot = line_rect(self.popup, i + 1);
         }
+        self.submit = line_rect(self.popup, submit_idx);
+    }
+}
+
+// ----------------------------------------------------------------- rename tab
+
+pub struct RenameTabForm {
+    key: crate::config::SessionKey,
+    name: String,
+    popup: Rect,
+    submit: Rect,
+}
+
+impl RenameTabForm {
+    pub fn new(key: crate::config::SessionKey, current: String) -> RenameTabForm {
+        RenameTabForm {
+            key,
+            name: current,
+            popup: Rect::default(),
+            submit: Rect::default(),
+        }
+    }
+
+    fn submit(&self) -> FormEvent {
+        FormEvent::RenameTab {
+            key: self.key.clone(),
+            name: self.name.trim().to_string(),
+        }
+    }
+
+    pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
+        match k.code {
+            KeyCode::Esc => return FormEvent::Cancel,
+            KeyCode::Backspace => {
+                self.name.pop();
+            }
+            KeyCode::Char(c) => self.name.push(c),
+            KeyCode::Enter => return self.submit(),
+            _ => {}
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if hits(self.submit, x, y) {
+            return self.submit();
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let lines = vec![
+            Line::from(""),
+            field_line("label", &self.name, true, "a short label — empty clears it"),
+            Line::from(""),
+            Line::from(dim(format!(
+                "  display only — the session stays {}",
+                self.key.session_name()
+            ))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ⏎ save", Style::default().fg(ACCENT)),
+                dim(" · esc cancel"),
+            ]),
+        ];
+        let submit_idx = lines.len() - 1;
+        self.popup = popup(frame, area, &format!("name tab {}", self.key.tab), lines);
         self.submit = line_rect(self.popup, submit_idx);
     }
 }

@@ -545,6 +545,10 @@ pub struct State {
     /// `"<bot>/<routine id>"` → unix seconds of the last firing.
     #[serde(default)]
     routine_runs: std::collections::BTreeMap<String, u64>,
+    /// State key → a human label for the tab strip. Display only — the
+    /// SESSION name stays `aviary-<id>[.n]`, or resume would break.
+    #[serde(default)]
+    tab_names: std::collections::BTreeMap<String, String>,
 }
 
 impl State {
@@ -565,9 +569,25 @@ impl State {
     }
 
     /// A `--resume` that died instantly means the named session is gone —
-    /// forget it so the next launch starts fresh.
+    /// forget it (and its label) so the next launch starts fresh.
     pub fn forget(&mut self, dir: &Path, state_key: &str) {
         self.spawned.remove(state_key);
+        self.tab_names.remove(state_key);
+        self.write(dir);
+    }
+
+    pub fn tab_name(&self, state_key: &str) -> Option<&str> {
+        self.tab_names.get(state_key).map(String::as_str)
+    }
+
+    /// Label a tab for the strip; an empty name clears the label.
+    pub fn set_tab_name(&mut self, dir: &Path, state_key: &str, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.tab_names.remove(state_key);
+        } else {
+            self.tab_names.insert(state_key.to_string(), name.to_string());
+        }
         self.write(dir);
     }
 
@@ -587,8 +607,9 @@ impl State {
 
     /// Drop every session record of one bird — primary and tabs alike.
     pub fn forget_bot(&mut self, dir: &Path, id: &BotId) {
-        self.spawned
-            .retain(|k| SessionKey::parse_state_key(k).is_none_or(|key| key.bot != *id));
+        let foreign = |k: &str| SessionKey::parse_state_key(k).is_none_or(|key| key.bot != *id);
+        self.spawned.retain(|k| foreign(k));
+        self.tab_names.retain(|k, _| foreign(k));
         self.write(dir);
     }
 
@@ -701,6 +722,24 @@ mod tests {
         assert!(!loaded.spawned_once("swift"));
         assert!(!loaded.spawned_once("swift.2"));
         assert!(loaded.spawned_once("swiftly"));
+    }
+
+    #[test]
+    fn tab_names_persist_and_clean_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = State::default();
+        st.set_tab_name(tmp.path(), "swift.2", "refactor");
+        st.set_tab_name(tmp.path(), "swift", "main");
+        st.set_tab_name(tmp.path(), "raven.3", "triage");
+        assert_eq!(State::load(tmp.path()).tab_name("swift.2"), Some("refactor"));
+        // Empty and whitespace names clear.
+        st.set_tab_name(tmp.path(), "swift", "  ");
+        assert_eq!(st.tab_name("swift"), None);
+        // Closing a tab forgets its label; releasing a bird forgets them all.
+        st.forget(tmp.path(), "swift.2");
+        assert_eq!(st.tab_name("swift.2"), None);
+        st.forget_bot(tmp.path(), &BotId("raven".into()));
+        assert_eq!(State::load(tmp.path()).tab_name("raven.3"), None);
     }
 
     #[test]

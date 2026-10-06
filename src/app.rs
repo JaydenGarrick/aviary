@@ -375,6 +375,7 @@ impl App {
                 Overlay::Profile(f) => f.handle_key(key),
                 Overlay::Confirm(f) => f.handle_key(key),
                 Overlay::Context(f) => f.handle_key(key),
+                Overlay::RenameTab(f) => f.handle_key(key),
                 _ => return,
             };
             self.on_form_event(event);
@@ -467,7 +468,11 @@ impl App {
                 }
             }
             // Session tabs belong to the thread pane.
-            Action::NextTab | Action::PrevTab | Action::NewTab | Action::CloseTab => {
+            Action::NextTab
+            | Action::PrevTab
+            | Action::NewTab
+            | Action::CloseTab
+            | Action::RenameTab => {
                 if !self.room_selected() {
                     let mut fx = Effects::default();
                     self.components.thread.update(action, &mut self.shared, &mut fx);
@@ -602,6 +607,15 @@ impl App {
                 fx.msg(Msg::ConfirmDelete(target));
                 self.apply(fx);
             }
+            FormEvent::RenameTab { key, name } => {
+                self.overlay = Overlay::None;
+                self.shared.agents.set_tab_name(&self.shared.config, &key, &name);
+                self.shared.flash(if name.is_empty() {
+                    format!("tab {} unlabeled", key.tab)
+                } else {
+                    format!("tab {} → “{name}”", key.tab)
+                });
+            }
         }
     }
 
@@ -701,6 +715,7 @@ impl App {
                 Overlay::Profile(f) => f.handle_mouse(m),
                 Overlay::Confirm(f) => f.handle_mouse(m),
                 Overlay::Context(f) => f.handle_mouse(m),
+                Overlay::RenameTab(f) => f.handle_mouse(m),
                 _ => return,
             };
             self.on_form_event(event);
@@ -774,6 +789,16 @@ impl App {
                 }
                 Msg::OpenContext { target, x, y } => {
                     self.overlay = Overlay::Context(crate::overlays::ContextMenu::new(target, x, y));
+                }
+                Msg::OpenRenameTab(key) => {
+                    let current = self
+                        .shared
+                        .agents
+                        .tab_name(&key)
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    self.overlay =
+                        Overlay::RenameTab(crate::overlays::RenameTabForm::new(key, current));
                 }
                 Msg::Compose { source, preselect } => {
                     match ComposeForm::new(&self.shared, source, preselect) {
@@ -874,6 +899,7 @@ impl App {
             Overlay::Profile(f) => f.draw(frame, frame.area(), &self.shared),
             Overlay::Confirm(f) => f.draw(frame, frame.area()),
             Overlay::Context(f) => f.draw(frame, frame.area()),
+            Overlay::RenameTab(f) => f.draw(frame, frame.area()),
         }
     }
 }

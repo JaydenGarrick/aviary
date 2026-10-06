@@ -98,6 +98,7 @@ Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 | `T` / click `[+]` | open a parallel session of the bird in a new tab |
 | `]` / `[` / click a tab | cycle / pick the bird's session tabs |
 | `W` | close the viewed tab and forget it (tab 1 refuses — that's the bird) |
+| `R` | label the viewed tab (display only; empty clears) |
 | `i` / `u` / `d` / `1-5` | write / scroll the room / pick a quick-reply |
 | `?` | help, generated from the real keymaps |
 
