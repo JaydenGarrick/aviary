@@ -408,6 +408,7 @@ impl Component for Roster {
                         Row::Bot(i) => {
                             let bot = &s.config.bots[i];
                             let colour = bird_color(i);
+                            let (status, status_tab) = s.agents.status_tabbed(&bot.id);
                             let mut title = vec![
                                 Span::raw(format!(" {} ", bot.glyph)),
                                 Span::styled(
@@ -418,8 +419,12 @@ impl Component for Roster {
                                         Style::default().fg(colour)
                                     },
                                 ),
-                                status_span(s.agents.status(&bot.id)),
+                                status_span(status),
                             ];
+                            // Multi-tab birds say WHICH tab the chip reports.
+                            if let Some(tab) = status_tab {
+                                title.push(dim(format!("·{tab}")));
+                            }
                             if s.agents.is_unread(&bot.id) {
                                 // Grok-Bot unread dot: news since you last looked.
                                 title.push(Span::styled(" ●", Style::default().fg(ACCENT)));

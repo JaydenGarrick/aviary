@@ -242,11 +242,17 @@ impl AgentStore {
     /// The roster chip: the most attention-worthy status across the bird's
     /// sessions — NeedsInput > Working > Done (youngest) > Exited.
     pub fn status(&self, id: &BotId) -> BotStatus {
+        self.status_tabbed(id).0
+    }
+
+    /// The roster chip plus WHICH tab it is reporting — named only when the
+    /// bird has more than one session, so single-tab birds stay clean.
+    pub fn status_tabbed(&self, id: &BotId) -> (BotStatus, Option<u8>) {
         aggregate_status(
             self.sessions
                 .keys()
                 .filter(|k| k.bot == *id)
-                .map(|k| self.status_key(k)),
+                .map(|k| (k.tab, self.status_key(k))),
         )
     }
 
@@ -537,7 +543,11 @@ impl AgentStore {
 }
 
 /// Aggregate per-session statuses into the roster chip: attention first.
-fn aggregate_status(statuses: impl Iterator<Item = BotStatus>) -> BotStatus {
+/// Returns the winning status and its tab — the tab is `Some` only when more
+/// than one session contributed, since "which tab" is noise on a lone bird.
+fn aggregate_status(
+    statuses: impl Iterator<Item = (u8, BotStatus)>,
+) -> (BotStatus, Option<u8>) {
     use BotStatus::*;
     fn rank(s: &BotStatus) -> u8 {
         match s {
@@ -548,12 +558,18 @@ fn aggregate_status(statuses: impl Iterator<Item = BotStatus>) -> BotStatus {
             NotStarted => 0,
         }
     }
-    statuses.fold(NotStarted, |acc, s| match (acc, s) {
-        // Two finished tabs: the chip shows the FRESHEST completion.
-        (Done(a), Done(b)) => Done(a.min(b)),
-        (acc, s) if rank(&s) > rank(&acc) => s,
-        (acc, _) => acc,
-    })
+    let mut n = 0usize;
+    let folded = statuses.fold((NotStarted, 1u8), |(acc, at), (tab, s)| {
+        n += 1;
+        match (acc, s) {
+            // Two finished tabs: the chip shows the FRESHEST completion.
+            (Done(a), Done(b)) if b < a => (Done(b), tab),
+            (Done(a), Done(_)) => (Done(a), at),
+            (acc, s) if rank(&s) > rank(&acc) => (s, tab),
+            (acc, _) => (acc, at),
+        }
+    });
+    (folded.0, (n > 1).then_some(folded.1))
 }
 
 /// Match poll rows to live keys by EXACT session name — `aviary-swift.2`
@@ -723,16 +739,19 @@ mod tests {
     #[test]
     fn aggregate_status_shows_the_most_attention_worthy_tab() {
         use BotStatus::*;
-        assert_eq!(aggregate_status([].into_iter()), NotStarted);
-        assert_eq!(aggregate_status([Done(30), Working].into_iter()), Working);
+        let agg = |v: Vec<(u8, BotStatus)>| aggregate_status(v.into_iter());
+        assert_eq!(agg(vec![]), (NotStarted, None));
+        // A lone session never names its tab — "which tab" is noise then.
+        assert_eq!(agg(vec![(1, Working)]), (Working, None));
+        assert_eq!(agg(vec![(1, Done(30)), (2, Working)]), (Working, Some(2)));
         assert_eq!(
-            aggregate_status([Working, NeedsInput, Done(5)].into_iter()),
-            NeedsInput
+            agg(vec![(1, Working), (3, NeedsInput), (2, Done(5))]),
+            (NeedsInput, Some(3))
         );
         // Two finished tabs: the chip shows the freshest completion.
-        assert_eq!(aggregate_status([Done(300), Done(5)].into_iter()), Done(5));
-        assert_eq!(aggregate_status([Exited, Done(9)].into_iter()), Done(9));
-        assert_eq!(aggregate_status([Exited, NotStarted].into_iter()), Exited);
+        assert_eq!(agg(vec![(1, Done(300)), (4, Done(5))]), (Done(5), Some(4)));
+        assert_eq!(agg(vec![(1, Exited), (2, Done(9))]), (Done(9), Some(2)));
+        assert_eq!(agg(vec![(1, Exited), (2, NotStarted)]), (Exited, Some(1)));
     }
 
     #[test]
