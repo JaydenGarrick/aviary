@@ -100,15 +100,27 @@ pub fn run(mut terminal: DefaultTerminal) -> Result<()> {
 
     while !app.should_quit {
         terminal.draw(|frame| app.draw(frame))?;
-        match rx.recv() {
-            Ok(ev) => {
-                app.handle(ev);
-                // Coalesce: a chatty bird must not spin the renderer.
-                while let Ok(next) = rx.try_recv() {
-                    app.handle(next);
-                }
+        // While a spinner is on screen, wake up at frame rate so it actually
+        // spins (a quiet working bird only emits the 1s tick). Otherwise stay
+        // fully blocking — no idle CPU burn.
+        let ev = if app.shared.agents.has_working() {
+            match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok(ev) => Some(ev),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, // redraw only
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            Err(_) => break,
+        } else {
+            match rx.recv() {
+                Ok(ev) => Some(ev),
+                Err(_) => break,
+            }
+        };
+        if let Some(ev) = ev {
+            app.handle(ev);
+            // Coalesce: a chatty bird must not spin the renderer.
+            while let Ok(next) = rx.try_recv() {
+                app.handle(next);
+            }
         }
     }
     Ok(())
@@ -125,16 +137,18 @@ impl App {
         match ev {
             Event::Key(k) => self.on_key(k),
             Event::Mouse(m) => self.on_mouse(m),
-            Event::AgentOutput(id) => {
+            Event::AgentOutput(key) => {
                 use crate::agent_store::RelaunchHint;
-                if self.shared.agents.note_output(&self.shared.config, &id)
+                if self.shared.agents.note_output(&self.shared.config, &key)
                     == RelaunchHint::FreshSpawn
                 {
-                    // The named session was gone — start the bird fresh.
-                    let prompt = self.shared.opening_prompt(&id);
-                    self.shared.boot_bot(&id, prompt.as_deref());
-                    self.shared
-                        .flash(format!("{id}'s old session was gone — hatched fresh"));
+                    // The named session was gone — start THAT tab fresh.
+                    let prompt = self.shared.opening_prompt(&key);
+                    self.shared.boot_key(&key, prompt.as_deref());
+                    self.shared.flash(format!(
+                        "{}'s old session was gone — hatched fresh",
+                        key.session_name()
+                    ));
                 }
             }
             Event::Done(result) => match *result {
@@ -143,8 +157,7 @@ impl App {
                 }
                 crate::command::CommandResult::Agents { gen, ref sessions } => {
                     if self.shared.agents_poll.accept(gen, ()) {
-                        let transitions =
-                            self.shared.agents.apply_poll(&self.shared.config, sessions);
+                        let transitions = self.shared.agents.apply_poll(sessions);
                         self.react(transitions);
                     }
                 }
@@ -161,15 +174,16 @@ impl App {
     fn react(&mut self, transitions: Vec<crate::agent_store::Transition>) {
         use crate::agent_store::StatusKind;
         for t in transitions {
-            let selected =
-                self.shared.current_room.is_none() && self.shared.current_bot.as_ref() == Some(&t.id);
-            let Some(bot) = self.shared.config.bot(&t.id).cloned() else {
+            // "Looking at it" means the exact TAB, not just the bird.
+            let selected = self.shared.current_room.is_none()
+                && self.shared.current_key().as_ref() == Some(&t.key);
+            let Some(bot) = self.shared.config.bot(&t.key.bot).cloned() else {
                 continue;
             };
             match t.to {
                 StatusKind::NeedsInput => {
                     if !selected {
-                        self.shared.agents.mark_unread(&t.id);
+                        self.shared.agents.mark_unread(&t.key.bot);
                     }
                     if bot.notify {
                         self.executor.run(crate::command::Command::Notify {
@@ -179,14 +193,14 @@ impl App {
                     }
                 }
                 StatusKind::Done if t.from == StatusKind::Working && !selected => {
-                    self.shared.agents.mark_unread(&t.id);
+                    self.shared.agents.mark_unread(&t.key.bot);
                     if bot.notify {
                         self.executor.run(crate::command::Command::Notify {
                             title: format!("{} {} finished", bot.glyph, bot.name),
                             body: self
                                 .shared
                                 .agents
-                                .get(&t.id)
+                                .get(&t.key)
                                 .and_then(|s| s.last_prompt.clone())
                                 .unwrap_or_else(|| "waiting at its prompt".into()),
                         });
@@ -285,6 +299,7 @@ impl App {
             for ev in events {
                 if let Some(t) = self.shared.agents.apply_hook(
                     &self.shared.config,
+                    ev.aviary_session.as_deref(),
                     &ev.cwd,
                     &ev.hook_event_name,
                     &ev.detail(),
@@ -336,15 +351,15 @@ impl App {
                 self.shared.agent_focused = false;
                 return;
             }
-            let Some(id) = self.shared.current_bot.clone() else {
+            let Some(skey) = self.shared.current_key() else {
                 self.shared.agent_focused = false;
                 return;
             };
-            match self.shared.agents.get_mut(&id) {
+            match self.shared.agents.get_mut(&skey) {
                 Some(s) if s.term.is_running() => {
                     s.term.send_key(key);
                     // The user taking over means the bird works for THEM now.
-                    self.shared.agents.clear_collab(&id);
+                    self.shared.agents.clear_collab(&skey.bot);
                 }
                 _ => self.shared.agent_focused = false,
             }
@@ -372,6 +387,8 @@ impl App {
                 Overlay::Profile(f) => f.handle_key(key),
                 Overlay::Confirm(f) => f.handle_key(key),
                 Overlay::Context(f) => f.handle_key(key),
+                Overlay::RenameTab(f) => f.handle_key(key),
+                Overlay::TabMenu(f) => f.handle_key(key),
                 _ => return,
             };
             self.on_form_event(event);
@@ -386,9 +403,16 @@ impl App {
             return;
         }
 
-        // ⑤/⑥ sidebar keymap (+ content keys when a room is up), then globals.
+        // ⑤/⑥ sidebar keymap (+ content keys for the pane that is up), then
+        // globals.
         let tables: &[&[Binding]] = if self.room_selected() {
             &[crate::components::roster::KEYMAP, CONTENT_KEYS, GLOBAL]
+        } else if self.shared.current_bot.is_some() {
+            &[
+                crate::components::roster::KEYMAP,
+                crate::components::thread::KEYMAP,
+                GLOBAL,
+            ]
         } else {
             &[crate::components::roster::KEYMAP, GLOBAL]
         };
@@ -419,9 +443,8 @@ impl App {
             Action::Yank => {
                 let text = self
                     .shared
-                    .current_bot
-                    .as_ref()
-                    .and_then(|id| self.shared.agents.get(id))
+                    .current_key()
+                    .and_then(|key| self.shared.agents.get(&key))
                     .and_then(|s| s.term.parser.read().ok().map(|p| p.screen().contents()));
                 match text {
                     Some(t) if !t.trim().is_empty() => {
@@ -454,6 +477,19 @@ impl App {
                 if self.room_selected() {
                     let mut fx = Effects::default();
                     self.components.room.update(action, &mut self.shared, &mut fx);
+                    self.apply(fx);
+                }
+            }
+            // Session tabs belong to the thread pane.
+            Action::NextTab
+            | Action::PrevTab
+            | Action::NewTab
+            | Action::CloseTab
+            | Action::RenameTab
+            | Action::FreshTab => {
+                if !self.room_selected() {
+                    let mut fx = Effects::default();
+                    self.components.thread.update(action, &mut self.shared, &mut fx);
                     self.apply(fx);
                 }
             }
@@ -545,8 +581,14 @@ impl App {
             // Context-menu picks: close the menu, run the existing path.
             FormEvent::Talk(id) => {
                 self.overlay = Overlay::None;
-                let prompt = self.shared.opening_prompt(&id);
-                self.shared.boot_bot(&id, prompt.as_deref());
+                // Talk to the tab in view when it IS this bird's pane;
+                // otherwise the primary.
+                let key = match self.shared.current_key() {
+                    Some(k) if k.bot == id => k,
+                    _ => crate::config::SessionKey::primary(id),
+                };
+                let prompt = self.shared.opening_prompt(&key);
+                self.shared.boot_key(&key, prompt.as_deref());
                 self.shared.agent_focused = true;
             }
             FormEvent::Handoff(id) => {
@@ -578,6 +620,23 @@ impl App {
                 let mut fx = Effects::default();
                 fx.msg(Msg::ConfirmDelete(target));
                 self.apply(fx);
+            }
+            FormEvent::Tab(action) => {
+                self.overlay = Overlay::None;
+                if !self.room_selected() {
+                    let mut fx = Effects::default();
+                    self.components.thread.update(action, &mut self.shared, &mut fx);
+                    self.apply(fx);
+                }
+            }
+            FormEvent::RenameTab { key, name } => {
+                self.overlay = Overlay::None;
+                self.shared.agents.set_tab_name(&self.shared.config, &key, &name);
+                self.shared.flash(if name.is_empty() {
+                    format!("tab {} unlabeled", key.tab)
+                } else {
+                    format!("tab {} → “{name}”", key.tab)
+                });
             }
         }
     }
@@ -636,7 +695,9 @@ impl App {
                 ) else {
                     return;
                 };
-                let wake = self.shared.opening_prompt(&target);
+                let wake = self
+                    .shared
+                    .opening_prompt(&crate::config::SessionKey::primary(target.clone()));
                 self.shared.boot_bot(&target, wake.as_deref());
                 let prompt = prompts::handoff(&from, &to, &text, &self.shared.config.handoffs_dir());
                 self.shared.boot_bot(&src, Some(&prompt));
@@ -676,6 +737,8 @@ impl App {
                 Overlay::Profile(f) => f.handle_mouse(m),
                 Overlay::Confirm(f) => f.handle_mouse(m),
                 Overlay::Context(f) => f.handle_mouse(m),
+                Overlay::RenameTab(f) => f.handle_mouse(m),
+                Overlay::TabMenu(f) => f.handle_mouse(m),
                 _ => return,
             };
             self.on_form_event(event);
@@ -750,6 +813,23 @@ impl App {
                 Msg::OpenContext { target, x, y } => {
                     self.overlay = Overlay::Context(crate::overlays::ContextMenu::new(target, x, y));
                 }
+                Msg::OpenTabMenu { x, y } => {
+                    self.overlay = Overlay::TabMenu(crate::overlays::TabMenu::new(
+                        self.shared.current_tab,
+                        x,
+                        y,
+                    ));
+                }
+                Msg::OpenRenameTab(key) => {
+                    let current = self
+                        .shared
+                        .agents
+                        .tab_name(&key)
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    self.overlay =
+                        Overlay::RenameTab(crate::overlays::RenameTabForm::new(key, current));
+                }
                 Msg::Compose { source, preselect } => {
                     match ComposeForm::new(&self.shared, source, preselect) {
                         Some(form) => self.overlay = Overlay::Compose(form),
@@ -820,6 +900,12 @@ impl App {
         };
         let tables: &[&[Binding]] = if self.room_selected() {
             &[crate::components::roster::KEYMAP, CONTENT_KEYS, GLOBAL]
+        } else if self.shared.current_bot.is_some() {
+            &[
+                crate::components::roster::KEYMAP,
+                crate::components::thread::KEYMAP,
+                GLOBAL,
+            ]
         } else {
             &[crate::components::roster::KEYMAP, GLOBAL]
         };
@@ -832,6 +918,7 @@ impl App {
                 frame.area(),
                 &[
                     ("sidebar", crate::components::roster::KEYMAP),
+                    ("session tabs", crate::components::thread::KEYMAP),
                     ("room", CONTENT_KEYS),
                     ("everywhere", GLOBAL),
                 ],
@@ -842,6 +929,8 @@ impl App {
             Overlay::Profile(f) => f.draw(frame, frame.area(), &self.shared),
             Overlay::Confirm(f) => f.draw(frame, frame.area()),
             Overlay::Context(f) => f.draw(frame, frame.area()),
+            Overlay::RenameTab(f) => f.draw(frame, frame.area()),
+            Overlay::TabMenu(f) => f.draw(frame, frame.area()),
         }
     }
 }

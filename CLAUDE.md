@@ -10,7 +10,7 @@ architecture throughout — read this map before touching the shell.
 | `app.rs` | the THIN shell: layered key dispatch, overlay routing, msg fan-out, run loop. If a change grows this file, it probably belongs in a component. |
 | `components/` | one module per screen (roster · thread · room), each owning state + input + draw + its own hit rects. Bots and rooms are STATE inside components, never new components. |
 | `shared.rs` | cross-component state (`Shared`): config, `AgentStore`, room watcher, branch slot, focus. |
-| `agent_store.rs` | the birds: spawn/resume (`--name` / `--resume aviary-<id>`), stop, status. Session identity IS the session name — no jsonl bookkeeping. |
+| `agent_store.rs` | the birds: spawn/resume (`--name` / `--resume aviary-<id>[.n]`), stop, status, keyed by `SessionKey` (bird × tab; tab 1 = primary). Session identity IS the session name — no jsonl bookkeeping. |
 | `pty.rs` | embedded terminal (portable-pty + vt100 + tui-term). Resize is guarded; wheel forwards SGR on the alt screen. |
 | `keymap.rs` | binding tables — dispatch, the hints bar, and the help overlay all generate from them. Never hand-write a hint string. |
 | `command.rs` | `Executor` (thread-per-command) + `Slot<T>` for async results with stale-gen dropping. |
@@ -34,6 +34,11 @@ architecture throughout — read this map before touching the shell.
   repo; no sockets, no IPC.
 - **Room dispatch is mention-driven** — a bot append wakes only who it
   @-mentions. Loosening this reintroduces unbounded bot chatter; don't.
+- **External signals target the PRIMARY session (tab 1) only** — rooms,
+  handoffs, routines, and webhooks all funnel through `Shared::boot_bot`.
+  Extra session tabs (`aviary-<id>.<n>`) are human-driven; routing signals at
+  them reintroduces unbounded fan-out. The `.` tab separator is safe because
+  `slug()` can never emit one into a bot id.
 - **Prompts into FRESH sessions ride argv**, never typed into a booting PTY.
   Typed input is only for sessions already running.
 - **Launch argv order is load-bearing:** `--mcp-config` and `--add-dir` are
@@ -50,6 +55,7 @@ architecture throughout — read this map before touching the shell.
 
 ## Verify
 
-`cargo test` (26+ unit tests: keymap, list_nav, config scaffold, room
-dispatch, prompt wording) · `cargo clippy --all-targets` must be clean ·
-manual smoke: see README keys. Claude Code ≥ 2.1.224 required at runtime.
+`cargo test` (50+ unit tests: keymap, list_nav, config scaffold, session keys,
+status aggregation, hook attribution, room dispatch, prompt wording) ·
+`cargo clippy --all-targets` must be clean · manual smoke: see README keys.
+Claude Code ≥ 2.1.224 required at runtime.

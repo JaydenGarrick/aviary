@@ -10,7 +10,7 @@ use std::thread;
 use crossterm::event::{self as term, Event as TermEvent, KeyEvent, KeyEventKind, MouseEvent};
 
 use crate::command::CommandResult;
-use crate::config::BotId;
+use crate::config::SessionKey;
 
 /// A wake-up for the render loop.
 pub enum Event {
@@ -19,8 +19,8 @@ pub enum Event {
     /// Redraw only — ratatui re-measures the frame on the next `draw`.
     Resize,
     /// A bird's embedded terminal produced output, or its child exited.
-    /// Tagged per bot: the roster's working/idle chips key off who spoke.
-    AgentOutput(BotId),
+    /// Tagged per session: the status chips key off exactly who spoke.
+    AgentOutput(SessionKey),
     /// A background command finished (see [`crate::command`]).
     Done(Box<CommandResult>),
     /// An authenticated inbound webhook (see [`crate::http`]).

@@ -12,10 +12,15 @@ use serde::Deserialize;
 /// One hook payload line (tolerant: extra fields ignored, missing default).
 #[derive(Deserialize, Default)]
 pub struct HookEvent {
-    /// Attribution is by cwd; the id is kept for debugging the events file.
+    /// Claude's own uuid; kept for debugging the events file.
     #[serde(default)]
     #[allow(dead_code)]
     pub session_id: String,
+    /// Our session name, injected by `aviary --hook --session <name>` — the
+    /// only attribution that can tell a bird's tabs apart (they share a cwd).
+    /// Absent on old/foreign payloads, which fall back to cwd → primary.
+    #[serde(default)]
+    pub aviary_session: Option<String>,
     #[serde(default)]
     pub cwd: String,
     #[serde(default)]
@@ -73,12 +78,13 @@ impl EventsReader {
     }
 }
 
-/// `aviary --hook`: read the hook payload from stdin, append it as one line.
-/// Must be fast and silent — it runs inside every bird's hook.
-pub fn append_from_stdin(events_path: &Path) -> std::io::Result<()> {
+/// `aviary --hook [--session <name>]`: read the hook payload from stdin, tag
+/// it with our session name, append it as one line. Must be fast and silent —
+/// it runs inside every bird's hook.
+pub fn append_from_stdin(events_path: &Path, session: Option<&str>) -> std::io::Result<()> {
     let mut input = String::new();
     std::io::Read::take(std::io::stdin(), 64 * 1024).read_to_string(&mut input)?;
-    let line = input.replace(['\n', '\r'], " ");
+    let line = tag_line(&input.replace(['\n', '\r'], " "), session);
     if line.trim().is_empty() {
         return Ok(());
     }
@@ -92,6 +98,21 @@ pub fn append_from_stdin(events_path: &Path) -> std::io::Result<()> {
         .open(events_path)?;
     writeln!(f, "{}", line.trim())?;
     Ok(())
+}
+
+/// Inject `"aviary_session"` into a JSON payload line. Anything that is not a
+/// JSON object passes through untouched — junk stays junk, never lost.
+fn tag_line(line: &str, session: Option<&str>) -> String {
+    let Some(session) = session else {
+        return line.to_string();
+    };
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(mut v) if v.is_object() => {
+            v["aviary_session"] = serde_json::Value::String(session.to_string());
+            v.to_string()
+        }
+        _ => line.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -146,5 +167,17 @@ mod tests {
         std::fs::write(&path, "not json\n{\"hook_event_name\":\"Stop\"}\n").unwrap();
         let mut reader = EventsReader::default();
         assert_eq!(reader.poll(&path).len(), 1);
+    }
+
+    #[test]
+    fn tag_line_injects_the_session_and_spares_junk() {
+        let tagged = tag_line("{\"hook_event_name\":\"Stop\",\"cwd\":\"/x\"}", Some("aviary-swift.2"));
+        let ev: HookEvent = serde_json::from_str(&tagged).unwrap();
+        assert_eq!(ev.aviary_session.as_deref(), Some("aviary-swift.2"));
+        assert_eq!(ev.hook_event_name, "Stop");
+        // No session, non-object JSON, and junk all pass through verbatim.
+        assert_eq!(tag_line("{\"a\":1}", None), "{\"a\":1}");
+        assert_eq!(tag_line("[1,2]", Some("aviary-x")), "[1,2]");
+        assert_eq!(tag_line("not json", Some("aviary-x")), "not json");
     }
 }

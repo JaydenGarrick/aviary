@@ -55,7 +55,7 @@ pub fn run() -> Result<()> {
         // Hooks: per-session via --settings (verified working on this machine);
         // the settings files regenerate at every launch with the current exe.
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-        row(true, &format!("hooks ride --settings per session · hook cmd: {exe} --hook"));
+        row(true, &format!("hooks ride --settings per session · hook cmd: {exe} --hook --session <name>"));
         if exe.contains("/target/") {
             println!("      ⚠ that's a build-dir path — `cargo install --path .` gives birds a stable hook binary");
         }

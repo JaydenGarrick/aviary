@@ -25,6 +25,8 @@ pub enum Overlay {
     Profile(ProfileView),
     Confirm(ConfirmForm),
     Context(ContextMenu),
+    RenameTab(RenameTabForm),
+    TabMenu(TabMenu),
 }
 
 impl Overlay {
@@ -65,6 +67,14 @@ pub enum FormEvent {
     WriteRoom(String),
     /// Open the release/delete CONFIRM dialog (menus never delete directly).
     AskDelete(crate::action::RosterTarget),
+    /// Label a session tab (display only; empty clears).
+    RenameTab {
+        key: crate::config::SessionKey,
+        name: String,
+    },
+    /// A tab-menu pick: a tab Action for the thread pane to run on the
+    /// CURRENT tab (the right-click selected it first).
+    Tab(crate::action::Action),
 }
 
 const GLYPHS: [&str; 6] = ["🐦", "🦉", "🦅", "🪿", "🐧", "🦜"];
@@ -263,6 +273,76 @@ impl AddBotForm {
         for (i, slot) in self.field_rects.iter_mut().enumerate() {
             *slot = line_rect(self.popup, i + 1);
         }
+        self.submit = line_rect(self.popup, submit_idx);
+    }
+}
+
+// ----------------------------------------------------------------- rename tab
+
+pub struct RenameTabForm {
+    key: crate::config::SessionKey,
+    name: String,
+    popup: Rect,
+    submit: Rect,
+}
+
+impl RenameTabForm {
+    pub fn new(key: crate::config::SessionKey, current: String) -> RenameTabForm {
+        RenameTabForm {
+            key,
+            name: current,
+            popup: Rect::default(),
+            submit: Rect::default(),
+        }
+    }
+
+    fn submit(&self) -> FormEvent {
+        FormEvent::RenameTab {
+            key: self.key.clone(),
+            name: self.name.trim().to_string(),
+        }
+    }
+
+    pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
+        match k.code {
+            KeyCode::Esc => return FormEvent::Cancel,
+            KeyCode::Backspace => {
+                self.name.pop();
+            }
+            KeyCode::Char(c) => self.name.push(c),
+            KeyCode::Enter => return self.submit(),
+            _ => {}
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if hits(self.submit, x, y) {
+            return self.submit();
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let lines = vec![
+            Line::from(""),
+            field_line("label", &self.name, true, "a short label — empty clears it"),
+            Line::from(""),
+            Line::from(dim(format!(
+                "  display only — the session stays {}",
+                self.key.session_name()
+            ))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ⏎ save", Style::default().fg(ACCENT)),
+                dim(" · esc cancel"),
+            ]),
+        ];
+        let submit_idx = lines.len() - 1;
+        self.popup = popup(frame, area, &format!("name tab {}", self.key.tab), lines);
         self.submit = line_rect(self.popup, submit_idx);
     }
 }
@@ -760,6 +840,125 @@ impl ContextMenu {
     }
 }
 
+// -------------------------------------------------------------------- tab menu
+
+/// Right-click menu for a session tab. The click already selected the tab, so
+/// every pick is just a thread-pane Action on the current tab.
+pub struct TabMenu {
+    items: Vec<(&'static str, crate::action::Action)>,
+    cursor: usize,
+    anchor: (u16, u16),
+    popup: Rect,
+    item_rects: Vec<Rect>,
+}
+
+impl TabMenu {
+    pub fn new(tab: u8, x: u16, y: u16) -> TabMenu {
+        use crate::action::Action;
+        let mut items = vec![
+            ("name the tab", Action::RenameTab),
+            ("fresh conversation here", Action::FreshTab),
+            ("new tab beside it", Action::NewTab),
+        ];
+        if tab != 1 {
+            items.push(("close the tab", Action::CloseTab));
+        }
+        TabMenu {
+            items,
+            cursor: 0,
+            anchor: (x, y),
+            popup: Rect::default(),
+            item_rects: Vec::new(),
+        }
+    }
+
+    pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => FormEvent::Cancel,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.cursor = (self.cursor + 1) % self.items.len();
+                FormEvent::Consumed
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.cursor = (self.cursor + self.items.len() - 1) % self.items.len();
+                FormEvent::Consumed
+            }
+            KeyCode::Enter => FormEvent::Tab(self.items[self.cursor].1),
+            _ => FormEvent::Consumed,
+        }
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> FormEvent {
+        if let MouseEventKind::Moved | MouseEventKind::Drag(_) = m.kind {
+            if let Some(i) = self
+                .item_rects
+                .iter()
+                .position(|r| hits(*r, m.column, m.row))
+            {
+                self.cursor = i;
+            }
+            return FormEvent::Consumed;
+        }
+        let Some((x, y)) = click(&m, self.popup) else {
+            return FormEvent::Cancel;
+        };
+        if let Some(i) = self.item_rects.iter().position(|r| hits(*r, x, y)) {
+            return FormEvent::Tab(self.items[i].1);
+        }
+        FormEvent::Consumed
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let width = (self
+            .items
+            .iter()
+            .map(|(label, _)| label.width())
+            .max()
+            .unwrap_or(10) as u16
+            + 4)
+            .min(area.width);
+        let height = (self.items.len() as u16 + 2).min(area.height);
+        let x = self.anchor.0.min(area.width.saturating_sub(width));
+        let y = self.anchor.1.min(area.height.saturating_sub(height));
+        self.popup = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, self.popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT));
+        let inner = block.inner(self.popup);
+        frame.render_widget(block, self.popup);
+
+        self.item_rects.clear();
+        let lines: Vec<Line> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (label, act))| {
+                self.item_rects.push(Rect {
+                    x: inner.x,
+                    y: inner.y + i as u16,
+                    width: inner.width,
+                    height: 1,
+                });
+                let destructive = matches!(act, crate::action::Action::CloseTab);
+                let style = if i == self.cursor {
+                    Style::default()
+                        .fg(if destructive { BAD } else { ACCENT })
+                        .add_modifier(Modifier::REVERSED)
+                } else if destructive {
+                    Style::default().fg(BAD)
+                } else {
+                    Style::default().fg(crate::ui::MUTED)
+                };
+                Line::from(Span::styled(format!(" {label} "), style))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
 // --------------------------------------------------------------------- confirm
 
 /// A small yes/no gate for roster deletions — destructive enough to ask,
@@ -912,11 +1111,17 @@ impl ProfileView {
             Line::from(vec![
                 muted("  session   "),
                 Span::raw(self.id.session_name()),
-                dim(if s.agents.has_session_record(&self.id) {
-                    "  (resumes with full memory)"
-                } else {
-                    "  (never flown)"
-                }),
+                // The profile is about the bird = its PRIMARY session; tabs
+                // live in the thread pane's strip.
+                dim(
+                    if s.agents.has_session_record(&crate::config::SessionKey::primary(
+                        self.id.clone(),
+                    )) {
+                        "  (resumes with full memory)"
+                    } else {
+                        "  (never flown)"
+                    },
+                ),
             ]),
             Line::from(""),
         ];

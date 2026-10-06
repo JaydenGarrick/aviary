@@ -32,9 +32,16 @@ fn main() -> Result<()> {
 
     // Hook mode: runs inside every bird's Stop/Notification hook. Fast, silent,
     // and NEVER the TUI — it must not fight the session for the terminal.
+    // `--session <name>` tags the event with the emitting session, the only
+    // attribution that can tell a bird's tabs apart (they share a cwd).
     if args.iter().any(|a| a == "--hook") {
+        let session = args
+            .iter()
+            .position(|a| a == "--session")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
         let dir = config::default_dir()?;
-        let _ = events::append_from_stdin(&dir.join("events.jsonl"));
+        let _ = events::append_from_stdin(&dir.join("events.jsonl"), session);
         return Ok(());
     }
 

@@ -94,13 +94,21 @@ Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 | `n` / `c` (or the `+ bird` / `+ room` buttons) | hatch a bird / create a room |
 | `p` | bird profile: persona, routines, notifications toggle, fresh start |
 | `N` | abandon the bird's conversation and start a fresh one |
-| `x` | stop a session (it resumes by name later) |
+| `x` | stop a bird (all its sessions; they resume by name later) |
+| `T` / click `[+]` | open a parallel session of the bird in a new tab |
+| `]` / `[` / click a tab | cycle / pick the bird's session tabs |
+| `W` | close the viewed tab and forget it (tab 1 refuses — that's the bird) |
+| `R` | label the viewed tab (display only; empty clears) |
 | `i` / `u` / `d` / `1-5` | write / scroll the room / pick a quick-reply |
 | `?` | help, generated from the real keymaps |
 
 Mouse: click rows to select (again to step in), click chips/fields/members in
 any form, click outside a popup to dismiss it, wheel scrolls everything —
-including the bird's own transcript inside its pane.
+including the bird's own transcript inside its pane. Click the selected
+session tab again for its menu (name · fresh · new · close) — right-click works too,
+but iTerm2 keeps right-clicks for its own menu unless you remove that binding
+in Settings → Pointer. The strip wraps onto more rows when the labels outgrow
+the pane.
 
 ## Doctor, routines, webhooks
 

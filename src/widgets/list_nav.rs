@@ -6,9 +6,7 @@ use crate::action::Action;
 pub enum Wrap {
     /// Stop at the ends.
     Clamp,
-    /// Wrap around them. No caller yet outside tests — kept because a cycling
-    /// list (mb's Run switcher shape) is the known next consumer.
-    #[allow(dead_code)]
+    /// Wrap around them (the thread pane's session-tab cycling).
     Cycle,
 }
 

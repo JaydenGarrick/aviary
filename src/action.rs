@@ -44,6 +44,18 @@ pub enum Action {
     ToggleMouse,
     /// Copy the selected bird's visible pane to the clipboard.
     Yank,
+    // -- session tabs (the thread pane's parallel sessions of one bird)
+    NextTab,
+    PrevTab,
+    /// Open one more session of the selected bird, on the lowest free tab.
+    NewTab,
+    /// Stop the viewed tab and forget its resume record (tab 1 refuses).
+    CloseTab,
+    /// Label the viewed tab (display only).
+    RenameTab,
+    /// Abandon the viewed tab's conversation and hatch a brand-new session —
+    /// also the escape when a resume record points at a vanished session.
+    FreshTab,
     // -- scrolling panes
     PageUp,
     PageDown,
@@ -76,6 +88,10 @@ pub enum Msg {
         source: Option<BotId>,
         preselect: Option<BotId>,
     },
+    /// Open the rename-tab form for one session tab.
+    OpenRenameTab(crate::config::SessionKey),
+    /// Open the right-click menu for the CURRENT tab, anchored at the click.
+    OpenTabMenu { x: u16, y: u16 },
     /// Show a transient status line in the chrome.
     Flash(String),
 }
