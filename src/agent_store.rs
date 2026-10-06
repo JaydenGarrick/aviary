@@ -305,6 +305,15 @@ impl AgentStore {
         }
     }
 
+    /// Is any live session badging as Working right now? Drives the run
+    /// loop's frame-rate wakeup so the spinner animates smoothly — the loop
+    /// stays fully blocking when nothing spins.
+    pub fn has_working(&self) -> bool {
+        self.sessions
+            .keys()
+            .any(|k| matches!(self.status_key(k), BotStatus::Working))
+    }
+
     /// Only badge sessions whose PTY we actually hold — a user's own session
     /// that happens to share a name is not ours.
     fn live_keys(&self) -> Vec<SessionKey> {

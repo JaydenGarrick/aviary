@@ -100,15 +100,27 @@ pub fn run(mut terminal: DefaultTerminal) -> Result<()> {
 
     while !app.should_quit {
         terminal.draw(|frame| app.draw(frame))?;
-        match rx.recv() {
-            Ok(ev) => {
-                app.handle(ev);
-                // Coalesce: a chatty bird must not spin the renderer.
-                while let Ok(next) = rx.try_recv() {
-                    app.handle(next);
-                }
+        // While a spinner is on screen, wake up at frame rate so it actually
+        // spins (a quiet working bird only emits the 1s tick). Otherwise stay
+        // fully blocking — no idle CPU burn.
+        let ev = if app.shared.agents.has_working() {
+            match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok(ev) => Some(ev),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, // redraw only
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            Err(_) => break,
+        } else {
+            match rx.recv() {
+                Ok(ev) => Some(ev),
+                Err(_) => break,
+            }
+        };
+        if let Some(ev) = ev {
+            app.handle(ev);
+            // Coalesce: a chatty bird must not spin the renderer.
+            while let Ok(next) = rx.try_recv() {
+                app.handle(next);
+            }
         }
     }
     Ok(())
