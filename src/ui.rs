@@ -39,11 +39,24 @@ pub fn dim(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(DIM))
 }
 
+/// Working animates: the frame comes from the wall clock, so every redraw
+/// advances it — fast while a bird streams output, gently on idle ticks.
+/// Braille frames are all 1 cell wide, so chips never shift.
+const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn working_frame() -> &'static str {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    WORKING_FRAMES[((ms / 80) as usize) % WORKING_FRAMES.len()]
+}
+
 /// The chip's words (glyph + state), unstyled — for surfaces that carry their
 /// own styling, like the selected tab.
 pub fn status_text(status: BotStatus) -> String {
     match status {
-        BotStatus::Working => "● working".into(),
+        BotStatus::Working => format!("{} working", working_frame()),
         BotStatus::NeedsInput => "⏸ needs you".into(),
         BotStatus::Done(secs) => format!("✔ done {}", human_duration(secs)),
         BotStatus::NotStarted => "○ not started".into(),
@@ -68,7 +81,7 @@ pub fn status_span(status: BotStatus) -> Span<'static> {
 /// The chip's glyph alone — tab-strip sized, same shapes and colours.
 pub fn status_glyph(status: BotStatus) -> Span<'static> {
     match status {
-        BotStatus::Working => Span::styled("●", Style::default().fg(OK)),
+        BotStatus::Working => Span::styled(working_frame(), Style::default().fg(OK)),
         BotStatus::NeedsInput => Span::styled("⏸", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
         BotStatus::Done(_) => Span::styled("✔", Style::default().fg(MUTED)),
         BotStatus::NotStarted => Span::styled("○", Style::default().fg(DIM)),
