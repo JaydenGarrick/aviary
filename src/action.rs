@@ -53,6 +53,9 @@ pub enum Action {
     CloseTab,
     /// Label the viewed tab (display only).
     RenameTab,
+    /// Abandon the viewed tab's conversation and hatch a brand-new session —
+    /// also the escape when a resume record points at a vanished session.
+    FreshTab,
     // -- scrolling panes
     PageUp,
     PageDown,

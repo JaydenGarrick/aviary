@@ -107,6 +107,11 @@ impl Component for Thread {
                 self.select_tab(s, tabs[nav.selected]);
             }
             Action::NewTab => self.new_tab(s),
+            Action::FreshTab => {
+                let key = SessionKey { bot: id, tab: s.current_tab };
+                s.fresh_key(&key);
+                s.agent_focused = true;
+            }
             Action::RenameTab => {
                 fx.msg(crate::action::Msg::OpenRenameTab(SessionKey {
                     bot: id,
@@ -319,14 +324,23 @@ impl Component for Thread {
                 muted(format!(" to wake {} — it lives in {}", bot.name, bot.repo)),
             ]),
             Line::from(""),
-            Line::from(dim(format!(
-                "  its session is named {} and resumes with its full memory;",
-                key.session_name()
-            ))),
+            Line::from(dim(if s.agents.has_session_record(&key) {
+                format!(
+                    "  ⏎ RESUMES the conversation named {} with its full memory",
+                    key.session_name()
+                )
+            } else {
+                format!(
+                    "  ⏎ starts a BRAND-NEW conversation named {}",
+                    key.session_name()
+                )
+            })),
             Line::from(dim("  teammates reach it by that name with SendMessage")),
             Line::from(""),
-            Line::from(dim("  N starts a brand-new conversation · p opens its profile")),
-            Line::from(dim("  T opens a parallel session in another tab")),
+            Line::from(dim("  T opens a parallel session in another tab · p profile")),
+            Line::from(dim(
+                "  fresh conversation: N (tab 1) or the tab menu (click the tab again)",
+            )),
         ];
         if !self.feed.is_empty() {
             empty.push(Line::from(""));

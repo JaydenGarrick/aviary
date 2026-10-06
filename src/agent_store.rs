@@ -430,7 +430,7 @@ impl AgentStore {
 
     /// Deliberately abandon the PRIMARY conversation: stop the session, forget
     /// the resume record, and hatch a brand-new one. Tabs are untouched —
-    /// closing those is the thread pane's job.
+    /// they fresh-start individually via [`AgentStore::fresh_key`].
     pub fn fresh_start(
         &mut self,
         cfg: &Config,
@@ -438,9 +438,24 @@ impl AgentStore {
         prompt: Option<&str>,
         tx: &Sender<Event>,
     ) -> Result<()> {
-        let key = SessionKey::primary(bot.id.clone());
-        self.sessions.remove(&key);
         self.collab.remove(&bot.id);
+        self.fresh_key(cfg, bot, 1, prompt, tx)
+    }
+
+    /// Abandon ONE tab's conversation and hatch a brand-new session under the
+    /// same name — also the escape hatch when a resume record points at a
+    /// session claude no longer has (the resume picker dead end). The tab's
+    /// label survives; only the conversation is new.
+    pub fn fresh_key(
+        &mut self,
+        cfg: &Config,
+        bot: &Bot,
+        tab: u8,
+        prompt: Option<&str>,
+        tx: &Sender<Event>,
+    ) -> Result<()> {
+        let key = SessionKey { bot: bot.id.clone(), tab };
+        self.sessions.remove(&key);
         self.state.forget(&cfg.dir, &key.state_key());
         self.launch(cfg, bot, &key, prompt, tx, false)
     }
@@ -499,13 +514,14 @@ impl AgentStore {
         self.observed.remove(key);
     }
 
-    /// Close a tab: stop it and forget its resume record, so the strip entry
-    /// disappears. The claude session itself survives, unreferenced.
+    /// Close a tab: stop it, forget its resume record and label, so the strip
+    /// entry disappears. The claude session itself survives, unreferenced.
     pub fn close_tab(&mut self, cfg: &Config, key: &SessionKey) {
         self.stop_key(key);
         self.last_output.remove(key);
         self.kind_since.remove(key);
         self.state.forget(&cfg.dir, &key.state_key());
+        self.state.set_tab_name(&cfg.dir, &key.state_key(), "");
     }
 
     /// A bird leaving the roster: stop all its sessions and drop all

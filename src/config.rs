@@ -568,11 +568,12 @@ impl State {
         self.write(dir);
     }
 
-    /// A `--resume` that died instantly means the named session is gone —
-    /// forget it (and its label) so the next launch starts fresh.
+    /// Forget a session of record so the next launch starts fresh (a dead
+    /// resume, a closed tab, a deliberate fresh start). The label survives —
+    /// a fresh conversation on a named tab keeps its name; `set_tab_name`
+    /// with an empty string clears it where that is wanted.
     pub fn forget(&mut self, dir: &Path, state_key: &str) {
         self.spawned.remove(state_key);
-        self.tab_names.remove(state_key);
         self.write(dir);
     }
 
@@ -735,9 +736,10 @@ mod tests {
         // Empty and whitespace names clear.
         st.set_tab_name(tmp.path(), "swift", "  ");
         assert_eq!(st.tab_name("swift"), None);
-        // Closing a tab forgets its label; releasing a bird forgets them all.
+        // A fresh start forgets the record but KEEPS the label.
         st.forget(tmp.path(), "swift.2");
-        assert_eq!(st.tab_name("swift.2"), None);
+        assert_eq!(st.tab_name("swift.2"), Some("refactor"));
+        // Releasing a bird forgets every label.
         st.forget_bot(tmp.path(), &BotId("raven".into()));
         assert_eq!(State::load(tmp.path()).tab_name("raven.3"), None);
     }

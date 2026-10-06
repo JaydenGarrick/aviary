@@ -857,6 +857,7 @@ impl TabMenu {
         use crate::action::Action;
         let mut items = vec![
             ("name the tab", Action::RenameTab),
+            ("fresh conversation here", Action::FreshTab),
             ("new tab beside it", Action::NewTab),
         ];
         if tab != 1 {

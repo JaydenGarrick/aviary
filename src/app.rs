@@ -485,7 +485,8 @@ impl App {
             | Action::PrevTab
             | Action::NewTab
             | Action::CloseTab
-            | Action::RenameTab => {
+            | Action::RenameTab
+            | Action::FreshTab => {
                 if !self.room_selected() {
                     let mut fx = Effects::default();
                     self.components.thread.update(action, &mut self.shared, &mut fx);

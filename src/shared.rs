@@ -109,6 +109,24 @@ impl Shared {
         (!self.agents.has_session_record(key)).then(|| prompts::first_flight(bot))
     }
 
+    /// Abandon ONE tab's conversation on purpose and start a new one there.
+    pub fn fresh_key(&mut self, key: &SessionKey) {
+        let Some(bot) = self.config.bot(&key.bot).cloned() else {
+            self.flash(format!("no bot named {:?}", key.bot));
+            return;
+        };
+        let tx = self.tx.clone();
+        let prompt = prompts::first_flight(&bot);
+        if let Err(e) = self
+            .agents
+            .fresh_key(&self.config, &bot, key.tab, Some(&prompt), &tx)
+        {
+            self.flash(format!("{e:#}"));
+        } else {
+            self.flash(format!("{} tab {} — fresh conversation", bot.name, key.tab));
+        }
+    }
+
     /// Abandon the bird's PRIMARY conversation on purpose and start a new one.
     pub fn fresh_bot(&mut self, id: &BotId) {
         let Some(bot) = self.config.bot(id).cloned() else {
