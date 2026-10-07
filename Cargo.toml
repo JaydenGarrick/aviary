@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.86"
 description = "A roster of repo-resident Claude Code birds — each repo gets an agent with its own context, character, and the ability to hand work to its teammates."
+license = "MIT"
+repository = "https://github.com/JaydenGarrick/aviary"
+readme = "README.md"
 
 [[bin]]
 name = "aviary"

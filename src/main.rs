@@ -30,6 +30,17 @@ use anyhow::Result;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // Non-interactive flags first: Homebrew's `test do` and friends need a way
+    // to exercise the binary without a TTY.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("aviary {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
     // Hook mode: runs inside every bird's Stop/Notification hook. Fast, silent,
     // and NEVER the TUI — it must not fight the session for the terminal.
     // `--session <name>` tags the event with the emitting session, the only
@@ -56,6 +67,14 @@ fn main() -> Result<()> {
     mouse_capture(false);
     ratatui::restore();
     result
+}
+
+fn print_help() {
+    println!(
+        "aviary {}\n{}\n\nUSAGE:\n  aviary            open the cockpit\n  aviary doctor     check the environment (claude on PATH, config dir, ...)\n  aviary --hook     [internal] Claude Code Stop/Notification hook sink\n  aviary --version  print the version\n  aviary --help     this text",
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_DESCRIPTION"),
+    );
 }
 
 pub(crate) fn mouse_capture(on: bool) {

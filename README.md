@@ -70,10 +70,25 @@ and gives the birds each other.
   and composers detect `ABC-123` / linear.app / figma.com references and wrap
   them in fetch instructions.
 
+## Install
+
+```bash
+# Homebrew (macOS / Linux) — builds from the tagged source
+brew install JaydenGarrick/aviary/aviary
+
+# or straight from the repo with cargo
+cargo install --git https://github.com/JaydenGarrick/aviary
+
+# or from a checkout
+cargo install --path .     # or: cargo run
+```
+
+aviary drives [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+(≥ 2.1.224) — install that first, then `aviary doctor` checks the rest.
+
 ## Quickstart
 
 ```bash
-cargo install --path .     # or: cargo run
 aviary
 ```
 
