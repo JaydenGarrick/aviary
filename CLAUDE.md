@@ -49,9 +49,13 @@ architecture throughout — read this map before touching the shell.
   Working; recent poll/hook observation (<15s) → its kind; else the
   output-recency heuristic. `map_status_str` maps unknown poll strings to Done
   — never invent urgency from an unrecognized state.
-- **Default files materialize on every startup** (`materialize_defaults`),
-  per-file and never overwriting — new shipped personas/templates reach
-  existing installs. Only `scaffold()` (first run) writes config.json.
+- **Aviary ships no birds.** `scaffold()` (first run) writes an EMPTY
+  config.json; birds are hatched from the cockpit (`n`) or by hand. Shipped
+  support files (mcp.json, permissions/readonly.json) materialize on every
+  startup (`materialize_defaults`), per-file and never overwriting, so new
+  ones reach existing installs. The empty roster is a real state — the pane
+  and hints bar draw a zero state for it, with keys pulled via
+  `keymap::label_for`.
 
 ## Verify
 

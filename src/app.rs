@@ -887,6 +887,13 @@ impl App {
             self.components.thread.draw(frame, cols[1], &mut self.shared);
         }
 
+        let zero_state = self.shared.config.bots.is_empty().then(|| {
+            format!(
+                "no birds yet — {} hatches your first · {} every key",
+                crate::keymap::label_for(&[GLOBAL], Action::NewBot).unwrap_or_default(),
+                crate::keymap::label_for(&[GLOBAL], Action::Help).unwrap_or_default(),
+            )
+        });
         let hint_override = if !self.mouse_on {
             Some("mouse → terminal: drag selects, ⌘C copies · m gives the mouse back to aviary")
         } else if self.shared.agent_focused {
@@ -896,7 +903,7 @@ impl App {
         } else if !self.overlay.is_none() && !matches!(self.overlay, Overlay::Help) {
             Some("fill the form — ⏎ submits · esc cancels · fields are clickable")
         } else {
-            None
+            zero_state.as_deref()
         };
         let tables: &[&[Binding]] = if self.room_selected() {
             &[crate::components::roster::KEYMAP, CONTENT_KEYS, GLOBAL]

@@ -210,7 +210,6 @@ pub fn local_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     fn room_with(members: &[&str]) -> Room {
         Room {
@@ -263,7 +262,7 @@ mod tests {
     #[test]
     fn watcher_adopts_history_then_dispatches_only_new() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut cfg = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        let mut cfg = crate::config::test_flock(tmp.path(), &["swift", "raven"]);
         cfg.add_room("nest", vec![BotId("swift".into()), BotId("raven".into())])
             .unwrap();
         let path = cfg.rooms[0].transcript_path(&cfg.dir);
@@ -285,7 +284,7 @@ mod tests {
     #[test]
     fn local_appends_do_not_redispatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut cfg = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        let mut cfg = crate::config::test_flock(tmp.path(), &["swift", "raven"]);
         cfg.add_room("nest", vec![BotId("swift".into()), BotId("raven".into())])
             .unwrap();
         let path = cfg.rooms[0].transcript_path(&cfg.dir);

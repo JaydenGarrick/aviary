@@ -136,6 +136,17 @@ pub fn hints(tables: &[&[Binding]]) -> Vec<(String, &'static str)> {
     out
 }
 
+/// The advertised key for `action` in the first table that binds it — for
+/// prose that names a key (empty states, footers), so it can't drift from
+/// dispatch any more than the hints bar can.
+pub fn label_for(tables: &[&[Binding]], action: Action) -> Option<String> {
+    tables
+        .iter()
+        .flat_map(|t| t.iter())
+        .find(|b| b.action == action)
+        .map(|b| b.pat.label())
+}
+
 /// Grouped rows for the help overlay: (group title, [(key label, help)]).
 pub fn help_groups(groups: &[(&'static str, &[Binding])]) -> Vec<(String, Vec<(String, String)>)> {
     groups
@@ -230,6 +241,15 @@ mod tests {
         assert_eq!(resolve(&[COMPONENT], &plain), None);
         let ctrl_a = press(KeyCode::Char('a'), KeyModifiers::CONTROL);
         assert_eq!(resolve(&[COMPONENT], &ctrl_a), Some(A::FocusAgent));
+    }
+
+    #[test]
+    fn label_for_names_the_primary_key_of_the_first_binding() {
+        assert_eq!(label_for(&[COMPONENT, GLOBAL], A::Down).as_deref(), Some("j"));
+        // Component shadows global: the shadowing table's label wins.
+        assert_eq!(label_for(&[COMPONENT, GLOBAL], A::Back).as_deref(), Some("q"));
+        assert_eq!(label_for(&[GLOBAL], A::NewBot).as_deref(), Some("n"));
+        assert_eq!(label_for(&[COMPONENT], A::Quit), None);
     }
 
     #[test]

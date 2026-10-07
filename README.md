@@ -6,20 +6,20 @@ living in its own repo with its own persistent context and character; aviary is
 the roster that spawns, names, displays, and connects them.
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│ AVIARY                                        ● 2 flying · 3 birds│
-│ BIRDS             │ 🪶 Swift · ~/…/ios · ● working · ⎇ develop   │
-│▸🪶 Swift ● working │ ┌──────────────────────────────────────────┐ │
-│   ↗ @raven “…”    │ │                                          │ │
-│ 🧺 Weaver ✔ done 4m│ │   the selected bird's live claude        │ │
-│ 🐦‍⬛ Raven ● working │ │   session (or the room transcript),      │ │
-│   ↘ @swift        │ │   always on the right — selection         │ │
-│ ROOMS             │ │   switches it instantly                   │ │
-│ # fly-calc    2   │ │                                          │ │
-│   @swift @raven   │ └──────────────────────────────────────────┘ │
-│ + bird  + room    │                                              │
-│ j move · ⏎ open · a talk · @ handoff · ? keys                    │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ AVIARY                                        ● 2 flying · 3 birds │
+│ BIRDS             │ 🐦 Wren · ~/…/web · ● working · ⎇ main         │
+│▸🐦 Wren ● working │ ┌──────────────────────────────────────────┐   │
+│   ↗ @heron “…”    │ │                                          │   │
+│ 🦩 Heron ✔ done 4m│ │   the selected bird's live claude        │   │
+│ 🦆 Finch ● working│ │   session (or the room transcript),      │   │
+│   ↘ @wren         │ │   always on the right — selection        │   │
+│ ROOMS             │ │   switches it instantly                  │   │
+│ # launch      2   │ │                                          │   │
+│   @wren @heron    │ └──────────────────────────────────────────┘   │
+│ + bird  + room    │                                                │
+│ j move · ⏎ open · a talk · @ handoff · ? keys                      │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 The sidebar tells you what every bird is doing at a glance — and the signals
@@ -34,16 +34,16 @@ per-session via `--settings`) and aviary reconciles against
   looking elsewhere (clears when you select it)
 - a macOS banner when a bird **finishes or needs input** (per-bird toggle in
   its profile, `p`)
-- a **collaboration tag**: `↗ @raven` (handed work off), `↘ @swift` (received a
+- a **collaboration tag**: `↗ @heron` (handed work off), `↘ @wren` (received a
   handoff), `⇄ #room` (room work). No tag = flying solo; clears when you take
   the keyboard.
 
 ## Why
 
 Working across sibling repos means several agents with isolated contexts: the
-iOS agent knows everything about a feature, and there is no good way to hand
-that context to the backend or Android agent. Aviary gives each repo a bird and
-gives the birds each other.
+frontend agent knows everything about a feature, and there is no good way to
+hand that context to the backend or mobile agent. Aviary gives each repo a bird
+and gives the birds each other.
 
 ## How a bird works
 
@@ -77,9 +77,29 @@ cargo install --path .     # or: cargo run
 aviary
 ```
 
-First run scaffolds `~/.config/aviary/` with three default birds (edit
-`config.json` for your own repos): **swift** 🪶 (iOS), **weaver** 🧺 (Android),
-**raven** 🐦‍⬛ (core-api). `n` hatches more.
+First run scaffolds `~/.config/aviary/` with an empty roster — aviary ships
+no birds, and the cockpit opens on a zero state that says so:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ AVIARY                                                    0 birds  │
+│ BIRDS             │                   🪺                           │
+│ no birds yet —    │          the aviary is empty                   │
+│ n hatches one     │                                                │
+│                   │  a bird is a Claude Code session that lives    │
+│                   │  in one repo and resumes by name               │
+│                   │                                                │
+│                   │        n  hatch your first bird — or click     │
+│                   │        ?  every key                            │
+│ + bird  + room    │                                                │
+│ no birds yet — n hatches your first · ? every key                  │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+`n` (or `+ bird`, or a click on the pane) hatches one: a name, a glyph, and
+the repo it lives in. Its persona lands in `birds/<id>.md`, built from the
+shipped template — edit it to give the bird its character. Hatch one bird per
+repo you work across; two or more unlock rooms (`c`).
 
 Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 
@@ -113,8 +133,7 @@ the pane.
 ## Doctor, routines, webhooks
 
 - **`aviary doctor`** — one screen of ✓/✗: claude version, repos, config, MCP
-  hooks, the events pipeline, plus the mimus 🪞 (mockingbird parity oracle)
-  config snippet. Run it whenever something feels off.
+  hooks, the events pipeline. Run it whenever something feels off.
 - **Routines** — per-bird scheduled prompts in `config.json`
   (`{"id":"standup","schedule":"weekdays@09:00","prompt":"…"}`; grammar:
   `daily@HH:MM` · `weekdays@HH:MM` · `every:<N>m|h`). Fire while aviary runs,
@@ -122,7 +141,7 @@ the pane.
 - **Webhooks** — add `"webhook": {"port": 4242, "token": "…"}` to config.json
   and external events wake birds:
   `curl -H "Authorization: Bearer …" -d "CI red on main" \
-  localhost:4242/bird/raven` (also `/room/<id>` — the message dispatches to
+  localhost:4242/bird/<id>` (also `/room/<id>` — the message dispatches to
   members like any outside author).
 - **Permissions** — set a bird's `"permissions": "permissions/readonly.json"`
   to pre-allow read-only tools and cut prompt noise (template scaffolded).

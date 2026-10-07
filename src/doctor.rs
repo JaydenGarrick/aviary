@@ -79,10 +79,12 @@ pub fn run() -> Result<()> {
             .unwrap_or(false);
         row(agents_ok, "claude agents --json reachable (authoritative busy/idle/needs_input)");
 
-        if !cfg.bots.iter().any(|b| b.id.0 == "mimus") {
+        if cfg.bots.is_empty() {
+            let hatch = crate::keymap::label_for(&[crate::keymap::GLOBAL], crate::action::Action::NewBot)
+                .unwrap_or_default();
             println!(
-                "\n  tip: hatch mimus 🪞 (the mockingbird parity oracle) — add to config.json bots:\n  \
-                 {{ \"id\": \"mimus\", \"name\": \"Mimus\", \"glyph\": \"🪞\", \"repo\": \"~/Library/Develop/iOS/mockingbird\", \"persona\": \"birds/mimus.md\" }}"
+                "\n  · no birds yet — press {hatch} in the cockpit, or add to config.json bots:\n  \
+                 {{ \"id\": \"<id>\", \"name\": \"<Name>\", \"glyph\": \"🐦\", \"repo\": \"~/path/to/repo\", \"persona\": \"birds/<id>.md\" }}"
             );
         }
     }

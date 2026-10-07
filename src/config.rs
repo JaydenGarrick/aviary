@@ -2,7 +2,7 @@
 //!
 //! `~/.config/aviary/` (override: `AVIARY_CONFIG_DIR`):
 //!   config.json   bots + rooms (user- AND app-edited; pretty-printed)
-//!   birds/*.md    persona files, materialized on first run, user-editable
+//!   birds/*.md    persona files, one per hatched bird (from the template), user-editable
 //!   mcp.json      MCP servers every bird spawns with (Linear + Figma hooks)
 //!   rooms/*.md    group-chat transcripts (append-only)
 //!   handoffs/     where birds park large handoff briefs
@@ -195,9 +195,10 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 impl Config {
-    /// Load the config, scaffolding the whole directory on first run.
-    /// Existing installs still get newly-shipped default files (personas,
-    /// templates) materialized — per-file, never overwriting edits.
+    /// Load the config, scaffolding the directory on first run (an EMPTY
+    /// roster — aviary ships no birds). Existing installs still get
+    /// newly-shipped support files (mcp.json, permissions) materialized —
+    /// per-file, never overwriting edits.
     pub fn load_or_scaffold(dir: PathBuf) -> Result<Config> {
         let config_path = dir.join("config.json");
         materialize_defaults(&dir)?;
@@ -441,25 +442,14 @@ fn make_bot(id: BotId, name: &str, glyph: &str, repo: &str, persona: &str) -> Bo
     }
 }
 
-/// Directory tree + every shipped default file, written only when missing —
-/// safe to run on every startup, so upgrades deliver new personas/templates
-/// without ever overwriting a user's edits.
+/// Directory tree + every shipped support file, written only when missing —
+/// safe to run on every startup, so upgrades deliver new files without ever
+/// overwriting a user's edits. No personas ship: `birds/` fills as the user
+/// hatches birds (see [`Config::add_bot`]).
 fn materialize_defaults(dir: &Path) -> Result<()> {
     for sub in ["birds", "rooms", "handoffs"] {
         std::fs::create_dir_all(dir.join(sub))
             .with_context(|| format!("cannot create {}", dir.join(sub).display()))?;
-    }
-
-    for (name, body) in [
-        ("swift.md", include_str!("../assets/birds/swift.md")),
-        ("weaver.md", include_str!("../assets/birds/weaver.md")),
-        ("raven.md", include_str!("../assets/birds/raven.md")),
-        ("mimus.md", include_str!("../assets/birds/mimus.md")),
-    ] {
-        let path = dir.join("birds").join(name);
-        if !path.is_file() {
-            std::fs::write(&path, body)?;
-        }
     }
 
     // Opt-in read-only permission allowlist a bot can reference via its
@@ -498,32 +488,11 @@ fn materialize_defaults(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// First run only: the default Blackbird flock.
+/// First run only: an empty roster. Birds are hatched from the cockpit (`n`)
+/// or by editing config.json — nothing repo-specific ships.
 fn scaffold(dir: &Path) -> Result<()> {
     let default_config = RawConfig {
-        bots: vec![
-            make_bot(
-                BotId("swift".into()),
-                "Swift",
-                "🪶",
-                "~/Library/Develop/iOS/ios",
-                "birds/swift.md",
-            ),
-            make_bot(
-                BotId("weaver".into()),
-                "Weaver",
-                "🧺",
-                "~/Library/Develop/iOS/android",
-                "birds/weaver.md",
-            ),
-            make_bot(
-                BotId("raven".into()),
-                "Raven",
-                "🐦‍⬛",
-                "~/Library/Develop/Backend/core-api",
-                "birds/raven.md",
-            ),
-        ],
+        bots: Vec::new(),
         rooms: Vec::new(),
         webhook: None,
     };
@@ -630,33 +599,49 @@ impl State {
     }
 }
 
+/// Test fixture: a scaffolded config dir with birds `ids` hatched into
+/// throwaway repos under it. Aviary ships no birds, so tests seed their own.
+#[cfg(test)]
+pub fn test_flock(dir: &Path, ids: &[&str]) -> Config {
+    let mut cfg = Config::load_or_scaffold(dir.to_path_buf()).unwrap();
+    for id in ids {
+        let repo = dir.join("repos").join(id);
+        std::fs::create_dir_all(&repo).unwrap();
+        cfg.add_bot(id, id, "🐦", repo.to_str().unwrap()).unwrap();
+    }
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn temp_config() -> (tempfile::TempDir, Config) {
+    fn temp_config(ids: &[&str]) -> (tempfile::TempDir, Config) {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_flock(tmp.path(), ids);
         (tmp, cfg)
     }
 
     #[test]
-    fn scaffold_creates_three_birds_and_hooks() {
-        let (tmp, cfg) = temp_config();
-        assert_eq!(cfg.bots.len(), 3);
-        assert_eq!(cfg.bots[0].id.0, "swift");
-        assert!(tmp.path().join("birds/raven.md").is_file());
+    fn scaffold_creates_an_empty_roster_and_hooks() {
+        let (tmp, cfg) = temp_config(&[]);
+        assert!(cfg.bots.is_empty(), "aviary ships no birds");
+        assert!(cfg.rooms.is_empty());
+        assert!(tmp.path().join("config.json").is_file());
+        // No shipped personas — birds/ exists for the ones the user hatches.
+        assert_eq!(std::fs::read_dir(tmp.path().join("birds")).unwrap().count(), 0);
         assert!(tmp.path().join("mcp.json").is_file());
+        assert!(tmp.path().join("permissions/readonly.json").is_file());
         assert!(tmp.path().join("rooms").is_dir());
         assert!(tmp.path().join("handoffs").is_dir());
         // Reload reads what scaffold wrote.
         let again = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
-        assert_eq!(again.bots.len(), 3);
+        assert!(again.bots.is_empty());
     }
 
     #[test]
     fn add_bot_materializes_persona_and_persists() {
-        let (tmp, mut cfg) = temp_config();
+        let (tmp, mut cfg) = temp_config(&[]);
         let repo = tmp.path().join("some-repo");
         std::fs::create_dir(&repo).unwrap();
         let id = cfg
@@ -668,12 +653,12 @@ mod tests {
         assert!(persona.contains("aviary-night-jar"));
         assert!(!persona.contains("{{ID}}"));
         let again = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
-        assert_eq!(again.bots.len(), 4);
+        assert_eq!(again.bots.len(), 1);
     }
 
     #[test]
     fn add_bot_rejects_duplicates_and_bad_repos() {
-        let (tmp, mut cfg) = temp_config();
+        let (tmp, mut cfg) = temp_config(&["swift"]);
         assert!(cfg
             .add_bot("swift", "Swift", "x", tmp.path().to_str().unwrap())
             .is_err());
@@ -682,7 +667,7 @@ mod tests {
 
     #[test]
     fn add_room_touches_transcript_and_validates_members() {
-        let (tmp, mut cfg) = temp_config();
+        let (tmp, mut cfg) = temp_config(&["swift", "raven"]);
         let id = cfg
             .add_room(
                 "Fly Calculator",
@@ -774,7 +759,7 @@ mod tests {
 
     #[test]
     fn settings_file_embeds_session_flag() {
-        let (tmp, cfg) = temp_config();
+        let (tmp, cfg) = temp_config(&["swift"]);
         let bot = cfg.bots[0].clone();
         let key = SessionKey { bot: bot.id.clone(), tab: 2 };
         let path = cfg.settings_file_for(&bot, &key).unwrap();

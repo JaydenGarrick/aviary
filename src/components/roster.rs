@@ -14,7 +14,7 @@ use crate::action::{Action, Effects, Msg};
 use crate::command::{Command, CommandResult};
 use crate::components::{hits, Component};
 use crate::config::Config;
-use crate::keymap::{bind, bind_alias, ch, key, Binding, KeyCode};
+use crate::keymap::{bind, bind_alias, ch, key, label_for, Binding, KeyCode, GLOBAL};
 use crate::shared::Shared;
 use crate::ui::{bird_color, dim, muted, status_span, ACCENT, DIM, MUTED};
 use crate::widgets::list_nav::{ListNav, Wrap};
@@ -502,9 +502,14 @@ impl Component for Roster {
             }
         }
 
+        // Keys named in prose come from the table, like the hints bar does.
+        let hatch_key = label_for(&[GLOBAL], Action::NewBot).unwrap_or_default();
+        let room_key = label_for(&[GLOBAL], Action::NewRoom).unwrap_or_default();
         if s.config.bots.is_empty() {
             frame.render_widget(
-                Paragraph::new(Line::from(dim(" no birds — n adds one"))),
+                Paragraph::new(Line::from(dim(format!(
+                    " no birds yet — {hatch_key} hatches one"
+                )))),
                 Rect {
                     x: inner.x,
                     y: inner.y + 1,
@@ -548,7 +553,7 @@ impl Component for Roster {
                 Span::styled(bot_label, Style::default().fg(ACCENT)),
                 Span::raw("  "),
                 Span::styled(room_label, Style::default().fg(ACCENT)),
-                dim("  n · c"),
+                dim(format!("  {hatch_key} · {room_key}")),
             ])),
             Rect {
                 x: inner.x,

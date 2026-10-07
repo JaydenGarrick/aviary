@@ -10,12 +10,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::action::{Action, Effects};
+use crate::action::{Action, Effects, Msg};
 use crate::components::{hits, Component};
 use crate::config::SessionKey;
-use crate::keymap::{bind, ch, Binding};
+use crate::keymap::{bind, ch, label_for, Binding, GLOBAL};
 use crate::shared::Shared;
-use crate::ui::{bird_color, dim, muted, status_glyph, status_span, ACCENT};
+use crate::ui::{bird_color, centered, dim, muted, status_glyph, status_span, ACCENT, MUTED};
 use crate::widgets::agent_pane;
 use crate::widgets::list_nav::{ListNav, Wrap};
 
@@ -168,6 +168,11 @@ impl Component for Thread {
         let over_pane = hits(self.pane, m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) if over_pane => {
+                // An empty aviary: the pane IS the hatch button.
+                if s.config.bots.is_empty() {
+                    fx.msg(Msg::OpenNewBot);
+                    return;
+                }
                 // Clicking the pane wakes the viewed session and hands it the
                 // keyboard, exactly like ⏎ on the sidebar.
                 if let Some(key) = s.current_key() {
@@ -196,10 +201,14 @@ impl Component for Thread {
         self.tab_rects.clear();
         let Some(id) = s.current_bot.clone() else {
             self.pane = area;
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(dim("  no bird selected"))),
-                area,
-            );
+            if s.config.bots.is_empty() {
+                draw_empty_aviary(frame, area);
+            } else {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(Line::from(dim("  no bird selected"))),
+                    area,
+                );
+            }
             return;
         };
         let Some(bot) = s.config.bot(&id).cloned() else { return };
@@ -360,4 +369,37 @@ impl Component for Thread {
         let focused = s.agent_focused;
         agent_pane::draw(frame, body, title, s.agents.get_mut(&key), focused, empty);
     }
+}
+
+/// Zero state — a fresh install has no birds at all. The keys come from the
+/// GLOBAL table so the prose can't drift from dispatch; a click anywhere in
+/// the pane opens the same form the key does.
+fn draw_empty_aviary(frame: &mut Frame, area: Rect) {
+    let hatch = label_for(&[GLOBAL], Action::NewBot).unwrap_or_default();
+    let help = label_for(&[GLOBAL], Action::Help).unwrap_or_default();
+    let key = |k: &str| {
+        Span::styled(
+            format!("{k:>12}  "),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    };
+    let lines = vec![
+        Line::from("🪺").centered(),
+        Line::from(""),
+        Line::from(Span::styled(
+            "the aviary is empty",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ))
+        .centered(),
+        Line::from(""),
+        Line::from(dim("a bird is a Claude Code session that lives in one repo")).centered(),
+        Line::from(dim("and resumes by name — hatch one per repo you work in")).centered(),
+        Line::from(""),
+        Line::from(vec![key(&hatch), muted("hatch your first bird — or click here")]),
+        Line::from(vec![key(&help), muted("every key")]),
+        Line::from(""),
+        Line::from(dim("aviary doctor checks claude, repos, hooks and config")).centered(),
+    ];
+    let rect = centered(60, lines.len() as u16, area);
+    frame.render_widget(ratatui::widgets::Paragraph::new(lines), rect);
 }

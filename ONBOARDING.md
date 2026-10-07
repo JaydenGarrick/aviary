@@ -20,9 +20,10 @@ context and character; aviary spawns, names, displays, and connects them.
 
 1. **Build & install**: `cargo install --path .` (hooks embed the binary path —
    a stable install beats `target/`). Requires Claude Code ≥ 2.1.224.
-2. **First run**: `aviary` scaffolds `~/.config/aviary/` (config, personas,
-   MCP hooks, permissions template). `aviary doctor` checks everything.
-3. **Fly a bird**: `⏎` on Swift → a full claude session boots in the iOS repo
+2. **First run**: `aviary` scaffolds `~/.config/aviary/` (empty config, MCP
+   hooks, permissions template) — no birds ship. `n` hatches one per repo;
+   its persona lands in `birds/<id>.md`. `aviary doctor` checks everything.
+3. **Fly a bird**: `⏎` on a bird → a full claude session boots in its repo
    with its persona. `ctrl+a` hands the keyboard back. Answer the repo-trust
    dialog once per repo.
 4. **Hand off**: `@` → the selected bird packages its context and SendMessages
