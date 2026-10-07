@@ -102,7 +102,7 @@ Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 | `i` / `u` / `d` / `1-5` | write / scroll the room / pick a quick-reply |
 | `?` | help, generated from the real keymaps |
 
-Mouse: click rows to select (again to step in), click chips/fields/members in
+Mouse: click rows to select (again for the context menu; `⏎` steps in), click chips/fields/members in
 any form, click outside a popup to dismiss it, wheel scrolls everything —
 including the bird's own transcript inside its pane. Click the selected
 session tab again for its menu (name · fresh · new · close) — right-click works too,

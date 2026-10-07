@@ -141,6 +141,16 @@ impl Roster {
 
     /// Step into the selection: wake a bird and hand it the keyboard, or open
     /// the room composer (via the shell, which owns the room component).
+    /// Open the context menu for the row at `idx`, anchored at the click.
+    fn open_context(&mut self, idx: usize, x: u16, y: u16, s: &Shared, fx: &mut Effects) {
+        let target = match rows(&s.config).get(idx) {
+            Some(Row::Bot(i)) => crate::action::RosterTarget::Bird(s.config.bots[*i].id.clone()),
+            Some(Row::Room(i)) => crate::action::RosterTarget::Room(s.config.rooms[*i].id.clone()),
+            None => return,
+        };
+        fx.msg(Msg::OpenContext { target, x, y });
+    }
+
     fn confirm(&mut self, s: &mut Shared, fx: &mut Effects) {
         self.sync(s);
         match rows(&s.config).get(self.nav.selected) {
@@ -269,20 +279,7 @@ impl Component for Roster {
                 if let Some(idx) = hit {
                     self.nav.selected = idx;
                     self.sync(s);
-                    let target = match rows(&s.config).get(idx) {
-                        Some(Row::Bot(i)) => {
-                            crate::action::RosterTarget::Bird(s.config.bots[*i].id.clone())
-                        }
-                        Some(Row::Room(i)) => {
-                            crate::action::RosterTarget::Room(s.config.rooms[*i].id.clone())
-                        }
-                        None => return,
-                    };
-                    fx.msg(Msg::OpenContext {
-                        target,
-                        x: m.column,
-                        y: m.row,
-                    });
+                    self.open_context(idx, m.column, m.row, s, fx);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -294,15 +291,19 @@ impl Component for Roster {
                     fx.msg(Msg::OpenNewRoom);
                     return;
                 }
-                if let Some((_, idx)) = self
+                let hit = self
                     .row_rects
                     .iter()
                     .find(|(r, _)| hits(*r, m.column, m.row))
-                {
-                    if self.nav.selected == *idx {
-                        self.confirm(s, fx); // second click steps in
+                    .map(|(_, idx)| *idx);
+                if let Some(idx) = hit {
+                    if self.nav.selected == idx {
+                        // Second click on the selected card: its context menu,
+                        // matching the session tabs (right-click is kept by
+                        // some terminals, e.g. iTerm2). ⏎ still steps in.
+                        self.open_context(idx, m.column, m.row, s, fx);
                     } else {
-                        self.nav.selected = *idx;
+                        self.nav.selected = idx;
                         self.sync(s);
                     }
                 }
