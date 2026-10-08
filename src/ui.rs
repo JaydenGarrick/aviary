@@ -61,6 +61,8 @@ pub fn status_text(status: BotStatus) -> String {
         BotStatus::Done(secs) => format!("✔ done {}", human_duration(secs)),
         BotStatus::NotStarted => "○ not started".into(),
         BotStatus::Exited => "✗ exited".into(),
+        BotStatus::Failed => "✗ failed".into(),
+        BotStatus::Paused(secs) => format!("◦ paused {}", human_duration(secs)),
     }
 }
 
@@ -74,6 +76,8 @@ pub fn status_span(status: BotStatus) -> Span<'static> {
         BotStatus::Done(_) => Style::default().fg(MUTED),
         BotStatus::NotStarted => Style::default().fg(DIM),
         BotStatus::Exited => Style::default().fg(BAD),
+        BotStatus::Failed => Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        BotStatus::Paused(_) => Style::default().fg(MUTED),
     };
     Span::styled(status_text(status), style)
 }
@@ -86,6 +90,8 @@ pub fn status_glyph(status: BotStatus) -> Span<'static> {
         BotStatus::Done(_) => Span::styled("✔", Style::default().fg(MUTED)),
         BotStatus::NotStarted => Span::styled("○", Style::default().fg(DIM)),
         BotStatus::Exited => Span::styled("✗", Style::default().fg(BAD)),
+        BotStatus::Failed => Span::styled("✗", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+        BotStatus::Paused(_) => Span::styled("◦", Style::default().fg(MUTED)),
     }
 }
 

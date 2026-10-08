@@ -156,7 +156,24 @@ impl App {
                     if self.shared.agents_poll.accept(gen, ()) {
                         let transitions = self.shared.agents.apply_poll(sessions);
                         self.react(transitions);
+                        // The same poll names the birds' workers.
+                        let wt = self
+                            .shared
+                            .agents
+                            .workers
+                            .apply_poll(&self.shared.config.bots, sessions);
+                        self.react_workers(wt);
                     }
+                }
+                crate::command::CommandResult::WorkerStopped { name, ok, detail } => {
+                    let label = crate::flock::WorkerName::parse(&name)
+                        .map(|w| w.label())
+                        .unwrap_or(name);
+                    self.shared.flash(if ok {
+                        format!("stopped {label} — its conversation is kept")
+                    } else {
+                        format!("claude stop {label} failed: {detail}")
+                    });
                 }
             },
             Event::Webhook(hook) => self.on_webhook(*hook),
@@ -200,6 +217,50 @@ impl App {
                                 .get(&t.key)
                                 .and_then(|s| s.last_prompt.clone())
                                 .unwrap_or_else(|| "waiting at its prompt".into()),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Worker transitions → the worker row's unread dot + a banner under the
+    /// bird's `notify` toggle. A viewer tab in view counts as looking.
+    fn react_workers(&mut self, transitions: Vec<crate::flock::WorkerTransition>) {
+        use crate::agent_store::{BotStatus, StatusKind};
+        for t in transitions {
+            let Some(bot) = self.shared.config.bot(&t.bot).cloned() else {
+                continue;
+            };
+            let viewing = self.shared.current_room.is_none()
+                && self.shared.current_key().is_some_and(|k| {
+                    self.shared.agents.attached_worker(&k) == Some(t.session_name.as_str())
+                });
+            match t.to {
+                StatusKind::NeedsInput => {
+                    if !viewing {
+                        self.shared.agents.workers.mark_unread(&t.session_name);
+                    }
+                    if bot.notify {
+                        self.executor.run(crate::command::Command::Notify {
+                            title: format!("{} {} › {} needs you", bot.glyph, bot.name, t.label),
+                            body: if t.status == BotStatus::Failed {
+                                "the worker reported failed".into()
+                            } else {
+                                "blocked on a permission prompt or question".into()
+                            },
+                        });
+                    }
+                }
+                StatusKind::Done
+                    if t.from == StatusKind::Working && t.status != BotStatus::Exited && !viewing =>
+                {
+                    self.shared.agents.workers.mark_unread(&t.session_name);
+                    if bot.notify {
+                        self.executor.run(crate::command::Command::Notify {
+                            title: format!("{} {} › {} finished", bot.glyph, bot.name, t.label),
+                            body: "its report is in — the bird reviews it".into(),
                         });
                     }
                 }
@@ -286,8 +347,27 @@ impl App {
         }
 
         // Fresh sessions become resumable only after surviving long enough —
-        // a boot crash must never leave a ghost resume record.
-        self.shared.agents.tick(&self.shared.config);
+        // a boot crash must never leave a ghost resume record. Viewer tabs
+        // whose attach client ended close themselves.
+        let closed = self.shared.agents.tick(&self.shared.config);
+        if let Some(k) = self.shared.current_key() {
+            if closed.contains(&k) {
+                self.shared.current_tab = 1;
+                self.shared.agent_focused = false;
+                self.shared.flash("the viewer ended — back to tab 1");
+            }
+        }
+
+        // Worker reports: a `status:` line refines idle into done /
+        // needs-input / failed / paused (stat per worker; read on change).
+        let wt = self
+            .shared
+            .agents
+            .workers
+            .tick_reports(&self.shared.config.reports_dir());
+        if !wt.is_empty() {
+            self.react_workers(wt);
+        }
 
         // Hook events (Stop / Notification) — push-latency status truth.
         let events = self.shared.events.poll(&self.shared.config.events_path());
@@ -354,6 +434,14 @@ impl App {
             };
             match self.shared.agents.get_mut(&skey) {
                 Some(s) if s.term.is_running() => {
+                    // ctrl+z would suspend an attach client with no shell to
+                    // fall back to — the pane would freeze.
+                    if s.kind != crate::agent_store::SessionKind::Bird
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('z')
+                    {
+                        return;
+                    }
                     s.term.send_key(key);
                     // The user taking over means the bird works for THEM now.
                     self.shared.agents.clear_collab(&skey.bot);
@@ -591,9 +679,21 @@ impl App {
                 self.overlay = Overlay::None;
                 self.shared.fresh_bot(&id);
             }
-            FormEvent::Delete(target) => {
+            FormEvent::Confirmed(target) => {
+                use crate::action::ConfirmTarget;
                 self.overlay = Overlay::None;
-                self.perform_delete(target);
+                match target {
+                    ConfirmTarget::Delete(t) => self.perform_delete(t),
+                    ConfirmTarget::StopWorker { name, label, id, .. } => {
+                        self.executor
+                            .run(crate::command::Command::StopWorker { name, id });
+                        self.shared.flash(format!("stopping {label}…"));
+                    }
+                }
+            }
+            FormEvent::AttachWorker { bot, name, label, id } => {
+                self.overlay = Overlay::None;
+                self.shared.attach_worker(&bot, &name, &label, &id);
             }
             // Context-menu picks: close the menu, run the existing path.
             FormEvent::Talk(id) => {
@@ -633,9 +733,9 @@ impl App {
                 fx.msg(Msg::OpenRoom(id));
                 self.apply(fx);
             }
-            FormEvent::AskDelete(target) => {
+            FormEvent::Ask(target) => {
                 let mut fx = Effects::default();
-                fx.msg(Msg::ConfirmDelete(target));
+                fx.msg(Msg::Confirm(target));
                 self.apply(fx);
             }
             FormEvent::Tab(action) => {
@@ -696,6 +796,8 @@ impl App {
                 }
                 Err(e) => self.shared.flash(format!("{e:#}")),
             },
+            // Workers are not roster entries: they leave when their session does.
+            RosterTarget::Worker { .. } => {}
         }
         self.components.roster.sync(&mut self.shared);
     }
@@ -817,10 +919,23 @@ impl App {
                 Msg::OpenProfile(id) => {
                     self.overlay = Overlay::Profile(crate::overlays::ProfileView::new(id));
                 }
-                Msg::ConfirmDelete(target) => {
-                    use crate::action::RosterTarget;
+                Msg::AttachWorker { bot, name, label, id } => {
+                    self.shared.attach_worker(&bot, &name, &label, &id);
+                }
+                Msg::Confirm(target) => {
+                    use crate::action::{ConfirmTarget, RosterTarget};
                     let (question, note) = match &target {
-                        RosterTarget::Bird(id) => {
+                        ConfirmTarget::StopWorker { label, id, .. } => (
+                            format!("Stop worker {label}?"),
+                            format!(
+                                "Runs `claude stop {id}`. Its conversation is kept — `claude attach {id}`                                  reopens it; `claude rm {id}` deletes it and its worktree."
+                            ),
+                        ),
+                        ConfirmTarget::Delete(RosterTarget::Worker { .. }) => {
+                            self.shared.flash("workers aren't released — x stops one");
+                            continue;
+                        }
+                        ConfirmTarget::Delete(RosterTarget::Bird(id)) => {
                             let name = self
                                 .shared
                                 .config
@@ -837,7 +952,7 @@ impl App {
                                 ),
                             )
                         }
-                        RosterTarget::Room(id) => (
+                        ConfirmTarget::Delete(RosterTarget::Room(id)) => (
                             format!("Delete #{id}?"),
                             "The transcript file stays in ~/.config/aviary/rooms/ — only the \
                              roster entry goes."
@@ -851,8 +966,13 @@ impl App {
                     self.overlay = Overlay::Context(crate::overlays::ContextMenu::new(target, x, y));
                 }
                 Msg::OpenTabMenu { x, y } => {
+                    let attached = self
+                        .shared
+                        .current_key()
+                        .is_some_and(|k| self.shared.agents.is_attached(&k));
                     self.overlay = Overlay::TabMenu(crate::overlays::TabMenu::new(
                         self.shared.current_tab,
+                        attached,
                         x,
                         y,
                     ));

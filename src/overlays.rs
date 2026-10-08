@@ -57,16 +57,23 @@ pub enum FormEvent {
     OpenPersona(BotId),
     /// Profile shortcut for a fresh conversation (closes the overlay).
     FreshStart(BotId),
-    /// The confirm dialog said yes: remove this from the roster.
-    Delete(crate::action::RosterTarget),
+    /// The confirm dialog said yes.
+    Confirmed(crate::action::ConfirmTarget),
+    /// A worker-row menu pick: open a viewer tab on the worker.
+    AttachWorker {
+        bot: BotId,
+        name: String,
+        label: String,
+        id: String,
+    },
     // -- context-menu picks, executed by the shell
     Talk(BotId),
     Handoff(BotId),
     Profile(BotId),
     StopBird(BotId),
     WriteRoom(String),
-    /// Open the release/delete CONFIRM dialog (menus never delete directly).
-    AskDelete(crate::action::RosterTarget),
+    /// Open the CONFIRM dialog (menus never delete or stop directly).
+    Ask(crate::action::ConfirmTarget),
     /// Label a session tab (display only; empty clears).
     RenameTab {
         key: crate::config::SessionKey,
@@ -701,6 +708,8 @@ enum MenuAct {
     Release,
     Write,
     DeleteRoom,
+    Attach,
+    StopWorker,
 }
 
 /// The right-click menu for a sidebar card, anchored at the click. Keyboard
@@ -730,6 +739,10 @@ impl ContextMenu {
                 ("write to the room", MenuAct::Write),
                 ("delete the room", MenuAct::DeleteRoom),
             ],
+            RosterTarget::Worker { .. } => vec![
+                ("attach in a tab", MenuAct::Attach),
+                ("stop the worker", MenuAct::StopWorker),
+            ],
         };
         ContextMenu {
             target,
@@ -750,9 +763,24 @@ impl ContextMenu {
             (RosterTarget::Bird(id), MenuAct::Fresh) => FormEvent::FreshStart(id.clone()),
             (RosterTarget::Bird(id), MenuAct::Stop) => FormEvent::StopBird(id.clone()),
             (_, MenuAct::Release | MenuAct::DeleteRoom) => {
-                FormEvent::AskDelete(self.target.clone())
+                FormEvent::Ask(crate::action::ConfirmTarget::Delete(self.target.clone()))
             }
             (RosterTarget::Room(id), MenuAct::Write) => FormEvent::WriteRoom(id.clone()),
+            (RosterTarget::Worker { bot, name, label, id }, MenuAct::Attach) => {
+                FormEvent::AttachWorker {
+                    bot: bot.clone(),
+                    name: name.clone(),
+                    label: label.clone(),
+                    id: id.clone(),
+                }
+            }
+            (RosterTarget::Worker { name, label, id, .. }, MenuAct::StopWorker) => {
+                FormEvent::Ask(crate::action::ConfirmTarget::StopWorker {
+                    name: name.clone(),
+                    label: label.clone(),
+                    id: id.clone(),
+                })
+            }
             _ => FormEvent::Cancel,
         }
     }
@@ -832,7 +860,8 @@ impl ContextMenu {
                     width: inner.width,
                     height: 1,
                 });
-                let destructive = matches!(act, MenuAct::Release | MenuAct::DeleteRoom);
+                let destructive =
+                    matches!(act, MenuAct::Release | MenuAct::DeleteRoom | MenuAct::StopWorker);
                 let style = if i == self.cursor {
                     Style::default()
                         .fg(if destructive { BAD } else { ACCENT })
@@ -862,14 +891,22 @@ pub struct TabMenu {
 }
 
 impl TabMenu {
-    pub fn new(tab: u8, x: u16, y: u16) -> TabMenu {
+    /// `attached`: the tab is a viewer on a worker — it can only be closed
+    /// (the worker keeps running) or sided with a new tab.
+    pub fn new(tab: u8, attached: bool, x: u16, y: u16) -> TabMenu {
         use crate::action::Action;
-        let mut items = vec![
-            ("name the tab", Action::RenameTab),
-            ("fresh conversation here", Action::FreshTab),
-            ("new tab beside it", Action::NewTab),
-        ];
-        if tab != 1 {
+        let mut items = if attached {
+            vec![("new tab beside it", Action::NewTab)]
+        } else {
+            vec![
+                ("name the tab", Action::RenameTab),
+                ("fresh conversation here", Action::FreshTab),
+                ("new tab beside it", Action::NewTab),
+            ]
+        };
+        if attached {
+            items.push(("close the tab — the worker keeps running", Action::CloseTab));
+        } else if tab != 1 {
             items.push(("close the tab", Action::CloseTab));
         }
         TabMenu {
@@ -970,10 +1007,10 @@ impl TabMenu {
 
 // --------------------------------------------------------------------- confirm
 
-/// A small yes/no gate for roster deletions — destructive enough to ask,
-/// cheap enough that the answer is one keystroke.
+/// A small yes/no gate for roster deletions and worker stops — destructive
+/// enough to ask, cheap enough that the answer is one keystroke.
 pub struct ConfirmForm {
-    target: crate::action::RosterTarget,
+    target: crate::action::ConfirmTarget,
     question: String,
     note: String,
     popup: Rect,
@@ -982,7 +1019,7 @@ pub struct ConfirmForm {
 }
 
 impl ConfirmForm {
-    pub fn new(target: crate::action::RosterTarget, question: String, note: String) -> ConfirmForm {
+    pub fn new(target: crate::action::ConfirmTarget, question: String, note: String) -> ConfirmForm {
         ConfirmForm {
             target,
             question,
@@ -995,7 +1032,7 @@ impl ConfirmForm {
 
     pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
         match k.code {
-            KeyCode::Char('y') | KeyCode::Enter => FormEvent::Delete(self.target.clone()),
+            KeyCode::Char('y') | KeyCode::Enter => FormEvent::Confirmed(self.target.clone()),
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => FormEvent::Cancel,
             _ => FormEvent::Consumed,
         }
@@ -1006,7 +1043,7 @@ impl ConfirmForm {
             return FormEvent::Cancel;
         };
         if hits(self.yes, x, y) {
-            return FormEvent::Delete(self.target.clone());
+            return FormEvent::Confirmed(self.target.clone());
         }
         if hits(self.no, x, y) {
             return FormEvent::Cancel;
@@ -1028,25 +1065,22 @@ impl ConfirmForm {
         }
         lines.push(Line::from(""));
         let buttons_idx = lines.len();
+        let yes = format!("   {}   ", self.target.yes_label());
+        let no = format!("   {}   ", self.target.no_label());
+        let (yes_w, no_w) = (yes.width() as u16, no.width() as u16);
         lines.push(Line::from(vec![
-            Span::styled(
-                "   y release   ",
-                Style::default().fg(BAD).add_modifier(Modifier::REVERSED),
-            ),
+            Span::styled(yes, Style::default().fg(BAD).add_modifier(Modifier::REVERSED)),
             Span::raw("   "),
-            Span::styled(
-                "   n keep   ",
-                Style::default().fg(DIM).add_modifier(Modifier::REVERSED),
-            ),
+            Span::styled(no, Style::default().fg(DIM).add_modifier(Modifier::REVERSED)),
         ]));
         lines.push(Line::from(""));
 
         self.popup = popup(frame, area, "sure?", lines);
         let row = line_rect(self.popup, buttons_idx);
-        self.yes = Rect { width: 15, ..row };
+        self.yes = Rect { width: yes_w, ..row };
         self.no = Rect {
-            x: row.x + 18,
-            width: 12,
+            x: row.x + yes_w + 3,
+            width: no_w,
             ..row
         };
     }

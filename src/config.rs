@@ -6,6 +6,8 @@
 //!   mcp.json      MCP servers every bird spawns with (Linear + Figma hooks)
 //!   rooms/*.md    group-chat transcripts (append-only)
 //!   handoffs/     where birds park large handoff briefs
+//!   plugin/       the flock skills, loaded by birds and workers via --plugin-dir
+//!   reports/      worker report files (`<worker-name>.md` with a `status:` line)
 //!   state.json    which bots have ever spawned (drives --resume vs fresh)
 //!
 //! Everything lives OUTSIDE the aviary repo on purpose: bot configs name
@@ -75,7 +77,9 @@ impl SessionKey {
 
     /// Inverse of [`SessionKey::state_key`].
     pub fn parse_state_key(key: &str) -> Option<SessionKey> {
-        if key.is_empty() {
+        // `_` is the worker separator (`flock::WorkerName`): a worker name is
+        // never a bird or a tab. `slug()` emits neither separator.
+        if key.is_empty() || key.contains(crate::flock::SEP) {
             return None;
         }
         match key.split_once('.') {
@@ -215,6 +219,12 @@ impl Config {
             if !seen.insert(b.id.clone()) {
                 bail!("config.json declares bot id {:?} twice", b.id.0);
             }
+            if !valid_bot_id(&b.id.0) {
+                bail!(
+                    "config.json bot id {:?} may not contain '.' or '_' — they separate session tabs and worker names",
+                    b.id.0
+                );
+            }
         }
 
         Ok(Config {
@@ -340,6 +350,17 @@ impl Config {
         self.dir.join("events.jsonl")
     }
 
+    /// The flock plugin (skills) every bird loads via `--plugin-dir`, and
+    /// that the orchestrator skill passes on to workers.
+    pub fn plugin_dir(&self) -> PathBuf {
+        self.dir.join("plugin")
+    }
+
+    /// Where workers drop `<worker-name>.md` reports (read each tick).
+    pub fn reports_dir(&self) -> PathBuf {
+        self.dir.join("reports")
+    }
+
     /// Add a bot: validate, materialize a persona from the template, persist.
     pub fn add_bot(&mut self, id: &str, name: &str, glyph: &str, repo: &str) -> Result<BotId> {
         let id = slug(id);
@@ -413,6 +434,13 @@ impl Config {
     }
 }
 
+/// A bot id may not carry either session-name separator: `.` starts a tab
+/// suffix and `_` starts a worker suffix. `slug()` never emits them; this
+/// guards hand-edited config.json.
+pub fn valid_bot_id(s: &str) -> bool {
+    !s.is_empty() && !s.contains('.') && !s.contains(crate::flock::SEP)
+}
+
 fn slug(s: &str) -> String {
     let mut out = String::new();
     for c in s.trim().chars() {
@@ -428,6 +456,9 @@ fn slug(s: &str) -> String {
 // ------------------------------------------------------------------ scaffold
 
 const PERSONA_TEMPLATE: &str = include_str!("../assets/birds/template.md");
+/// The flock skills, shipped into `<dir>/plugin/skills/` on startup.
+pub(crate) const ORCHESTRATOR_SKILL: &str = include_str!("../assets/skills/flock-orchestrator/SKILL.md");
+pub(crate) const WORKER_SKILL: &str = include_str!("../assets/skills/flock-worker/SKILL.md");
 
 fn make_bot(id: BotId, name: &str, glyph: &str, repo: &str, persona: &str) -> Bot {
     Bot {
@@ -447,7 +478,7 @@ fn make_bot(id: BotId, name: &str, glyph: &str, repo: &str, persona: &str) -> Bo
 /// overwriting a user's edits. No personas ship: `birds/` fills as the user
 /// hatches birds (see [`Config::add_bot`]).
 fn materialize_defaults(dir: &Path) -> Result<()> {
-    for sub in ["birds", "rooms", "handoffs"] {
+    for sub in ["birds", "rooms", "handoffs", "reports"] {
         std::fs::create_dir_all(dir.join(sub))
             .with_context(|| format!("cannot create {}", dir.join(sub).display()))?;
     }
@@ -485,8 +516,42 @@ fn materialize_defaults(dir: &Path) -> Result<()> {
         )?;
     }
 
+    // The flock skills ride `--plugin-dir`: every bird loads this plugin for
+    // its session, and the orchestrator skill passes it to the workers it
+    // spawns. Per-file and never overwriting, like mcp.json — a user's edits
+    // survive upgrades (`aviary doctor` notes when a copy differs).
+    let plugin = dir.join("plugin");
+    let manifest_dir = plugin.join(".claude-plugin");
+    std::fs::create_dir_all(&manifest_dir)?;
+    let manifest = manifest_dir.join("plugin.json");
+    if !manifest.is_file() {
+        std::fs::write(
+            &manifest,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "aviary",
+                "description": "aviary flock skills — orchestrate background worker sessions and report back",
+                "version": env!("CARGO_PKG_VERSION"),
+                "author": { "name": "aviary" },
+            }))? + "\n",
+        )?;
+    }
+    for (name, text) in SHIPPED_SKILLS {
+        let skill_dir = plugin.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir)?;
+        let skill = skill_dir.join("SKILL.md");
+        if !skill.is_file() {
+            std::fs::write(&skill, text)?;
+        }
+    }
+
     Ok(())
 }
+
+/// `(skill name, shipped text)` — the plugin's `skills/<name>/SKILL.md` files.
+pub(crate) const SHIPPED_SKILLS: [(&str, &str); 2] = [
+    ("flock-orchestrator", ORCHESTRATOR_SKILL),
+    ("flock-worker", WORKER_SKILL),
+];
 
 /// First run only: an empty roster. Birds are hatched from the cockpit (`n`)
 /// or by editing config.json — nothing repo-specific ships.
@@ -634,9 +699,59 @@ mod tests {
         assert!(tmp.path().join("permissions/readonly.json").is_file());
         assert!(tmp.path().join("rooms").is_dir());
         assert!(tmp.path().join("handoffs").is_dir());
+        // The flock: a plugin (manifest + both skills) and the reports dir.
+        assert!(tmp.path().join("reports").is_dir());
+        assert_eq!(cfg.reports_dir(), tmp.path().join("reports"));
+        assert_eq!(cfg.plugin_dir(), tmp.path().join("plugin"));
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("plugin/.claude-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["name"], "aviary");
+        for (name, text) in SHIPPED_SKILLS {
+            let path = tmp.path().join("plugin/skills").join(name).join("SKILL.md");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{name} ships verbatim");
+            assert!(text.starts_with(&format!("---\nname: {name}\n")), "{name} frontmatter");
+        }
         // Reload reads what scaffold wrote.
         let again = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
         assert!(again.bots.is_empty());
+    }
+
+    #[test]
+    fn materialize_never_overwrites_a_customized_skill() {
+        let (tmp, _cfg) = temp_config(&[]);
+        let skill = tmp.path().join("plugin/skills/flock-worker/SKILL.md");
+        std::fs::write(&skill, "---\nname: flock-worker\n---\nmy edit\n").unwrap();
+        std::fs::remove_file(tmp.path().join("plugin/skills/flock-orchestrator/SKILL.md")).unwrap();
+        Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: flock-worker\n---\nmy edit\n");
+        // A missing file comes back — upgrades deliver new skills, never clobber edits.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("plugin/skills/flock-orchestrator/SKILL.md")).unwrap(),
+            ORCHESTRATOR_SKILL
+        );
+    }
+
+    #[test]
+    fn config_rejects_ids_with_tab_or_worker_separators() {
+        for (id, sep) in [("night_jar", '_'), ("a.b", '.')] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("config.json"),
+                format!(
+                    r#"{{"bots":[{{"id":"{id}","name":"x","glyph":"🐦","repo":"/tmp","persona":"birds/x.md"}}],"rooms":[]}}"#
+                ),
+            )
+            .unwrap();
+            let err = Config::load_or_scaffold(tmp.path().to_path_buf())
+                .err()
+                .expect("a reserved separator in an id must fail the load");
+            assert!(err.to_string().contains(&format!("{id:?}")), "{sep}: {err:#}");
+            assert!(!valid_bot_id(id));
+        }
+        assert!(valid_bot_id("night-jar"));
+        assert!(!valid_bot_id(""));
     }
 
     #[test]
@@ -746,6 +861,10 @@ mod tests {
         assert_eq!(SessionKey::parse_state_key("swift.1"), None);
         assert_eq!(SessionKey::parse_state_key("swift.x"), None);
         assert_eq!(SessionKey::parse_state_key(".2"), None);
+        // A worker name is never a bird or a tab (see flock::WorkerName).
+        assert_eq!(SessionKey::parse_state_key("swift_x-impl"), None);
+        assert_eq!(SessionKey::parse_session_name("aviary-swift_x-impl"), None);
+        assert_eq!(SessionKey::parse_session_name("aviary-swift_x-impl.2"), None);
     }
 
     #[test]
@@ -755,6 +874,10 @@ mod tests {
         assert_eq!(slug("night.jar"), "night-jar");
         assert_eq!(slug("v2.0 bird"), "v2-0-bird");
         assert!(!slug("a.b.c-2.9").contains('.'));
+        // Same for the worker separator: `aviary-<bird>_<slug>-<role>`.
+        assert_eq!(slug("night_jar"), "night-jar");
+        assert!(!slug("a_b__c").contains(crate::flock::SEP));
+        assert!(valid_bot_id(&slug("Night_Jar.2")));
     }
 
     #[test]

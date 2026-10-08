@@ -34,3 +34,12 @@ the link.
 
 Your repo's own CLAUDE.md (and any AGENTS.md) is law and outranks this file wherever they
 touch the same subject. This file is who you are; that file is how you work.
+
+## Orchestrator hat
+
+When a room or the human settles a plan with two or more independent workstreams in this
+repo, load the `flock-orchestrator` skill: it has you write one plan per workstream, start
+one Claude Code background worker per workstream in its own git worktree (named
+`aviary-{{ID}}_<slug>-<role>` so the cockpit shows it under you), monitor and review them,
+and ask the human before anything irreversible. Never fan out for single-workstream work —
+do that yourself.

@@ -40,6 +40,16 @@ pub struct AgentSession {
     /// and every later launch fell into claude's resume picker.
     fresh_unmarked: bool,
     exit_handled: bool,
+    pub kind: SessionKind,
+}
+
+/// What a tab's PTY runs: the bird itself, or a VIEWER on one of its workers
+/// (`claude attach <id>`). A viewer never earns a resume record — it is not
+/// a conversation of the bird's — and closing it never stops the worker.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SessionKind {
+    Bird,
+    Attached { worker: String, label: String },
 }
 
 /// The coarse state machine a bird moves through (drives transitions).
@@ -60,6 +70,11 @@ pub enum BotStatus {
     /// Finished responding, waiting at its prompt for `secs`.
     Done(u64),
     Exited,
+    /// Worn only by workers: the report said `failed`. Ranks with NeedsInput.
+    Failed,
+    /// Worn only by workers: idle on an `in-progress` report for `secs`.
+    /// Ranks with Done.
+    Paused(u64),
 }
 
 /// A status change worth reacting to (unread dot, notification).
@@ -145,6 +160,9 @@ pub struct AgentStore {
     unread: HashMap<BotId, bool>,
     collab: HashMap<BotId, (Collab, Instant)>,
     state: State,
+    /// The birds' workers — bird-spawned `claude --bg` sessions, attributed
+    /// from the poll by name, never spawned here.
+    pub workers: crate::flock::Workers,
 }
 
 impl AgentStore {
@@ -157,6 +175,7 @@ impl AgentStore {
             unread: HashMap::new(),
             collab: HashMap::new(),
             state: State::load(&cfg.dir),
+            workers: crate::flock::Workers::default(),
         }
     }
 
@@ -201,8 +220,12 @@ impl AgentStore {
         self.sessions.get_mut(key)
     }
 
+    /// Live BIRD sessions (viewers are not birds flying).
     pub fn running_count(&self) -> usize {
-        self.sessions.values().filter(|s| s.term.is_running()).count()
+        self.sessions
+            .values()
+            .filter(|s| s.kind == SessionKind::Bird && s.term.is_running())
+            .count()
     }
 
     /// Has this session EVER existed (drives resume vs the first-flight prompt)?
@@ -213,6 +236,40 @@ impl AgentStore {
     /// The tab's human label, if the user set one (display only).
     pub fn tab_name(&self, key: &SessionKey) -> Option<&str> {
         self.state.tab_name(&key.state_key())
+    }
+
+    /// The strip's label: a viewer tab names its worker, a bird tab carries
+    /// the user's label.
+    pub fn tab_label(&self, key: &SessionKey) -> Option<String> {
+        match self.sessions.get(key).map(|s| &s.kind) {
+            Some(SessionKind::Attached { label, .. }) => Some(label.clone()),
+            _ => self.tab_name(key).map(str::to_string),
+        }
+    }
+
+    pub fn is_attached(&self, key: &SessionKey) -> bool {
+        matches!(
+            self.sessions.get(key).map(|s| &s.kind),
+            Some(SessionKind::Attached { .. })
+        )
+    }
+
+    /// The worker a viewer tab shows (its session name).
+    pub fn attached_worker(&self, key: &SessionKey) -> Option<&str> {
+        match self.sessions.get(key).map(|s| &s.kind) {
+            Some(SessionKind::Attached { worker, .. }) => Some(worker),
+            _ => None,
+        }
+    }
+
+    /// The tab already viewing this worker, if any — never open two.
+    pub fn attached_tab(&self, bot: &BotId, worker: &str) -> Option<u8> {
+        self.sessions
+            .iter()
+            .find(|(k, s)| {
+                k.bot == *bot && matches!(&s.kind, SessionKind::Attached { worker: w, .. } if w == worker)
+            })
+            .map(|(k, _)| k.tab)
     }
 
     /// Label a tab for the strip; an empty name clears the label.
@@ -250,9 +307,9 @@ impl AgentStore {
     pub fn status_tabbed(&self, id: &BotId) -> (BotStatus, Option<u8>) {
         aggregate_status(
             self.sessions
-                .keys()
-                .filter(|k| k.bot == *id)
-                .map(|k| (k.tab, self.status_key(k))),
+                .iter()
+                .filter(|(k, s)| k.bot == *id && s.kind == SessionKind::Bird)
+                .map(|(k, _)| (k.tab, self.status_key(k))),
         )
     }
 
@@ -263,6 +320,11 @@ impl AgentStore {
         };
         if !session.term.is_running() {
             return BotStatus::Exited;
+        }
+        // A viewer wears its worker's status — the attach client's redraws
+        // are not the worker working.
+        if let SessionKind::Attached { worker, .. } = &session.kind {
+            return self.workers.status(worker);
         }
         let output_age = self.last_output.get(key).map(|t| t.elapsed());
         // Streaming overrides everything — a laggy poll can say "idle" while
@@ -318,6 +380,7 @@ impl AgentStore {
         self.sessions
             .keys()
             .any(|k| matches!(self.status_key(k), BotStatus::Working))
+            || self.workers.has_working()
     }
 
     /// Only badge sessions whose PTY we actually hold — a user's own session
@@ -325,7 +388,7 @@ impl AgentStore {
     fn live_keys(&self) -> Vec<SessionKey> {
         self.sessions
             .iter()
-            .filter(|(_, s)| s.term.is_running())
+            .filter(|(_, s)| s.kind == SessionKind::Bird && s.term.is_running())
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -372,6 +435,9 @@ impl AgentStore {
         let key = SessionKey { bot: bot.id.clone(), tab };
         if let Some(session) = self.sessions.get_mut(&key) {
             if session.term.is_running() {
+                if session.kind != SessionKind::Bird {
+                    return Ok(()); // a viewer: nothing to type at, nothing to resume
+                }
                 if let Some(p) = prompt {
                     // send_line, never a trailing \r in the same burst — the
                     // child's paste detection would swallow the submit.
@@ -379,6 +445,12 @@ impl AgentStore {
                     session.last_prompt = Some(p.to_string());
                 }
                 return Ok(());
+            }
+            if let SessionKind::Attached { label, .. } = &session.kind {
+                // The attach client ended: never replace a viewer with a bird.
+                let label = label.clone();
+                self.sessions.remove(&key);
+                bail!("{label}'s viewer ended — reopen it from the worker row");
             }
             self.sessions.remove(&key); // exited — replace it
         }
@@ -413,6 +485,7 @@ impl AgentStore {
             &settings,
             &cfg.dir,
             &cfg.mcp_config_path(),
+            &cfg.plugin_dir(),
             prompt,
             resume,
         );
@@ -427,10 +500,48 @@ impl AgentStore {
                 resumed: resume,
                 fresh_unmarked: !resume,
                 exit_handled: false,
+                kind: SessionKind::Bird,
             },
         );
         self.kind_since
             .insert(key.clone(), (StatusKind::Working, Instant::now()));
+        Ok(())
+    }
+
+    /// Open a VIEWER on one of the bird's workers in tab `key.tab`:
+    /// `claude attach <id>` in the bird's repo. Never a resume record
+    /// (`fresh_unmarked: false`); closing it leaves the worker running.
+    pub fn launch_attach(
+        &mut self,
+        bot: &Bot,
+        key: &SessionKey,
+        worker: &str,
+        label: &str,
+        short_id: &str,
+        tx: &Sender<Event>,
+    ) -> Result<()> {
+        let repo = bot.repo_path();
+        if !repo.is_dir() {
+            bail!("{}'s repo is missing: {}", bot.name, repo.display());
+        }
+        self.sessions.remove(key);
+        let args = vec!["attach".to_string(), short_id.to_string()];
+        let term = pty::Terminal::spawn(key.clone(), "claude", &args, &repo, 24, 80, tx.clone())?;
+        self.sessions.insert(
+            key.clone(),
+            AgentSession {
+                term,
+                last_prompt: None,
+                spawned_at: Instant::now(),
+                resumed: false,
+                fresh_unmarked: false,
+                exit_handled: false,
+                kind: SessionKind::Attached {
+                    worker: worker.to_string(),
+                    label: label.to_string(),
+                },
+            },
+        );
         Ok(())
     }
 
@@ -461,6 +572,9 @@ impl AgentStore {
         tx: &Sender<Event>,
     ) -> Result<()> {
         let key = SessionKey { bot: bot.id.clone(), tab };
+        if self.is_attached(&key) {
+            bail!("tab {tab} shows a worker — close it instead");
+        }
         self.sessions.remove(&key);
         self.state.forget(&cfg.dir, &key.state_key());
         self.launch(cfg, bot, &key, prompt, tx, false)
@@ -485,8 +599,10 @@ impl AgentStore {
     }
 
     /// Once a second: a fresh session that has survived [`MARK_AFTER`] becomes
-    /// that tab's resumable session of record.
-    pub fn tick(&mut self, cfg: &Config) {
+    /// that tab's resumable session of record; a viewer whose attach client
+    /// ended (worker stopped or removed, or the user left it) closes itself.
+    /// Returns the viewer tabs that closed, so the shell can leave them.
+    pub fn tick(&mut self, cfg: &Config) -> Vec<SessionKey> {
         let ripe: Vec<SessionKey> = self
             .sessions
             .iter()
@@ -501,6 +617,19 @@ impl AgentStore {
                 s.fresh_unmarked = false;
             }
         }
+        let ended: Vec<SessionKey> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.kind != SessionKind::Bird && !s.term.is_running())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &ended {
+            self.sessions.remove(key);
+            self.last_output.remove(key);
+            self.observed.remove(key);
+            self.kind_since.remove(key);
+        }
+        ended
     }
 
     /// Note PTY activity (from `Event::AgentOutput`). Returns a relaunch
@@ -525,7 +654,8 @@ impl AgentStore {
     }
 
     /// Stop EVERY session of the bird (the roster's `x`). Dropping the master
-    /// closes the PTY, which hangs up the child.
+    /// closes the PTY, which hangs up the child. Viewer tabs drop too — their
+    /// workers keep running, they just lose their window.
     pub fn stop(&mut self, id: &BotId) {
         self.sessions.retain(|k, _| k.bot != *id);
         self.observed.retain(|k, _| k.bot != *id);
@@ -541,9 +671,13 @@ impl AgentStore {
     /// Close a tab: stop it, forget its resume record and label, so the strip
     /// entry disappears. The claude session itself survives, unreferenced.
     pub fn close_tab(&mut self, cfg: &Config, key: &SessionKey) {
+        let viewer = self.is_attached(key);
         self.stop_key(key);
         self.last_output.remove(key);
         self.kind_since.remove(key);
+        if viewer {
+            return; // a viewer has no record and no label of its own
+        }
         self.state.forget(&cfg.dir, &key.state_key());
         self.state.set_tab_name(&cfg.dir, &key.state_key(), "");
     }
@@ -556,6 +690,7 @@ impl AgentStore {
         self.last_output.retain(|k, _| k.bot != *id);
         self.kind_since.retain(|k, _| k.bot != *id);
         self.unread.remove(id);
+        self.workers.forget_bot(id);
         self.state.forget_bot(&cfg.dir, id);
     }
 }
@@ -569,9 +704,9 @@ fn aggregate_status(
     use BotStatus::*;
     fn rank(s: &BotStatus) -> u8 {
         match s {
-            NeedsInput => 4,
+            NeedsInput | Failed => 4,
             Working => 3,
-            Done(_) => 2,
+            Done(_) | Paused(_) => 2,
             Exited => 1,
             NotStarted => 0,
         }
@@ -639,13 +774,16 @@ pub enum RelaunchHint {
 /// next flag — unterminated, they swallow the positional prompt as another
 /// config path ("MCP config file not found: <repo>/<prompt text>"). Each is
 /// therefore followed by another flag, and the positional prompt only ever
-/// follows a single-value flag.
+/// follows a single-value flag. `--plugin-dir` is single-valued (repeatable,
+/// not variadic) but sits ahead of `--settings` all the same.
+#[allow(clippy::too_many_arguments)] // an argv builder: every path is its own flag
 fn launch_args(
     session: String,
     persona: &std::path::Path,
     settings: &std::path::Path,
     cfg_dir: &std::path::Path,
     mcp: &std::path::Path,
+    plugin: &std::path::Path,
     prompt: Option<&str>,
     resume: bool,
 ) -> Vec<String> {
@@ -662,6 +800,9 @@ fn launch_args(
         // first-class instead of out-of-scope.
         "--add-dir".into(),
         cfg_dir.display().to_string(),
+        // The flock skills (orchestrator + worker), for this session only.
+        "--plugin-dir".into(),
+        plugin.display().to_string(),
         // Per-session Stop/Notification hooks (+ optional permission allows) —
         // the source of truthful "done / needs input" signals.
         "--settings".into(),
@@ -716,10 +857,15 @@ mod tests {
             Path::new("/cfg/settings/swift.json"),
             Path::new("/cfg"),
             Path::new("/cfg/mcp.json"),
+            Path::new("/cfg/plugin"),
             Some("You've just been perched."),
             false,
         );
         assert_eq!(args.last().map(String::as_str), Some("You've just been perched."));
+        let p = args.iter().position(|a| a == "--plugin-dir").unwrap();
+        assert_eq!(args[p + 1], "/cfg/plugin");
+        assert!(args[p + 2].starts_with("--"), "--plugin-dir takes one value then a flag");
+        assert!(p < args.iter().position(|a| a == "--settings").unwrap());
         for variadic in ["--mcp-config", "--add-dir"] {
             let i = args.iter().position(|a| a == variadic).unwrap();
             assert!(
@@ -742,6 +888,7 @@ mod tests {
             Path::new("/cfg/settings/raven.json"),
             Path::new("/cfg"),
             Path::new("/cfg/mcp.json"),
+            Path::new("/cfg/plugin"),
             None,
             true,
         );
@@ -762,6 +909,9 @@ mod tests {
         // A lone session never names its tab — "which tab" is noise then.
         assert_eq!(agg(vec![(1, Working)]), (Working, None));
         assert_eq!(agg(vec![(1, Done(30)), (2, Working)]), (Working, Some(2)));
+        // Worker-only states: Failed is attention, Paused is quiet.
+        assert_eq!(agg(vec![(1, Working), (2, Failed)]), (Failed, Some(2)));
+        assert_eq!(agg(vec![(1, Paused(5)), (2, Working)]), (Working, Some(2)));
         assert_eq!(
             agg(vec![(1, Working), (3, NeedsInput), (2, Done(5))]),
             (NeedsInput, Some(3))
@@ -778,6 +928,7 @@ mod tests {
             name: name.into(),
             status: status.into(),
             cwd: String::new(),
+            ..Default::default()
         };
         let live = [key("swift", 1), key("swift", 2)];
         let polled = [
