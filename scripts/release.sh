@@ -105,7 +105,19 @@ fi
 # --------------------------------------------------------------------- bump
 if [[ $TAP_ONLY -eq 0 ]]; then
   step "bump Cargo.toml → $VERSION"
-  run perl -pi -e "s/^version = \"\\Q$CURRENT\\E\"/version = \"$VERSION\"/ if !\$done++" Cargo.toml
+  # First `version = "…"` line only: the flag is set when a substitution
+  # actually happens, not merely when a line is visited.
+  BUMP="if (!\$done && s/^version = \"\\Q$CURRENT\\E\"/version = \"$VERSION\"/) { \$done = 1 }"
+  if [[ $DRY -eq 1 ]]; then
+    PREVIEW=$(mktemp); cp Cargo.toml "$PREVIEW"
+    perl -pi -e "$BUMP" "$PREVIEW"
+    note "would write: $(grep -m1 '^version = ' "$PREVIEW")"
+    rm -f "$PREVIEW"
+  fi
+  run perl -pi -e "$BUMP" Cargo.toml
+  if [[ $DRY -eq 0 ]]; then
+    grep -q "^version = \"$VERSION\"" Cargo.toml || die "the version bump did not apply to Cargo.toml"
+  fi
   run cargo build -q          # refreshes Cargo.lock's aviary entry
   if [[ $DRY -eq 0 ]]; then
     GOT=$(./target/debug/aviary --version)
