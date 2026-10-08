@@ -93,7 +93,7 @@ pub static KEYMAP: &[Binding] = &[
         ch('y'),
         Action::Yank,
         None,
-        "copy the selected bird's visible pane to the clipboard",
+        "copy the pane — the bird's screen, or the last room message as markdown",
     ),
 ];
 

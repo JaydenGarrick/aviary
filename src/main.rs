@@ -8,6 +8,7 @@
 mod action;
 mod agent_store;
 mod app;
+mod clipboard;
 mod command;
 mod components;
 mod config;
@@ -16,6 +17,7 @@ mod event;
 mod events;
 mod http;
 mod keymap;
+mod markdown;
 mod overlays;
 mod prompts;
 mod pty;

@@ -65,6 +65,9 @@ and gives the birds each other.
   under `~/.config/aviary/rooms/`; birds append `### @name — time` blocks.
   Dispatch is mention-driven: your message with no mentions wakes every member,
   a bird's reply only wakes who it @-mentions — so bot chatter is bounded.
+  Transcripts render as markdown (tables, lists, code, bold, coloured
+  @mentions). Creating a room gives every member a **fresh conversation**:
+  their primary sessions reset and hatch anew on the room's first message.
 - **Linear + Figma come along.** Every bird spawns with
   `--mcp-config ~/.config/aviary/mcp.json` (Linear + Figma remote MCP servers),
   and composers detect `ABC-123` / linear.app / figma.com references and wrap
@@ -135,11 +138,14 @@ Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
 | `W` | close the viewed tab and forget it (tab 1 refuses — that's the bird) |
 | `R` | label the viewed tab (display only; empty clears) |
 | `i` / `u` / `d` / `1-5` | write / scroll the room / pick a quick-reply |
+| `y` | copy: the bird's visible pane, or in a room the last message as markdown |
+| `m` | release the mouse to the terminal for native drag-select; `m` again re-captures |
 | `?` | help, generated from the real keymaps |
 
 Mouse: click rows to select (again for the context menu; `⏎` steps in), click chips/fields/members in
 any form, click outside a popup to dismiss it, wheel scrolls everything —
-including the bird's own transcript inside its pane. Click the selected
+including the bird's own transcript inside its pane. In a room, drag over the
+transcript to select text — releasing copies it to the clipboard. Click the selected
 session tab again for its menu (name · fresh · new · close) — right-click works too,
 but iTerm2 keeps right-clicks for its own menu unless you remove that binding
 in Settings → Pointer. The strip wraps onto more rows when the labels outgrow

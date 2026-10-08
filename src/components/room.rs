@@ -1,23 +1,36 @@
 //! The room view — a rendered group-chat transcript with an inline composer.
 //!
 //! The transcript file is the source of truth; this component re-reads it on
-//! tick and renders bottom-anchored, like a chat. Dispatch of NEW appends is
-//! the shell's room watcher — this view only reads, composes, and sends.
+//! tick, renders it through `markdown` (cached until the text or width
+//! changes), and draws it bottom-anchored, like a chat. Dispatch of NEW
+//! appends is the shell's room watcher — this view only reads, composes,
+//! sends, and copies.
+//!
+//! Copying: a drag over the transcript paints a selection in CONTENT
+//! coordinates (body line, display column) and copies it on release — a live
+//! append shifts rows on screen, never the lines under the pointer. `y`
+//! copies the last message's raw markdown instead.
 
-use crossterm::event::{KeyCode as CKey, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode as CKey, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::action::{Action, Effects};
 use crate::agent_store::Collab;
+use crate::clipboard;
 use crate::components::{hits, Component};
-use crate::config::BotId;
+use crate::config::{BotId, Room};
+use crate::keymap::{label_for, GLOBAL};
+use crate::markdown;
 use crate::room::{self, Entry, USER_AUTHOR};
 use crate::shared::Shared;
-use crate::ui::{bird_color, dim, status_span, wrap, ACCENT, DIM, MUTED};
+use crate::ui::{bird_color, dim, status_span, ACCENT, DIM, MUTED};
+
+/// Indent under every author header; stripped again on copy.
+const GUTTER: &str = "    ";
 
 #[derive(Default)]
 pub struct RoomView {
@@ -28,8 +41,26 @@ pub struct RoomView {
     /// Lines up from the bottom; 0 = follow new messages.
     scroll_up: usize,
     composing: Option<String>,
-    /// The composer/hint line — clickable to start writing.
+    /// The composer box — clickable to start writing.
     footer: Rect,
+    /// The rendered transcript, rebuilt only when its key changes.
+    cache: Option<Rendered>,
+    /// The transcript viewport, and the body line drawn at its first row.
+    view: Rect,
+    first_visible: usize,
+    /// Where Down landed, content coords (line, col) — a click until a Drag
+    /// converts it into a selection.
+    press: Option<(usize, usize)>,
+    /// anchor → cursor, content coords. Some = a selection is live.
+    sel: Option<((usize, usize), (usize, usize))>,
+}
+
+struct Rendered {
+    /// room id · width · entry count · last body length · roster size.
+    key: (String, u16, usize, usize, usize),
+    lines: Vec<Line<'static>>,
+    /// Plain text per line — what a drag copies.
+    text: Vec<String>,
 }
 
 /// `A) …` / `A. …` lines at the end of the last BOT message become one-key
@@ -67,6 +98,11 @@ impl RoomView {
     pub fn start_compose(&mut self) {
         self.composing = Some(String::new());
         self.scroll_up = 0;
+    }
+
+    /// A selection is painted (the hints bar says so).
+    pub fn selecting(&self) -> bool {
+        self.sel.is_some()
     }
 
     fn compose_with(&mut self, text: String) {
@@ -116,6 +152,120 @@ impl RoomView {
         self.reload(s);
         self.scroll_up = 0;
     }
+
+    /// Rebuild the rendered transcript when the text, width, or roster
+    /// (colours) changed — otherwise the cache serves every frame.
+    fn ensure_rendered(&mut self, s: &Shared, room: &Room, width: u16) {
+        let key = (
+            room.id.clone(),
+            width,
+            self.entries.len(),
+            self.entries.last().map(|e| e.body.len()).unwrap_or(0),
+            s.config.bots.len(),
+        );
+        if self.cache.as_ref().is_some_and(|c| c.key == key) {
+            return;
+        }
+        let lines = render_transcript(&self.entries, s, width);
+        let text = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect::<String>())
+            .collect();
+        self.cache = Some(Rendered { key, lines, text });
+    }
+
+    fn lines_len(&self) -> usize {
+        self.cache.as_ref().map(|c| c.lines.len()).unwrap_or(0)
+    }
+
+    /// Screen cell → content coords, clamped to the transcript.
+    fn cell(&self, m: &MouseEvent) -> (usize, usize) {
+        let row = m.row.saturating_sub(self.view.y) as usize;
+        let line = (self.first_visible + row).min(self.lines_len().saturating_sub(1));
+        let col = m
+            .column
+            .saturating_sub(self.view.x)
+            .min(self.view.width.saturating_sub(1)) as usize;
+        (line, col)
+    }
+
+    fn copy_selection(&mut self, fx: &mut Effects) {
+        let Some((a, b)) = self.sel.take() else { return };
+        let text = self
+            .cache
+            .as_ref()
+            .map(|c| selection::extract(&c.text, a, b, GUTTER.len()))
+            .unwrap_or_default();
+        let n = text.lines().count();
+        fx.flash(if n == 0 {
+            "nothing in the selection".to_string()
+        } else if !clipboard::copy(&text) {
+            "pbcopy failed".to_string()
+        } else {
+            format!("copied {n} line{}", if n == 1 { "" } else { "s" })
+        });
+    }
+
+    /// `y`: the last message, raw markdown — tables and links intact.
+    fn yank_last(&self, fx: &mut Effects) {
+        match self.entries.last() {
+            Some(e) if !e.body.trim().is_empty() => {
+                fx.flash(if clipboard::copy(&e.body) {
+                    format!("copied @{}'s message as markdown", e.author)
+                } else {
+                    "pbcopy failed".to_string()
+                });
+            }
+            _ => fx.flash("nothing to copy — the room is empty"),
+        }
+    }
+}
+
+/// Author blocks → lines: a coloured header, the body through the markdown
+/// renderer behind the gutter, a blank line. The zero state when empty.
+fn render_transcript(entries: &[Entry], s: &Shared, width: u16) -> Vec<Line<'static>> {
+    let theme = markdown::Theme::aviary();
+    let mention = |id: &str| -> Option<Color> {
+        if id == USER_AUTHOR {
+            return Some(ACCENT);
+        }
+        s.config
+            .bots
+            .iter()
+            .position(|b| b.id.0 == id)
+            .map(bird_color)
+    };
+    let body_width = width.saturating_sub(GUTTER.len() as u16 + 1) as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for e in entries {
+        let colour = if e.author == USER_AUTHOR {
+            ACCENT
+        } else {
+            colour_for(s, &BotId(e.author.clone()))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  @{}", e.author),
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            dim(format!("  {}", e.when)),
+        ]));
+        for md in markdown::render(&e.body, body_width, &theme, &mention) {
+            let mut spans = vec![Span::raw(GUTTER)];
+            spans.extend(md.spans);
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+    }
+    if entries.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(dim("  nothing yet — ⏎ writes the first message")));
+        lines.push(Line::from(dim(
+            "  birds reply only when @-mentioned or when they have something material",
+        )));
+    }
+    lines
 }
 
 impl Component for RoomView {
@@ -142,7 +292,7 @@ impl Component for RoomView {
         }
     }
 
-    fn update(&mut self, a: Action, s: &mut Shared, _fx: &mut Effects) {
+    fn update(&mut self, a: Action, s: &mut Shared, fx: &mut Effects) {
         match a {
             Action::Compose => self.start_compose(),
             Action::Quick(n) => {
@@ -153,6 +303,7 @@ impl Component for RoomView {
             Action::PageUp => self.scroll_up = self.scroll_up.saturating_add(8),
             Action::PageDown => self.scroll_up = self.scroll_up.saturating_sub(8),
             Action::Reload => self.reload(s),
+            Action::Yank => self.yank_last(fx),
             _ => {}
         }
     }
@@ -160,6 +311,9 @@ impl Component for RoomView {
     fn on_enter(&mut self, s: &mut Shared, _fx: &mut Effects) {
         self.scroll_up = 0;
         self.composing = None;
+        self.press = None;
+        self.sel = None;
+        self.cache = None;
         self.reload(s);
     }
 
@@ -167,11 +321,11 @@ impl Component for RoomView {
         self.reload(s);
     }
 
-    fn handle_mouse(&mut self, m: MouseEvent, _s: &mut Shared, _fx: &mut Effects) {
+    fn handle_mouse(&mut self, m: MouseEvent, _s: &mut Shared, fx: &mut Effects) {
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_up = self.scroll_up.saturating_add(3),
             MouseEventKind::ScrollDown => self.scroll_up = self.scroll_up.saturating_sub(3),
-            MouseEventKind::Down(_) => {
+            MouseEventKind::Down(button) => {
                 if let Some((_, idx)) = self
                     .option_rects
                     .iter()
@@ -182,9 +336,30 @@ impl Component for RoomView {
                     }
                     return;
                 }
-                if hits(self.footer, m.column, m.row) && self.composing.is_none() {
-                    self.start_compose();
+                if hits(self.footer, m.column, m.row) {
+                    if self.composing.is_none() {
+                        self.start_compose();
+                    }
+                    return;
                 }
+                if button == MouseButton::Left && hits(self.view, m.column, m.row) {
+                    // Arm: a click until a Drag turns it into a selection.
+                    self.press = Some(self.cell(&m));
+                    self.sel = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(anchor) = self.sel.map(|(a, _)| a).or(self.press) {
+                    self.sel = Some((anchor, self.cell(&m)));
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Copy-on-release: ⌘C never reaches the app under mouse
+                // capture, and a later keypress would race new appends.
+                if self.sel.is_some() {
+                    self.copy_selection(fx);
+                }
+                self.press = None; // a plain click on the transcript does nothing
             }
             _ => {}
         }
@@ -218,67 +393,9 @@ impl Component for RoomView {
             header.push(status_span(s.agents.status(member)));
         }
 
-        // Body: transcript rendered as wrapped author blocks.
-        let width = area.width.saturating_sub(6) as usize;
-        let mut body: Vec<Line> = Vec::new();
-        for e in &self.entries {
-            let colour = if e.author == USER_AUTHOR {
-                ACCENT
-            } else {
-                colour_for(s, &BotId(e.author.clone()))
-            };
-            body.push(Line::from(vec![
-                Span::styled(
-                    format!("  @{}", e.author),
-                    Style::default().fg(colour).add_modifier(Modifier::BOLD),
-                ),
-                dim(format!("  {}", e.when)),
-            ]));
-            // Markdown-ish: fenced code dims verbatim, blockquotes get a bar.
-            let mut in_code = false;
-            for para in e.body.lines() {
-                let t = para.trim_end();
-                if t.trim_start().starts_with("```") {
-                    in_code = !in_code;
-                    body.push(Line::from(dim(format!("    {}", t.trim_start()))));
-                    continue;
-                }
-                if t.trim().is_empty() {
-                    body.push(Line::from(""));
-                    continue;
-                }
-                if in_code {
-                    body.push(Line::from(Span::styled(
-                        format!("      {t}"),
-                        Style::default().fg(DIM),
-                    )));
-                    continue;
-                }
-                if let Some(q) = t.trim_start().strip_prefix("> ") {
-                    for chunk in wrap(q, width.saturating_sub(2)) {
-                        body.push(Line::from(vec![
-                            dim("    ▏ "),
-                            Span::styled(chunk, Style::default().fg(DIM)),
-                        ]));
-                    }
-                    continue;
-                }
-                for chunk in wrap(t, width) {
-                    body.push(Line::from(Span::styled(
-                        format!("    {chunk}"),
-                        Style::default().fg(MUTED),
-                    )));
-                }
-            }
-            body.push(Line::from(""));
-        }
-        if self.entries.is_empty() {
-            body.push(Line::from(""));
-            body.push(Line::from(dim("  nothing yet — ⏎ writes the first message")));
-            body.push(Line::from(dim(
-                "  birds reply only when @-mentioned or when they have something material",
-            )));
-        }
+        // Body: the cached render of the transcript.
+        self.ensure_rendered(s, &room, area.width);
+        let total = self.lines_len();
 
         // Layout: header · transcript window · quick-reply chips · a REAL
         // bordered composer box (the single gray line was too easy to miss).
@@ -286,26 +403,48 @@ impl Component for RoomView {
         let input_h = 3u16;
         let show_options = !self.options.is_empty() && self.composing.is_none();
         let options_h = if show_options { 1u16 } else { 0 };
-        let view_h =
-            area.height.saturating_sub(header_h + input_h + options_h + 1) as usize;
-        let max_up = body.len().saturating_sub(view_h);
+        let view_h = area
+            .height
+            .saturating_sub(header_h + input_h + options_h + 1) as usize;
+        let max_up = total.saturating_sub(view_h);
         self.scroll_up = self.scroll_up.min(max_up);
-        let end = body.len() - self.scroll_up.min(body.len());
+        let end = total - self.scroll_up.min(total);
         let start = end.saturating_sub(view_h);
+        self.view = Rect {
+            x: area.x,
+            y: area.y + header_h + 1,
+            width: area.width,
+            height: view_h as u16,
+        };
+        self.first_visible = start;
 
         frame.render_widget(
             Paragraph::new(Line::from(header)),
             Rect { height: header_h, ..area },
         );
-        frame.render_widget(
-            Paragraph::new(body[start..end].to_vec()),
-            Rect {
-                x: area.x,
-                y: area.y + header_h + 1,
-                width: area.width,
-                height: view_h as u16,
-            },
-        );
+        if let Some(cache) = &self.cache {
+            frame.render_widget(Paragraph::new(cache.lines[start..end].to_vec()), self.view);
+        }
+
+        // Selection highlight: a post-pass over the cells just drawn.
+        if let Some((a, b)) = self.sel.map(|(a, b)| selection::range(a, b)) {
+            let view = self.view;
+            let last_col = view.width.saturating_sub(1) as usize;
+            let buf = frame.buffer_mut();
+            for r in 0..view.height {
+                let line = start + r as usize;
+                if line < a.0 || line > b.0 {
+                    continue;
+                }
+                let from = if line == a.0 { a.1 } else { 0 };
+                let to = if line == b.0 { b.1 } else { last_col };
+                for c in from..=to.min(last_col) {
+                    if let Some(cell) = buf.cell_mut((view.x + c as u16, view.y + r)) {
+                        cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                    }
+                }
+            }
+        }
 
         // Quick-reply chips: click or 1-5 prefills the composer.
         self.option_rects.clear();
@@ -346,7 +485,7 @@ impl Component for RoomView {
         let composing = self.composing.is_some();
         let border = if composing { ACCENT } else { DIM };
         let hint = if composing {
-            " ⏎ send · esc cancel "
+            " ⏎ send · esc cancel · no @mention wakes everyone · @name wakes just that bird "
         } else {
             " ⏎ or click to write "
         };
@@ -371,24 +510,32 @@ impl Component for RoomView {
                     // caret lives while typing.
                     format!("{}▌", tail(buf, area.width.saturating_sub(5) as usize)),
                     Style::default()
-                        .fg(ratatui::style::Color::Reset)
+                        .fg(Color::Reset)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            None => Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    format!("Message #{}", room.name),
-                    Style::default().fg(MUTED),
-                ),
-                dim("  — no @mention wakes everyone · @name wakes just that bird"),
-            ]),
+            None => {
+                // Keys named from the tables, so the prose can't drift.
+                let yank = label_for(&[crate::components::roster::KEYMAP], Action::Yank)
+                    .unwrap_or_default();
+                let mouse = label_for(&[GLOBAL], Action::ToggleMouse).unwrap_or_default();
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("Message #{}", room.name),
+                        Style::default().fg(MUTED),
+                    ),
+                    dim(format!(
+                        "  — drag copies · {yank} copies the last message · {mouse} frees the mouse"
+                    )),
+                ])
+            }
         };
         frame.render_widget(ratatui::widgets::Paragraph::new(content).block(block), input_rect);
     }
 }
 
-fn colour_for(s: &Shared, id: &BotId) -> ratatui::style::Color {
+fn colour_for(s: &Shared, id: &BotId) -> Color {
     s.config
         .bots
         .iter()
@@ -414,6 +561,58 @@ fn tail(s: &str, max: usize) -> String {
     }
     let kept: String = s.chars().skip(n - (max - 1)).collect();
     format!("…{kept}")
+}
+
+/// Pure selection math over rendered lines — content coords are (line
+/// index, display column); the cursor cell is included.
+mod selection {
+    use unicode_width::UnicodeWidthChar;
+
+    type Cell = (usize, usize);
+
+    /// Order the two ends (a drag can run up-left).
+    pub fn range(a: Cell, b: Cell) -> (Cell, Cell) {
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    /// The glyphs whose cells intersect display columns `from..=to`.
+    pub fn slice_cols(text: &str, from: usize, to: usize) -> String {
+        let mut out = String::new();
+        let mut col = 0usize;
+        for c in text.chars() {
+            let w = c.width().unwrap_or(0).max(1);
+            if col + w > from && col <= to {
+                out.push(c);
+            }
+            col += w;
+            if col > to {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Linear (row-major) extraction: first line from `a.1`, middle lines
+    /// whole, last line to `b.1`. Line ends are trimmed and up to `gutter`
+    /// leading spaces come off each line, so pasted text starts flush while
+    /// nested indents keep their shape.
+    pub fn extract(lines: &[String], a: Cell, b: Cell, gutter: usize) -> String {
+        let (a, b) = range(a, b);
+        let mut out: Vec<String> = Vec::new();
+        for (i, text) in lines.iter().enumerate().take(b.0 + 1).skip(a.0) {
+            let from = if i == a.0 { a.1 } else { 0 };
+            let to = if i == b.0 { b.1 } else { usize::MAX };
+            let piece = slice_cols(text, from, to);
+            let piece = piece.trim_end();
+            let lead = piece.len() - piece.trim_start_matches(' ').len();
+            out.push(piece[lead.min(gutter)..].to_string());
+        }
+        out.join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -444,5 +643,40 @@ mod tests {
         assert!(detect_options(&[entry("swift", "A) just one")]).is_empty());
         // Out-of-order letters are prose, not a menu.
         assert!(detect_options(&[entry("swift", "B) two\nA) one")]).is_empty());
+    }
+
+    #[test]
+    fn selection_range_orders_a_drag_that_ran_backwards() {
+        assert_eq!(selection::range((5, 2), (3, 9)), ((3, 9), (5, 2)));
+        assert_eq!(selection::range((3, 9), (3, 2)), ((3, 2), (3, 9)));
+        assert_eq!(selection::range((1, 1), (1, 1)), ((1, 1), (1, 1)));
+    }
+
+    #[test]
+    fn slice_cols_counts_wide_glyphs_as_two_cells() {
+        // "🟢" occupies cols 0-1, "a" col 2, "b" col 3.
+        assert_eq!(selection::slice_cols("🟢ab", 1, 2), "🟢a");
+        assert_eq!(selection::slice_cols("🟢ab", 2, 3), "ab");
+        assert_eq!(selection::slice_cols("abc", 1, 1), "b");
+        assert_eq!(selection::slice_cols("abc", 5, 9), "");
+    }
+
+    #[test]
+    fn extract_is_linear_dedents_the_gutter_and_trims_line_ends() {
+        let lines: Vec<String> = vec![
+            "  @raven  11:16".into(),
+            "    the one list, merged   ".into(),
+            "    • alpha".into(),
+            "      nested".into(),
+            "".into(),
+        ];
+        // Mid-line start on the header, through to col 6 (the "a") of the bullet.
+        let got = selection::extract(&lines, (0, 2), (2, 6), 4);
+        assert_eq!(got, "@raven  11:16\nthe one list, merged\n• a");
+        // Same cell → one glyph; nested indent keeps its extra two spaces.
+        assert_eq!(selection::extract(&lines, (3, 6), (3, 6), 4), "n");
+        assert_eq!(selection::extract(&lines, (3, 0), (3, 99), 4), "  nested");
+        // Backwards drag works the same.
+        assert_eq!(selection::extract(&lines, (2, 6), (0, 2), 4), got);
     }
 }

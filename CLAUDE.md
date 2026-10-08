@@ -16,6 +16,8 @@ architecture throughout — read this map before touching the shell.
 | `command.rs` | `Executor` (thread-per-command) + `Slot<T>` for async results with stale-gen dropping. |
 | `room.rs` / `prompts.rs` | pure logic: transcript parse/append/dispatch, and the exact text typed into birds. Both unit-tested — change the tests with the wording. |
 | `overlays.rs` | modal forms (new bird, new room, compose, bird profile), shell-owned. |
+| `markdown.rs` | pure: a message body + width → styled lines (tables with column squeeze + stacked fallback, lists, fences, quotes, inline bold/code/@mentions). Unit-tested — change the tests with the layout. |
+| `clipboard.rs` | `pbcopy` — the only clipboard path. |
 | `events.rs` | the hook pipeline: birds run `aviary --hook` on Stop/Notification (per-session via `--settings`); events land in events.jsonl, read offset-tracked each tick. |
 | `routine.rs` | schedule grammar + due-math (pure, tested); the shell fires due routines every 30s. |
 | `http.rs` | inbound webhooks (POST /bird/<id> · /room/<id>, bearer-gated, localhost, off unless configured). |
@@ -41,6 +43,15 @@ architecture throughout — read this map before touching the shell.
   `slug()` can never emit one into a bot id.
 - **Prompts into FRESH sessions ride argv**, never typed into a booting PTY.
   Typed input is only for sessions already running.
+- **Room creation RESETS members' primary sessions without relaunching** —
+  drop the PTY, forget the resume record (`AgentStore::reset_primary`); the
+  room's first dispatch hatches them fresh with the prompt on argv. Never
+  eager-spawn at creation: the composer opens immediately and the first
+  message would be keystrokes at a booting PTY. Tabs are untouched.
+- **Mouse gestures have an owner.** The pane that takes `Down` receives
+  `Drag`/`Up` until release (`App::drag_owner`), so a drag-select in the room
+  finishes even when the button comes up over the sidebar. Selection lives
+  in CONTENT coordinates (body line, display column) and copies on release.
 - **Launch argv order is load-bearing:** `--mcp-config` and `--add-dir` are
   VARIADIC claude flags — each must be followed by another flag or it swallows
   the positional prompt as another value. `launch_args()` owns the order and
@@ -59,7 +70,8 @@ architecture throughout — read this map before touching the shell.
 
 ## Verify
 
-`cargo test` (50+ unit tests: keymap, list_nav, config scaffold, session keys,
-status aggregation, hook attribution, room dispatch, prompt wording) ·
+`cargo test` (75+ unit tests: keymap, list_nav, config scaffold, session keys,
+status aggregation, hook attribution, room dispatch, prompt wording, markdown
+layout, room selection math) ·
 `cargo clippy --all-targets` must be clean · manual smoke: see README keys.
 Claude Code ≥ 2.1.224 required at runtime.

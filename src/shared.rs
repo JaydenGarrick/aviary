@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent_store::AgentStore;
 use crate::command::{BranchInfo, Slot};
-use crate::config::{BotId, Config, SessionKey};
+use crate::config::{BotId, Config, Room, SessionKey};
 use crate::event::Event;
 use crate::events::EventsReader;
 use crate::prompts;
@@ -125,6 +125,27 @@ impl Shared {
         } else {
             self.flash(format!("{} tab {} — fresh conversation", bot.name, key.tab));
         }
+    }
+
+    /// A new room: every member's primary conversation ends now and starts
+    /// over on the room's first message (the prompt rides argv then — see
+    /// `AgentStore::reset_primary`). Returns the names of birds that had a
+    /// live session or a resume record to lose.
+    pub fn reset_for_room(&mut self, room: &Room) -> Vec<String> {
+        let mut reset = Vec::new();
+        for id in &room.members {
+            let Some(name) = self.config.bot(id).map(|b| b.name.clone()) else {
+                continue;
+            };
+            if self.agents.reset_primary(&self.config, id) {
+                reset.push(name);
+            }
+            // Never leave the keyboard pointed at a PTY that was just dropped.
+            if self.current_bot.as_ref() == Some(id) && self.current_tab == 1 {
+                self.agent_focused = false;
+            }
+        }
+        reset
     }
 
     /// Abandon the bird's PRIMARY conversation on purpose and start a new one.

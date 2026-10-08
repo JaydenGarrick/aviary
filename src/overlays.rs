@@ -458,7 +458,7 @@ impl NewRoomForm {
         FormEvent::Consumed
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
         let mut lines = vec![
             Line::from(""),
             field_line("name", &self.name, self.field == 0, "what the room is about"),
@@ -477,7 +477,7 @@ impl NewRoomForm {
             ]),
         ];
         let first_member_idx = lines.len();
-        for (i, ((_, glyph, name), &on)) in self.bots.iter().zip(&self.chosen).enumerate() {
+        for (i, ((id, glyph, name), &on)) in self.bots.iter().zip(&self.chosen).enumerate() {
             let cursor = if self.field == 1 && i == self.cursor { "▸" } else { " " };
             let mark = if on { "◉" } else { "○" };
             lines.push(Line::from(vec![
@@ -487,12 +487,21 @@ impl NewRoomForm {
                     Style::default().fg(if on { ACCENT } else { DIM }),
                 ),
                 Span::styled(
-                    format!("{glyph} {name}"),
+                    format!("{glyph} {name}  "),
                     Style::default().fg(bird_color(i)),
                 ),
+                // Live status: what creating the room would interrupt.
+                crate::ui::status_span(s.agents.status(id)),
             ]));
         }
         lines.extend(error_lines(&self.error));
+        lines.push(Line::from(""));
+        lines.push(Line::from(dim(
+            "  members start a fresh conversation on the room's first message",
+        )));
+        lines.push(Line::from(dim(
+            "  — a working bird is interrupted · space drops one from the room",
+        )));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("  ⏎ create", Style::default().fg(ACCENT)),

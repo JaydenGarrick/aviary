@@ -8,12 +8,13 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::DefaultTerminal;
 
 use crate::action::{Action, Effects, Msg};
 use crate::agent_store::Collab;
+use crate::clipboard;
 use crate::command::Executor;
 use crate::components::{hits, Component, Components};
 use crate::config::{self, BotId, Config};
@@ -26,22 +27,6 @@ use crate::ui;
 
 const FLASH_TTL: Duration = Duration::from_secs(4);
 const SIDEBAR_WIDTH: u16 = 34;
-
-/// Pipe text into the macOS clipboard. No dependency — the same trade the
-/// room timestamps make with `date`.
-fn pbcopy(text: &str) -> bool {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
-        return false;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(text.as_bytes()).is_err() {
-            return false;
-        }
-    }
-    child.wait().map(|s| s.success()).unwrap_or(false)
-}
 
 /// Keys that act on the CONTENT pane (the room transcript) while the sidebar
 /// keeps navigation. Merged into dispatch and hints only when a room is up.
@@ -56,6 +41,13 @@ static CONTENT_KEYS: &[Binding] = &[
     bind(ch('5'), Action::Quick(5), None, "pick quick-reply option 5"),
 ];
 
+/// Which side of the split a mouse gesture belongs to.
+#[derive(Clone, Copy)]
+enum Pane {
+    Sidebar,
+    Content,
+}
+
 pub struct App {
     components: Components,
     overlay: Overlay,
@@ -66,6 +58,10 @@ pub struct App {
     content: Rect,
     /// False = the mouse belongs to the TERMINAL (native drag-select/copy).
     mouse_on: bool,
+    /// The pane that took the last mouse Down owns Drag/Up until release,
+    /// wherever the pointer wanders — a drag-select must not strand when the
+    /// button comes up over the sidebar.
+    drag_owner: Option<Pane>,
     /// Tick counter pacing the agents poll (3s) and routine checks (30s).
     ticks: u64,
 }
@@ -91,6 +87,7 @@ pub fn run(mut terminal: DefaultTerminal) -> Result<()> {
         sidebar: Rect::default(),
         content: Rect::default(),
         mouse_on: true,
+        drag_owner: None,
         ticks: 0,
     };
     // Point the content pane at the first bird and start the branch load.
@@ -440,6 +437,12 @@ impl App {
                     "mouse released — drag to select, ⌘C to copy, m to re-capture"
                 });
             }
+            // In a room, y copies the last message as markdown.
+            Action::Yank if self.room_selected() => {
+                let mut fx = Effects::default();
+                self.components.room.update(action, &mut self.shared, &mut fx);
+                self.apply(fx);
+            }
             Action::Yank => {
                 let text = self
                     .shared
@@ -448,7 +451,7 @@ impl App {
                     .and_then(|s| s.term.parser.read().ok().map(|p| p.screen().contents()));
                 match text {
                     Some(t) if !t.trim().is_empty() => {
-                        let copied = pbcopy(&t);
+                        let copied = clipboard::copy(&t);
                         self.shared.flash(if copied {
                             "pane copied to the clipboard"
                         } else {
@@ -537,6 +540,20 @@ impl App {
                 match self.shared.config.add_room(&name, members) {
                     Ok(id) => {
                         self.overlay = Overlay::None;
+                        // Every member starts over on the room's first message;
+                        // nothing spawns here (see Shared::reset_for_room).
+                        let reset = match self.shared.config.room(&id).cloned() {
+                            Some(room) => self.shared.reset_for_room(&room),
+                            None => Vec::new(),
+                        };
+                        self.shared.flash(if reset.is_empty() {
+                            format!("#{id} created — members start fresh on the first message")
+                        } else {
+                            format!(
+                                "#{id} created · {} start fresh on the first message",
+                                reset.join(", ")
+                            )
+                        });
                         let mut fx = Effects::default();
                         fx.msg(Msg::OpenRoom(id));
                         self.apply(fx);
@@ -745,15 +762,35 @@ impl App {
             return;
         }
 
-        let mut fx = Effects::default();
-        if hits(self.sidebar, m.column, m.row) {
-            self.components.roster.handle_mouse(m, &mut self.shared, &mut fx);
+        let hit = if hits(self.sidebar, m.column, m.row) {
+            Some(Pane::Sidebar)
         } else if hits(self.content, m.column, m.row) {
-            if self.room_selected() {
+            Some(Pane::Content)
+        } else {
+            None
+        };
+        // Down picks the owner; Drag/Up follow it even off-pane.
+        let pane = match m.kind {
+            MouseEventKind::Down(_) => {
+                self.drag_owner = hit;
+                hit
+            }
+            MouseEventKind::Drag(_) => self.drag_owner.or(hit),
+            MouseEventKind::Up(_) => self.drag_owner.take().or(hit),
+            _ => hit,
+        };
+        let mut fx = Effects::default();
+        match pane {
+            Some(Pane::Sidebar) => {
+                self.components.roster.handle_mouse(m, &mut self.shared, &mut fx);
+            }
+            Some(Pane::Content) if self.room_selected() => {
                 self.components.room.handle_mouse(m, &mut self.shared, &mut fx);
-            } else {
+            }
+            Some(Pane::Content) => {
                 self.components.thread.handle_mouse(m, &mut self.shared, &mut fx);
             }
+            None => {}
         }
         self.apply(fx);
     }
@@ -898,6 +935,8 @@ impl App {
             Some("mouse → terminal: drag selects, ⌘C copies · m gives the mouse back to aviary")
         } else if self.shared.agent_focused {
             Some("the bird has the keyboard — every key goes to it except ctrl+a, which hands it back")
+        } else if self.room_selected() && self.components.room.selecting() {
+            Some("selecting — drag to extend · release copies to the clipboard")
         } else if self.room_selected() && self.components.room.capturing() {
             Some("writing to the room — ⏎ sends · esc cancels · @name wakes just that bird")
         } else if !self.overlay.is_none() && !matches!(self.overlay, Overlay::Help) {
@@ -931,7 +970,7 @@ impl App {
                 ],
             ),
             Overlay::AddBot(f) => f.draw(frame, frame.area()),
-            Overlay::NewRoom(f) => f.draw(frame, frame.area()),
+            Overlay::NewRoom(f) => f.draw(frame, frame.area(), &self.shared),
             Overlay::Compose(f) => f.draw(frame, frame.area()),
             Overlay::Profile(f) => f.draw(frame, frame.area(), &self.shared),
             Overlay::Confirm(f) => f.draw(frame, frame.area()),

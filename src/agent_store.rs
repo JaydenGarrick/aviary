@@ -466,6 +466,24 @@ impl AgentStore {
         self.launch(cfg, bot, &key, prompt, tx, false)
     }
 
+    /// A room is forming around this bird: abandon its PRIMARY conversation
+    /// WITHOUT relaunching. The room's first dispatch hatches it fresh with
+    /// the notify prompt ON ARGV — spawning here would turn that first
+    /// message into keystrokes at a booting PTY, the race the argv rule
+    /// exists for. Tabs are untouched (rooms never address them). Returns
+    /// true when there was something to drop: a live session or a record.
+    pub fn reset_primary(&mut self, cfg: &Config, id: &BotId) -> bool {
+        let key = SessionKey::primary(id.clone());
+        let was_live = self.sessions.remove(&key).is_some(); // drop = hang up
+        self.observed.remove(&key);
+        self.last_output.remove(&key);
+        self.kind_since.remove(&key);
+        self.collab.remove(id);
+        let had_record = self.state.spawned_once(&key.state_key());
+        self.state.forget(&cfg.dir, &key.state_key());
+        was_live || had_record
+    }
+
     /// Once a second: a fresh session that has survived [`MARK_AFTER`] becomes
     /// that tab's resumable session of record.
     pub fn tick(&mut self, cfg: &Config) {
@@ -805,6 +823,28 @@ mod tests {
         assert_eq!(resolve_hook_key(&bots, &live, "/elsewhere", None), None);
         // cwd fallback needs a live primary — tabs alone don't count.
         assert_eq!(resolve_hook_key(&bots, &[key("swift", 2)], &repo, None), None);
+    }
+
+    #[test]
+    fn reset_primary_forgets_tab_one_only_and_reports_what_it_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift", "raven"]);
+        let mut store = AgentStore::new(&cfg);
+        let swift = BotId("swift".into());
+        store.state.mark_spawned(&cfg.dir, "swift");
+        store.state.mark_spawned(&cfg.dir, "swift.2");
+        store.state.set_tab_name(&cfg.dir, "swift.2", "review");
+        store.set_collab(&swift, Collab::Room("nest".into()));
+
+        assert!(store.reset_primary(&cfg, &swift), "a resume record was dropped");
+        assert!(!store.has_session_record(&key("swift", 1)));
+        assert!(store.has_session_record(&key("swift", 2)), "tabs are untouched");
+        assert_eq!(store.tab_name(&key("swift", 2)), Some("review"));
+        assert!(store.collab(&swift).is_none());
+        // Persisted: a fresh store reads the same truth.
+        assert!(!AgentStore::new(&cfg).has_session_record(&key("swift", 1)));
+        // A never-flown bird has nothing to lose.
+        assert!(!store.reset_primary(&cfg, &BotId("raven".into())));
     }
 
     #[test]

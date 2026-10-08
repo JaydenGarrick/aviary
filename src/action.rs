@@ -42,7 +42,8 @@ pub enum Action {
     /// Release/recapture the mouse: released, the terminal's native
     /// drag-select and copy work everywhere.
     ToggleMouse,
-    /// Copy the selected bird's visible pane to the clipboard.
+    /// Copy the pane: the bird's visible screen, or in a room the last
+    /// message as raw markdown.
     Yank,
     // -- session tabs (the thread pane's parallel sessions of one bird)
     NextTab,
