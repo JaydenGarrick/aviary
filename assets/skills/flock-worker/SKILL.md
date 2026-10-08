@@ -10,8 +10,8 @@ description: "Act as a worker that an aviary orchestrator bird started as a back
 
 An orchestrator bird started you as a Claude Code background session. It gave
 you a session name, a role, a workstream, a plan, a report file, and its own
-session name. You do one job and report it. The orchestrator decides what
-comes next. The user watches you in the aviary cockpit and can attach to your
+address (its session name with a `[ref]`, for example `aviary-swift [1bc97a]`).
+You do one job and report it. The orchestrator decides what comes next. The user watches you in the aviary cockpit and can attach to your
 session at any time.
 
 ## Start
@@ -86,6 +86,9 @@ you tried and could not complete a step. Use `in-progress` when you stop with
 more steps to do.
 
 After you write the report, send the orchestrator one line with the
-`SendMessage` tool, to the orchestrator session name from your first prompt:
-`REPORT: <report-file-path> status=<status>`. Then end your turn with that
-same line.
+`SendMessage` tool: `REPORT: <report-file-path> status=<status>`. Address it
+exactly as your first prompt gives the orchestrator — the session name with
+its `[ref]` — never the bare name: another session may share it. If the send
+is still refused as ambiguous, run `ListAgents` and send to the row whose
+`[ref]` matches; if none matches, say so in your report instead of guessing.
+Then end your turn with that same line.

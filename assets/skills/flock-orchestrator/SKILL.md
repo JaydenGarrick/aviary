@@ -19,10 +19,15 @@ worker or stop it from there. The user talks to you directly.
 ## Before you start
 
 1. Confirm that you are an aviary bird: call the `ListAgents` tool once. Its
-   first line names this session. If the name does not start with `aviary-`,
-   tell the user that you are not an aviary bird and stop.
+   first line names this session, with its `[ref]`, for example
+   `aviary-swift [1bc97a]`. If the name does not start with `aviary-`, tell
+   the user that you are not an aviary bird and stop.
 2. Your bird id is the session name minus `aviary-` and minus any `.<n>` tab
-   suffix: `aviary-swift.2` → `swift`. Workers message your session name.
+   suffix: `aviary-swift.2` → `swift`. Your **address** is the full
+   `name [ref]` from that first line. Workers message that address: the ref
+   keeps their messages reaching you even when another session on this
+   machine carries the same name (a second cockpit, or a manual
+   `claude --resume`). Record it on the board.
 3. Find the repo root with `git rev-parse --show-toplevel`. This checkout is
    yours. Do not change its branch.
 4. Read the repo's `CLAUDE.md` and `AGENTS.md` for its branch-naming
@@ -214,7 +219,9 @@ Write a short first prompt. It must contain:
 - the absolute path of the plan
 - the absolute path of the report file:
   `<config>/reports/<worker-session-name>.md`
-- your own session name, so that the worker can message you
+- your address, exactly as ListAgents prints it — the session name with its
+  `[ref]`, for example `aviary-swift [1bc97a]` — so that the worker's
+  messages reach you and not a namesake
 - for a companion: the lead's session name, and whether the companion can
   edit files
 
