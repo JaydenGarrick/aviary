@@ -167,6 +167,20 @@ the pane.
 - **Permissions** — set a bird's `"permissions": "permissions/readonly.json"`
   to pre-allow read-only tools and cut prompt noise (template scaffolded).
 
+## Releasing
+
+```bash
+scripts/release.sh 0.2.0            # bump Cargo.toml · commit · tag · push · update the tap
+scripts/release.sh 0.2.0 --dry-run  # preflight and print every step, change nothing
+scripts/release.sh 0.2.0 --tap-only # the tag is already on GitHub — redo just the formula
+scripts/release.sh 0.2.0 --verify   # … then brew upgrade + brew test on this machine
+```
+
+Preflight insists on a clean `main` that isn't behind origin, a free tag, and
+green `cargo test` + `clippy`. The tap checkout defaults to `../homebrew-aviary`
+(`AVIARY_TAP_DIR` overrides); the formula's `url` and `sha256` are rewritten from
+the tarball GitHub serves for the new tag. Friends then `brew upgrade aviary`.
+
 ## Layout
 
 Everything stateful lives outside this repo, in `~/.config/aviary/`:
