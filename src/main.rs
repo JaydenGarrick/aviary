@@ -15,6 +15,7 @@ mod config;
 mod doctor;
 mod event;
 mod events;
+mod flock;
 mod http;
 mod keymap;
 mod markdown;

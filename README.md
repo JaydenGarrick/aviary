@@ -37,6 +37,11 @@ per-session via `--settings`) and aviary reconciles against
 - a **collaboration tag**: `↗ @heron` (handed work off), `↘ @wren` (received a
   handoff), `⇄ #room` (room work). No tag = flying solo; clears when you take
   the keyboard.
+- **worker rows** under a bird (`└ api-impl ✔ done 2m`): background sessions
+  the bird spawned itself for parallel workstreams (see the orchestrator hat
+  below). Same chips plus `✗ failed` / `◦ paused` from the worker's report
+  file, their own unread dot, the bird's banner toggle. `⏎` attaches a viewer
+  tab, `x` stops one (asks first).
 
 ## Why
 
@@ -72,6 +77,16 @@ and gives the birds each other.
   `--mcp-config ~/.config/aviary/mcp.json` (Linear + Figma remote MCP servers),
   and composers detect `ABC-123` / linear.app / figma.com references and wrap
   them in fetch instructions.
+- **The orchestrator hat.** When a room or you settle a plan with two or more
+  independent workstreams, the bird loads the shipped `flock-orchestrator`
+  skill (every bird gets `--plugin-dir ~/.config/aviary/plugin`): it writes a
+  plan per workstream, spawns one Sonnet worker each as
+  `claude --bg --worktree <slug> --name aviary-<bird>_<slug>-<role>`, monitors
+  and reviews them, and asks you before merging, pushing, or opening a PR.
+  Workers load `flock-worker`, write `~/.config/aviary/reports/<name>.md`
+  (a `status:` line the cockpit reads), and message the bird back. Aviary
+  never spawns a worker — it attributes them from `claude agents --json` by
+  name, so an aviary restart simply rediscovers them.
 
 ## Install
 
@@ -87,7 +102,8 @@ cargo install --path .     # or: cargo run
 ```
 
 aviary drives [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-(≥ 2.1.224) — install that first, then `aviary doctor` checks the rest.
+(≥ 2.1.224; ≥ 2.1.289 for flock workers) — install that first, then
+`aviary doctor` checks the rest.
 
 ## Quickstart
 
@@ -119,23 +135,24 @@ the repo it lives in. Its persona lands in `birds/<id>.md`, built from the
 shipped template — edit it to give the bird its character. Hatch one bird per
 repo you work across; two or more unlock rooms (`c`).
 
-Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`).
+Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`);
+≥ 2.1.289 for flock workers (`--bg` · `attach` · `stop` · `--plugin-dir`).
 
 ## Keys (everything is mouse-clickable too)
 
 | Key | Does |
 |---|---|
 | `j/k` / click | select a bird or room — the content pane follows instantly |
-| `⏎` / `a` / click pane | step in: wake the bird and take the keyboard, or write the room |
+| `⏎` / `a` / click pane | step in: wake the bird and take the keyboard, or write the room — on a worker row, open a viewer tab on the worker |
 | `ctrl+a` / `esc` | hand the keyboard back to the sidebar |
 | `@` | handoff: the selected bird packages its context for a teammate |
 | `n` / `c` (or the `+ bird` / `+ room` buttons) | hatch a bird / create a room |
 | `p` | bird profile: persona, routines, notifications toggle, fresh start |
 | `N` | abandon the bird's conversation and start a fresh one |
-| `x` | stop a bird (all its sessions; they resume by name later) |
+| `x` | stop a bird (all its sessions; they resume by name later) — on a worker row, `claude stop` it after a confirm |
 | `T` / click `[+]` | open a parallel session of the bird in a new tab |
 | `]` / `[` / click a tab | cycle / pick the bird's session tabs |
-| `W` | close the viewed tab and forget it (tab 1 refuses — that's the bird) |
+| `W` | close the viewed tab and forget it (tab 1 refuses — that's the bird); a worker viewer tab just closes, the worker keeps running |
 | `R` | label the viewed tab (display only; empty clears) |
 | `i` / `u` / `d` / `1-5` | write / scroll the room / pick a quick-reply |
 | `y` | copy: the bird's visible pane, or in a room the last message as markdown |
@@ -154,7 +171,8 @@ the pane.
 ## Doctor, routines, webhooks
 
 - **`aviary doctor`** — one screen of ✓/✗: claude version, repos, config, MCP
-  hooks, the events pipeline. Run it whenever something feels off.
+  hooks, the events pipeline, the flock plugin + `reports/`, and how many
+  workers the poll attributes right now. Run it whenever something feels off.
 - **Routines** — per-bird scheduled prompts in `config.json`
   (`{"id":"standup","schedule":"weekdays@09:00","prompt":"…"}`; grammar:
   `daily@HH:MM` · `weekdays@HH:MM` · `every:<N>m|h`). Fire while aviary runs,
@@ -187,4 +205,6 @@ Everything stateful lives outside this repo, in `~/.config/aviary/`:
 `config.json` (bots + rooms + webhook) · `birds/*.md` (personas) · `mcp.json`
 (MCP hooks) · `settings/*.json` (per-bird hook settings, regenerated at
 launch) · `events.jsonl` (hook events) · `rooms/*.md` (transcripts) ·
-`handoffs/` (briefs) · `permissions/` (allowlists) · `state.json`.
+`handoffs/` (briefs) · `permissions/` (allowlists) · `plugin/` (the flock
+skills, loaded via `--plugin-dir`) · `reports/` (worker report files) ·
+`state.json`.

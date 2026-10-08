@@ -24,11 +24,15 @@ pub enum Command {
     Notify { title: String, body: String },
     /// `open <path>` — personas in the user's editor, handoff briefs, etc.
     Open { path: PathBuf },
+    /// `claude stop <id>` — the roster's `x` on a worker row (after a confirm).
+    /// The worker's conversation is kept; `claude attach <id>` reopens it.
+    StopWorker { name: String, id: String },
 }
 
 pub enum CommandResult {
     Branches { gen: u64, info: Vec<BranchInfo> },
     Agents { gen: u64, sessions: Vec<SessionInfo> },
+    WorkerStopped { name: String, ok: bool, detail: String },
 }
 
 pub struct BranchInfo {
@@ -39,17 +43,55 @@ pub struct BranchInfo {
 
 /// One row of `claude agents --json`. Tolerant: unknown fields ignored,
 /// missing fields default — the schema is observed, not contractual.
-#[derive(Deserialize, Default)]
+///
+/// Observed on 2.1.289: interactive rows carry `pid, cwd, kind, startedAt,
+/// sessionId, name, status?`; background rows add `id` (the short id that
+/// `attach`/`logs`/`stop`/`rm` take — the first 8 chars of `sessionId`) and
+/// `state` (`working`, `done`, …).
+#[derive(Deserialize, Default, Clone)]
 pub struct SessionInfo {
-    /// Kept for cwd-based attribution if session naming ever changes shape.
     #[serde(default)]
-    #[allow(dead_code)]
     pub cwd: String,
     #[serde(default)]
     pub name: String,
     /// Observed values: "busy", "idle"; the binary also carries "needs_input".
     #[serde(default)]
     pub status: String,
+    /// Finer than `status` on background rows: "working", "done", …
+    #[serde(default)]
+    pub state: String,
+    /// The short id (background rows only).
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "sessionId")]
+    pub session_id: String,
+    /// "interactive" | "background".
+    #[serde(default)]
+    pub kind: String,
+    /// Epoch millis.
+    #[serde(default, rename = "startedAt")]
+    pub started_at: u64,
+}
+
+impl SessionInfo {
+    /// The id `claude attach|logs|stop|rm` take: the row's `id`, else the
+    /// 8-char prefix of `sessionId` (the observed short-id shape).
+    pub fn short_id(&self) -> Option<String> {
+        if !self.id.is_empty() {
+            return Some(self.id.clone());
+        }
+        let prefix: String = self.session_id.chars().take(8).collect();
+        (prefix.len() == 8).then_some(prefix)
+    }
+
+    /// The status string to map: `status`, or `state` when `status` is empty.
+    pub fn status_str(&self) -> &str {
+        if self.status.is_empty() {
+            &self.state
+        } else {
+            &self.status
+        }
+    }
 }
 
 /// A slot for data loaded off-thread. `in_flight` keeps old data on screen
@@ -147,6 +189,26 @@ fn execute(cmd: Command) -> Option<CommandResult> {
             let _ = Proc::new("open").arg(path).status();
             None
         }
+        Command::StopWorker { name, id } => {
+            let out = Proc::new("claude")
+                .args(["stop", &id])
+                .stdin(Stdio::null())
+                .output();
+            let (ok, detail) = match out {
+                Ok(o) => {
+                    let text = if o.status.success() { &o.stdout } else { &o.stderr };
+                    let line = String::from_utf8_lossy(text)
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("")
+                        .to_string();
+                    (o.status.success(), line)
+                }
+                Err(e) => (false, e.to_string()),
+            };
+            Some(CommandResult::WorkerStopped { name, ok, detail })
+        }
     }
 }
 
@@ -203,6 +265,25 @@ mod tests {
         assert_eq!(v[0].name, "aviary-swift");
         assert_eq!(v[0].status, "busy");
         assert_eq!(v[1].name, "");
+        assert_eq!(v[1].short_id(), None, "no id and no sessionId → nothing to attach");
+    }
+
+    #[test]
+    fn session_info_short_id_prefers_the_explicit_id() {
+        let json = r#"[
+          {"pid":1,"id":"2d1601e0","cwd":"/x/.claude/worktrees/probe","kind":"background","startedAt":1791479673254,"sessionId":"2d1601e0-2455-4f7c-8ae2-c575d7764010","name":"aviary-zz_probe-impl","status":"busy","state":"working"},
+          {"pid":2,"cwd":"/x","kind":"interactive","startedAt":1,"sessionId":"dc808c13-1c3e-4652-9bd1-6e80a8e71511","name":"aviary-swift","status":"idle"},
+          {"pid":3,"cwd":"/x","kind":"interactive","sessionId":"short","name":"x"},
+          {"pid":4,"cwd":"/x","kind":"background","sessionId":"abc","name":"y","state":"done"}
+        ]"#;
+        let v: Vec<SessionInfo> = serde_json::from_str(json).unwrap();
+        assert_eq!(v[0].short_id().as_deref(), Some("2d1601e0"));
+        assert_eq!(v[0].kind, "background");
+        assert_eq!(v[0].started_at, 1791479673254);
+        assert_eq!(v[1].short_id().as_deref(), Some("dc808c13"), "sessionId prefix fallback");
+        assert_eq!(v[2].short_id(), None, "too short to be an id");
+        assert_eq!(v[3].status_str(), "done", "state fills in for a missing status");
+        assert_eq!(v[0].status_str(), "busy");
     }
 
     #[test]

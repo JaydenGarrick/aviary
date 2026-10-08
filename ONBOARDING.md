@@ -16,6 +16,8 @@ context and character; aviary spawns, names, displays, and connects them.
            (per-session via --settings → aviary --hook → events.jsonl)
  birds ↔ birds:  native SendMessage (session names) + handoff briefs
  rooms:  append-only markdown transcripts, mention-driven dispatch
+ workers: a bird's own `claude --bg` sessions (aviary-<bird>_<slug>-<role>),
+          poll-attributed by name, status from reports/<name>.md — never spawned here
 ```
 
 1. **Build & install**: `cargo install --path .` (hooks embed the binary path —
@@ -29,6 +31,11 @@ context and character; aviary spawns, names, displays, and connects them.
 4. **Hand off**: `@` → the selected bird packages its context and SendMessages
    a teammate. Rooms (`c`) are shared transcripts; birds reply only when
    @-mentioned or materially useful.
+5. **Fan out**: a bird with a multi-workstream plan loads `flock-orchestrator`
+   (shipped under `~/.config/aviary/plugin/`, on every bird's `--plugin-dir`)
+   and spawns Sonnet workers as background worktree sessions. They show as
+   rows under the bird; `⏎` attaches a viewer tab, `x` stops one. Needs
+   Claude Code ≥ 2.1.289.
 
 ## The three load-bearing ideas
 
@@ -48,6 +55,7 @@ context and character; aviary spawns, names, displays, and connects them.
 | Shell: layered key dispatch, msg fan-out | `src/app.rs` (keep it thin) |
 | Screens (state + input + draw + hit rects) | `src/components/{roster,thread,room}.rs` |
 | Birds: spawn/resume/status/collab | `src/agent_store.rs` |
+| Workers: name grammar, poll attribution, report precedence | `src/flock.rs` (pure, tested) · skills in `assets/skills/` |
 | Embedded terminal (PTY + vt100) | `src/pty.rs` |
 | Keymaps → dispatch + hints + help (one source) | `src/keymap.rs` |
 | Pure, tested logic | `src/{room,prompts,routine,events,http}.rs` |
@@ -59,12 +67,13 @@ test-guarded.
 
 ## Verify your changes
 
-`cargo test` (45+ unit tests) · `cargo clippy --all-targets` must stay at zero
+`cargo test` (92 unit tests) · `cargo clippy --all-targets` must stay at zero
 · `aviary doctor` green · then the manual smoke: wake a bird, block it on a
 permission prompt, watch `⏸ needs you` + the banner arrive.
 
 ## Git & publishing
 
-Personal repo (`github.com/JaydenGarrick/aviary`, private). Commits use the
+Personal repo (`github.com/JaydenGarrick/aviary`, public — MIT, installable via
+Homebrew/cargo; nothing stateful lives in it). Commits use the
 repo-local noreply identity. To push: `gh auth switch --user JaydenGarrick`,
 push, then switch back to the work account.

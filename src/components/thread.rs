@@ -89,7 +89,19 @@ impl Thread {
         }
         if let Some(id) = s.current_bot.clone() {
             s.agents.clear_unread(&id);
+            // A viewer tab in view reads its worker's news too.
+            let key = SessionKey { bot: id, tab };
+            if let Some(w) = s.agents.attached_worker(&key).map(str::to_string) {
+                s.agents.workers.clear_unread(&w);
+            }
         }
+    }
+
+    /// A viewer tab has no conversation of its own to rename or restart.
+    fn flash_viewer(&self, s: &mut Shared) {
+        let close = label_for(&[KEYMAP], Action::CloseTab).unwrap_or_default();
+        let tab = s.current_tab;
+        s.flash(format!("tab {tab} shows a worker — {close} closes it"));
     }
 }
 
@@ -109,14 +121,20 @@ impl Component for Thread {
             Action::NewTab => self.new_tab(s),
             Action::FreshTab => {
                 let key = SessionKey { bot: id, tab: s.current_tab };
+                if s.agents.is_attached(&key) {
+                    self.flash_viewer(s);
+                    return;
+                }
                 s.fresh_key(&key);
                 s.agent_focused = true;
             }
             Action::RenameTab => {
-                fx.msg(crate::action::Msg::OpenRenameTab(SessionKey {
-                    bot: id,
-                    tab: s.current_tab,
-                }));
+                let key = SessionKey { bot: id, tab: s.current_tab };
+                if s.agents.is_attached(&key) {
+                    self.flash_viewer(s);
+                    return;
+                }
+                fx.msg(crate::action::Msg::OpenRenameTab(key));
             }
             Action::CloseTab => {
                 if s.current_tab == 1 {
@@ -124,10 +142,14 @@ impl Component for Thread {
                     return;
                 }
                 let key = SessionKey { bot: id, tab: s.current_tab };
+                let viewer = s.agents.is_attached(&key).then(|| s.agents.tab_label(&key)).flatten();
                 s.agents.close_tab(&s.config, &key);
                 s.current_tab = 1;
                 s.agent_focused = false;
-                s.flash(format!("closed tab {} — back to tab 1", key.tab));
+                s.flash(match viewer {
+                    Some(label) => format!("closed {label}'s tab — the worker keeps running"),
+                    None => format!("closed tab {} — back to tab 1", key.tab),
+                });
             }
             _ => {}
         }
@@ -232,7 +254,7 @@ impl Component for Thread {
             for t in &tabs {
                 let key = SessionKey { bot: id.clone(), tab: *t };
                 let colour = bird_color(*t as usize - 1);
-                let label = match s.agents.tab_name(&key) {
+                let label = match s.agents.tab_label(&key) {
                     Some(n) => format!("{t}:{n}"),
                     None => format!("{t}"),
                 };
@@ -315,6 +337,12 @@ impl Component for Thread {
             dim("  ·  "),
             status_span(status),
         ]);
+        if s.agents.is_attached(&key) {
+            if let Some(label) = s.agents.tab_label(&key) {
+                title.spans.push(dim("  ·  "));
+                title.spans.push(muted(format!("viewing {label}")));
+            }
+        }
         if let Some(info) = s
             .branches
             .data

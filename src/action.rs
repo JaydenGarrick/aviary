@@ -7,11 +7,47 @@
 use crate::command::Command;
 use crate::config::BotId;
 
-/// What a roster deletion points at.
+/// What a roster card / row points at (context menus, confirms).
 #[derive(Clone)]
 pub enum RosterTarget {
     Bird(BotId),
     Room(String),
+    /// A worker row under a bird: its session name, label, and short id.
+    Worker {
+        bot: BotId,
+        name: String,
+        label: String,
+        id: String,
+    },
+}
+
+/// What the confirm dialog is gating.
+#[derive(Clone)]
+pub enum ConfirmTarget {
+    /// Remove a bird/room from the roster.
+    Delete(RosterTarget),
+    /// `claude stop <id>` on a bird's worker.
+    StopWorker {
+        name: String,
+        label: String,
+        id: String,
+    },
+}
+
+impl ConfirmTarget {
+    pub fn yes_label(&self) -> &'static str {
+        match self {
+            ConfirmTarget::Delete(_) => "y release",
+            ConfirmTarget::StopWorker { .. } => "y stop",
+        }
+    }
+
+    pub fn no_label(&self) -> &'static str {
+        match self {
+            ConfirmTarget::Delete(_) => "n keep",
+            ConfirmTarget::StopWorker { .. } => "n leave it",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,8 +111,15 @@ pub enum Msg {
     OpenNewRoom,
     /// Open a bird's profile overlay.
     OpenProfile(BotId),
-    /// Ask before removing a bird/room from the roster.
-    ConfirmDelete(RosterTarget),
+    /// Open the confirm dialog (roster deletions, stopping a worker).
+    Confirm(ConfirmTarget),
+    /// Open a viewer tab (`claude attach <id>`) on a bird's worker.
+    AttachWorker {
+        bot: BotId,
+        name: String,
+        label: String,
+        id: String,
+    },
     /// Open the right-click context menu for a card, anchored at the click.
     OpenContext {
         target: RosterTarget,

@@ -103,10 +103,51 @@ impl Shared {
         }
     }
 
-    /// First prompt for a never-before-spawned session, None otherwise.
+    /// First prompt for a never-before-spawned session, None otherwise — and
+    /// never for a viewer tab, which is not a conversation of the bird's.
     pub fn opening_prompt(&self, key: &SessionKey) -> Option<String> {
+        if self.agents.is_attached(key) {
+            return None;
+        }
         let bot = self.config.bot(&key.bot)?;
         (!self.agents.has_session_record(key)).then(|| prompts::first_flight(bot))
+    }
+
+    /// Open (or jump to) a viewer tab on one of a bird's workers:
+    /// `claude attach <id>` on the lowest free tab. Never two viewers on one
+    /// worker. Closing the tab leaves the worker running.
+    pub fn attach_worker(&mut self, bot: &BotId, worker: &str, label: &str, id: &str) {
+        let Some(b) = self.config.bot(bot).cloned() else {
+            self.flash(format!("no bot named {bot:?}"));
+            return;
+        };
+        self.current_room = None;
+        self.current_bot = Some(bot.clone());
+        if let Some(tab) = self.agents.attached_tab(bot, worker) {
+            self.current_tab = tab;
+            self.agent_focused = true;
+            self.agents.workers.clear_unread(worker);
+            return;
+        }
+        let tab = crate::agent_store::lowest_free_tab(&self.agents.tabs(bot));
+        let key = SessionKey { bot: bot.clone(), tab };
+        let tx = self.tx.clone();
+        match self.agents.launch_attach(&b, &key, worker, label, id, &tx) {
+            Ok(()) => {
+                self.current_tab = tab;
+                self.agent_focused = true;
+                self.agents.workers.clear_unread(worker);
+                let close = crate::keymap::label_for(
+                    &[crate::components::thread::KEYMAP],
+                    crate::action::Action::CloseTab,
+                )
+                .unwrap_or_default();
+                self.flash(format!(
+                    "tab {tab} — viewing {label} · {close} closes it, the worker keeps running"
+                ));
+            }
+            Err(e) => self.flash(format!("{e:#}")),
+        }
     }
 
     /// Abandon ONE tab's conversation on purpose and start a new one there.
