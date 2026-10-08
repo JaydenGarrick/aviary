@@ -26,7 +26,7 @@ worker or stop it from there. The user talks to you directly.
 3. Find the repo root with `git rev-parse --show-toplevel`. This checkout is
    yours. Do not change its branch.
 4. Read the repo's `CLAUDE.md` and `AGENTS.md` for its branch-naming
-   convention, for example `jayden/<ticket>/<slug>`. If there is none, ask
+   convention, for example `<you>/<ticket>/<slug>`. If there is none, ask
    the user once and record the answer on the board.
 5. Resolve the aviary config directory once:
    `${AVIARY_CONFIG_DIR:-$HOME/.config/aviary}`. Use the absolute path

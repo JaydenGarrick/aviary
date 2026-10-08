@@ -1,1 +1,3 @@
 /target
+# claude --worktree lands here when run from this repo
+.claude/worktrees/

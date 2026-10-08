@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn detects_ticket_keys_and_urls() {
-        let l = detect_links("see BLA-123 and https://linear.app/blackbird/issue/BLA-9 plus https://www.figma.com/design/abc?node-id=1");
+        let l = detect_links("see ABC-123 and https://linear.app/acme/issue/ABC-9 plus https://www.figma.com/design/abc?node-id=1");
         assert_eq!(l.linear.len(), 2);
         assert_eq!(l.figma.len(), 1);
         // not tickets: lowercase team, no digits, bare words
@@ -123,13 +123,13 @@ mod tests {
         let s = handoff(
             &bot("swift", "Swift"),
             &bot("raven", "Raven"),
-            "GET /v1/fly_balance needs pending_credits — BLA-123",
+            "GET /v1/accounts needs a pending_credits field — ABC-123",
             std::path::Path::new("/tmp/handoffs"),
         );
         assert!(s.contains("@aviary-raven"));
         assert!(s.contains("SendMessage"));
         assert!(s.contains("/tmp/handoffs/<timestamp>-swift-to-raven.md"));
-        assert!(s.contains("Fetch BLA-123 via the Linear MCP tools"));
+        assert!(s.contains("Fetch ABC-123 via the Linear MCP tools"));
     }
 
     #[test]
