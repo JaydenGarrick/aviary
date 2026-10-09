@@ -88,7 +88,7 @@ architecture throughout — read this map before touching the shell.
 
 ## Verify
 
-`cargo test` (92 unit tests: keymap, list_nav, config scaffold, session keys,
+`cargo test` (97 unit tests: keymap, list_nav, config scaffold, user-name resolution, session keys,
 status aggregation, hook attribution, room dispatch, prompt wording, markdown
 layout, room selection math, worker name grammar + report precedence) ·
 `cargo clippy --all-targets` must be clean · manual smoke: see README keys.

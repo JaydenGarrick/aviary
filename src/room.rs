@@ -16,9 +16,6 @@ use anyhow::{Context, Result};
 
 use crate::config::{BotId, Config, Room};
 
-/// The author name aviary writes for the human.
-pub const USER_AUTHOR: &str = "jayden";
-
 pub struct Entry {
     pub author: String,
     pub when: String,
@@ -74,7 +71,17 @@ pub fn append(path: &Path, author: &str, text: &str) -> Result<String> {
     Ok(header)
 }
 
-/// `@word` tokens (letters, digits, dashes) anywhere in a message.
+/// One byte of a mention name: letters, digits, dashes, underscores, and a
+/// dot only when another name byte follows — `@jayden.garrick` (a login
+/// name) is one mention, `@raven.` ends before the full stop. The markdown
+/// renderer applies the same rule, so a mention colours and dispatches as
+/// one and the same token.
+fn mention_byte(bytes: &[u8], i: usize) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    word(bytes[i]) || (bytes[i] == b'.' && bytes.get(i + 1).is_some_and(|&n| word(n)))
+}
+
+/// `@word` tokens anywhere in a message (see [`mention_byte`]).
 pub fn mentions(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
@@ -83,9 +90,7 @@ pub fn mentions(text: &str) -> Vec<String> {
         if bytes[i] == b'@' {
             let start = i + 1;
             let mut end = start;
-            while end < bytes.len()
-                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-' || bytes[end] == b'_')
-            {
+            while end < bytes.len() && mention_byte(bytes, end) {
                 end += 1;
             }
             if end > start {
@@ -233,13 +238,18 @@ mod tests {
     fn mentions_normalize_prefix_and_dedupe() {
         let m = mentions("ping @Raven and @aviary-raven, also @swift!");
         assert_eq!(m, vec!["raven".to_string(), "swift".to_string()]);
-        assert!(mentions("no birds here, email a@b.c ok").contains(&"b".to_string()));
+        assert!(mentions("no birds here, email a@b.c ok").contains(&"b.c".to_string()));
+        // A dotted login name is one token; a sentence-ending dot is not part of it.
+        assert_eq!(
+            mentions("thanks @jayden.garrick. over to @raven."),
+            vec!["jayden.garrick".to_string(), "raven".to_string()]
+        );
     }
 
     #[test]
     fn user_without_mentions_reaches_everyone() {
         let room = room_with(&["swift", "raven", "weaver"]);
-        let t = dispatch_targets(&room, USER_AUTHOR, "morning birds");
+        let t = dispatch_targets(&room, "jayden", "morning birds");
         assert_eq!(t.len(), 3);
         // Any outside author (a webhook) gets the same reach.
         let t = dispatch_targets(&room, "webhook", "CI is red");
@@ -291,7 +301,7 @@ mod tests {
 
         let mut w = Watcher::default();
         w.poll(&cfg); // adopt empty
-        append(&path, USER_AUTHOR, "hello room").unwrap();
+        append(&path, "jayden", "hello room").unwrap();
         w.note_local_append("nest");
         assert!(w.poll(&cfg).is_empty(), "composer already dispatched this");
     }
