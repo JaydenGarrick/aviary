@@ -25,7 +25,7 @@ use crate::components::{hits, Component};
 use crate::config::{BotId, Room};
 use crate::keymap::{label_for, GLOBAL};
 use crate::markdown;
-use crate::room::{self, Entry, USER_AUTHOR};
+use crate::room::{self, Entry};
 use crate::shared::Shared;
 use crate::ui::{bird_color, dim, status_span, ACCENT, DIM, MUTED};
 
@@ -64,12 +64,13 @@ struct Rendered {
 }
 
 /// `A) …` / `A. …` lines at the end of the last BOT message become one-key
-/// quick replies — the Grok Bot lettered-options pattern.
-fn detect_options(entries: &[Entry]) -> Vec<String> {
+/// quick replies — the Grok Bot lettered-options pattern. `user_name` is
+/// the human's author name: their own messages never offer options.
+fn detect_options(entries: &[Entry], user_name: &str) -> Vec<String> {
     let Some(last) = entries.last() else {
         return Vec::new();
     };
-    if last.author == USER_AUTHOR {
+    if last.author == user_name {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -113,7 +114,7 @@ impl RoomView {
     fn reload(&mut self, s: &Shared) {
         if let Some(room) = s.current_room.as_deref().and_then(|id| s.config.room(id)) {
             self.entries = room::read(&room.transcript_path(&s.config.dir));
-            self.options = detect_options(&self.entries);
+            self.options = detect_options(&self.entries, &s.config.user_name);
         }
     }
 
@@ -128,7 +129,7 @@ impl RoomView {
             return;
         };
         let path = room.transcript_path(&s.config.dir);
-        let anchor = match room::append(&path, USER_AUTHOR, &text) {
+        let anchor = match room::append(&path, &s.config.user_name, &text) {
             Ok(header) => header,
             Err(e) => {
                 fx.flash(format!("could not write the room: {e:#}"));
@@ -137,10 +138,10 @@ impl RoomView {
         };
         s.watcher.note_local_append(&room.id);
 
-        let targets = room::dispatch_targets(&room, USER_AUTHOR, &text);
+        let targets = room::dispatch_targets(&room, &s.config.user_name, &text);
         let count = targets.len();
         for target in targets {
-            let prompt = room::notify_prompt(&room, USER_AUTHOR, &s.config.dir, &anchor);
+            let prompt = room::notify_prompt(&room, &s.config.user_name, &s.config.dir, &anchor);
             s.boot_bot(&target, Some(&prompt));
             s.agents.set_collab(&target, Collab::Room(room.id.clone()));
         }
@@ -225,8 +226,10 @@ impl RoomView {
 /// renderer behind the gutter, a blank line. The zero state when empty.
 fn render_transcript(entries: &[Entry], s: &Shared, width: u16) -> Vec<Line<'static>> {
     let theme = markdown::Theme::aviary();
+    let me = s.config.user_name.as_str();
+    // Mentions arrive lowercased; the human's name keeps its case.
     let mention = |id: &str| -> Option<Color> {
-        if id == USER_AUTHOR {
+        if id.eq_ignore_ascii_case(me) {
             return Some(ACCENT);
         }
         s.config
@@ -239,7 +242,7 @@ fn render_transcript(entries: &[Entry], s: &Shared, width: u16) -> Vec<Line<'sta
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for e in entries {
-        let colour = if e.author == USER_AUTHOR {
+        let colour = if e.author == me {
             ACCENT
         } else {
             colour_for(s, &BotId(e.author.clone()))
@@ -633,16 +636,16 @@ mod tests {
             "swift",
             "Pick one:\nA) This works\nB. Vegetarian\nC) No seafood",
         )];
-        let opts = detect_options(&entries);
+        let opts = detect_options(&entries, "jayden");
         assert_eq!(opts, vec!["This works", "Vegetarian", "No seafood"]);
     }
 
     #[test]
     fn user_messages_and_single_strays_offer_no_options() {
-        assert!(detect_options(&[entry(USER_AUTHOR, "A) hello\nB) world")]).is_empty());
-        assert!(detect_options(&[entry("swift", "A) just one")]).is_empty());
+        assert!(detect_options(&[entry("jayden", "A) hello\nB) world")], "jayden").is_empty());
+        assert!(detect_options(&[entry("swift", "A) just one")], "jayden").is_empty());
         // Out-of-order letters are prose, not a menu.
-        assert!(detect_options(&[entry("swift", "B) two\nA) one")]).is_empty());
+        assert!(detect_options(&[entry("swift", "B) two\nA) one")], "jayden").is_empty());
     }
 
     #[test]

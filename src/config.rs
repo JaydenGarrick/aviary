@@ -165,6 +165,9 @@ pub struct WebhookConfig {
 
 #[derive(Default, Serialize, Deserialize)]
 struct RawConfig {
+    /// The human's room author name; absent = derived from the login env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_name: Option<String>,
     #[serde(default)]
     bots: Vec<Bot>,
     #[serde(default)]
@@ -175,6 +178,11 @@ struct RawConfig {
 
 pub struct Config {
     pub dir: PathBuf,
+    /// The human's room author name, resolved — see [`resolve_user_name`].
+    pub user_name: String,
+    /// `user_name` exactly as config.json has it (None = not set), so
+    /// [`Config::save`] round-trips it and never pins an env-derived name.
+    pub user_name_cfg: Option<String>,
     pub bots: Vec<Bot>,
     pub rooms: Vec<Room>,
     pub webhook: Option<WebhookConfig>,
@@ -196,6 +204,39 @@ fn expand_tilde(s: &str) -> PathBuf {
         }
     }
     PathBuf::from(s)
+}
+
+/// What the human posts as when nothing names them.
+const DEFAULT_USER_NAME: &str = "you";
+
+/// The human's room author name and where it came from: config.json
+/// `user_name` → `$USER` → `$LOGNAME` → "you". Values are trimmed and an
+/// empty one counts as absent. Pure, so the chain is tested without env.
+pub fn resolve_user_name(
+    configured: Option<&str>,
+    env_user: Option<&str>,
+    env_logname: Option<&str>,
+) -> (String, &'static str) {
+    let candidates = [
+        (configured, "config.json"),
+        (env_user, "$USER"),
+        (env_logname, "$LOGNAME"),
+    ];
+    candidates
+        .into_iter()
+        .find_map(|(value, source)| {
+            let v = value?.trim();
+            (!v.is_empty()).then(|| (v.to_string(), source))
+        })
+        .unwrap_or_else(|| (DEFAULT_USER_NAME.to_string(), "default"))
+}
+
+/// [`resolve_user_name`] against the real environment. Env vars only —
+/// never `whoami`; a subprocess is not worth a name.
+pub fn user_name_from_env(configured: Option<&str>) -> (String, &'static str) {
+    let user = std::env::var("USER").ok();
+    let logname = std::env::var("LOGNAME").ok();
+    resolve_user_name(configured, user.as_deref(), logname.as_deref())
 }
 
 impl Config {
@@ -227,8 +268,26 @@ impl Config {
             }
         }
 
+        // The human counts as an OUTSIDE author in room dispatch only while
+        // no bird shares the name. It is never a session name, so `.`/`_`
+        // are fine here — a login like `jayden.garrick` must keep working.
+        let (user_name, source) = user_name_from_env(raw.user_name.as_deref());
+        if user_name.chars().any(char::is_whitespace) {
+            bail!(
+                "user_name {user_name:?} (from {source}) may not contain whitespace — set \"user_name\" in config.json"
+            );
+        }
+        let shares_name = |b: &Bot| b.id.0.eq_ignore_ascii_case(&user_name);
+        if raw.bots.iter().any(shares_name) {
+            bail!(
+                "user_name {user_name:?} (from {source}) collides with a bot id — the human and a bird cannot share a name; set \"user_name\" in config.json"
+            );
+        }
+
         Ok(Config {
             dir,
+            user_name,
+            user_name_cfg: raw.user_name,
             bots: raw.bots,
             rooms: raw.rooms,
             webhook: raw.webhook,
@@ -253,6 +312,7 @@ impl Config {
 
     fn save(&self) -> Result<()> {
         let raw = RawConfig {
+            user_name: self.user_name_cfg.clone(),
             bots: self.bots.clone(),
             rooms: self.rooms.clone(),
             webhook: self.webhook.clone(),
@@ -557,6 +617,7 @@ pub(crate) const SHIPPED_SKILLS: [(&str, &str); 2] = [
 /// or by editing config.json — nothing repo-specific ships.
 fn scaffold(dir: &Path) -> Result<()> {
     let default_config = RawConfig {
+        user_name: None,
         bots: Vec::new(),
         rooms: Vec::new(),
         webhook: None,
@@ -752,6 +813,89 @@ mod tests {
         }
         assert!(valid_bot_id("night-jar"));
         assert!(!valid_bot_id(""));
+    }
+
+    #[test]
+    fn user_name_resolves_config_then_env_then_default() {
+        // config.json wins over the environment.
+        assert_eq!(
+            resolve_user_name(Some("finch"), Some("envuser"), Some("logname")),
+            ("finch".to_string(), "config.json")
+        );
+        // Absent → $USER → $LOGNAME → "you"; blanks count as absent.
+        assert_eq!(
+            resolve_user_name(None, Some("envuser"), Some("logname")),
+            ("envuser".to_string(), "$USER")
+        );
+        assert_eq!(
+            resolve_user_name(Some("  "), Some(""), Some(" logname ")),
+            ("logname".to_string(), "$LOGNAME")
+        );
+        assert_eq!(
+            resolve_user_name(None, None, None),
+            ("you".to_string(), "default")
+        );
+        // Trimmed; a dotted login name is fine — it is never a session name.
+        assert_eq!(
+            resolve_user_name(Some(" jayden.garrick "), None, None).0,
+            "jayden.garrick"
+        );
+    }
+
+    #[test]
+    fn configured_user_name_wins_over_env_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{"user_name":"finch","bots":[],"rooms":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(cfg.user_name, "finch", "config.json beats $USER/$LOGNAME");
+        assert_eq!(cfg.user_name_cfg.as_deref(), Some("finch"));
+        // A save keeps what was configured.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        cfg.add_bot("swift", "Swift", "🐦", repo.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join("config.json")).unwrap();
+        assert!(text.contains(r#""user_name": "finch""#), "{text}");
+    }
+
+    #[test]
+    fn save_never_writes_an_unconfigured_user_name() {
+        // An env-derived name stays out of config.json.
+        let (tmp, mut cfg) = temp_config(&[]);
+        assert!(cfg.user_name_cfg.is_none());
+        assert!(!cfg.user_name.is_empty(), "something always resolves");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        cfg.add_bot("swift", "Swift", "🐦", repo.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join("config.json")).unwrap();
+        assert!(!text.contains("user_name"), "{text}");
+    }
+
+    #[test]
+    fn user_name_rejects_bot_id_collisions_and_whitespace() {
+        // A bird and the human cannot share a name — the human would stop
+        // counting as an outside author in room dispatch.
+        for (name, needle) in [
+            ("swift", "collides with a bot id"),
+            ("Swift", "collides with a bot id"),
+            ("jay den", "whitespace"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("config.json"),
+                format!(
+                    r#"{{"user_name":"{name}","bots":[{{"id":"swift","name":"x","glyph":"🐦","repo":"/tmp","persona":"birds/x.md"}}],"rooms":[]}}"#
+                ),
+            )
+            .unwrap();
+            let err = Config::load_or_scaffold(tmp.path().to_path_buf())
+                .err()
+                .expect("must fail the load");
+            assert!(err.to_string().contains(needle), "{name}: {err:#}");
+        }
     }
 
     #[test]

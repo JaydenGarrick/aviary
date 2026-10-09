@@ -184,6 +184,10 @@ the pane.
   members like any outside author).
 - **Permissions** — set a bird's `"permissions": "permissions/readonly.json"`
   to pre-allow read-only tools and cut prompt noise (template scaffolded).
+- **Your name** — rooms post you as `@<user_name>` and birds are told "New
+  message from @<user_name>". Set `"user_name": "…"` in config.json; otherwise
+  `$USER`, then `$LOGNAME`, then `you`. No whitespace, and it may not match a
+  bird's id (`aviary doctor` shows what resolved).
 
 ## Releasing
 
@@ -202,7 +206,7 @@ the tarball GitHub serves for the new tag. Friends then `brew upgrade aviary`.
 ## Layout
 
 Everything stateful lives outside this repo, in `~/.config/aviary/`:
-`config.json` (bots + rooms + webhook) · `birds/*.md` (personas) · `mcp.json`
+`config.json` (bots + rooms + webhook + user_name) · `birds/*.md` (personas) · `mcp.json`
 (MCP hooks) · `settings/*.json` (per-bird hook settings, regenerated at
 launch) · `events.jsonl` (hook events) · `rooms/*.md` (transcripts) ·
 `handoffs/` (briefs) · `permissions/` (allowlists) · `plugin/` (the flock

@@ -39,6 +39,15 @@ pub fn run() -> Result<()> {
     };
 
     if let Some(cfg) = &cfg {
+        // The human's room author name: config.json, else the login env.
+        let (_, source) = config::user_name_from_env(cfg.user_name_cfg.as_deref());
+        let hint = if source == "config.json" {
+            ""
+        } else {
+            " — set \"user_name\" in config.json to override"
+        };
+        println!("  · user name @{} (from {source}){hint}", cfg.user_name);
+
         for bot in &cfg.bots {
             let repo = bot.repo_path();
             row(

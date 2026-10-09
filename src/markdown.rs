@@ -43,7 +43,7 @@ const MIN_COL: usize = 4;
 const COL_GAP: usize = 3;
 
 /// Render one message body at `width` columns. `mention` maps a bare id
-/// (`swift`, `jayden`) to a colour; `None` renders the mention strong.
+/// (`swift`, `jayden.garrick`) to a colour; `None` renders the mention strong.
 pub fn render(
     body: &str,
     width: usize,
@@ -363,6 +363,24 @@ fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
+/// How much of `s` is a mention name: word chars plus interior dots, so
+/// `@jayden.garrick` (a login name) is one mention while `@raven.` ends
+/// before the full stop. Mirrors `room::mentions`.
+fn mention_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut n = 0;
+    while n < b.len() {
+        let c = b[n] as char;
+        let interior_dot = c == '.' && b.get(n + 1).is_some_and(|&next| is_word(next as char));
+        if is_word(c) || interior_dot {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
 fn tokenize(s: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut text = String::new();
@@ -388,10 +406,9 @@ fn tokenize(s: &str) -> Vec<Tok> {
                 }
             }
             '@' if !prev.is_some_and(|p| p.is_ascii_alphanumeric()) => {
-                let n = after.chars().take_while(|ch| is_word(*ch)).count();
+                let n = mention_len(after);
                 if n > 0 {
-                    let name: String = after.chars().take(n).collect();
-                    consumed = Some((Tok::Mention(name.clone()), 1 + name.len()));
+                    consumed = Some((Tok::Mention(after[..n].to_string()), 1 + n));
                 }
             }
             '[' => {
@@ -795,6 +812,25 @@ mod tests {
         assert!(r[1].1.add_modifier.contains(Modifier::BOLD));
         assert_eq!(r[3].0, "@swift");
         assert_eq!(r[3].1.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn dotted_login_names_mention_whole_and_a_full_stop_ends_one() {
+        assert_eq!(
+            tokenize("cc @jayden.garrick and @night_jar. done"),
+            vec![
+                Tok::Text("cc ".into()),
+                Tok::Mention("jayden.garrick".into()),
+                Tok::Text(" and ".into()),
+                Tok::Mention("night_jar".into()),
+                Tok::Text(". done".into()),
+            ]
+        );
+        let th = theme();
+        let colour = |id: &str| (id == "jayden.garrick").then_some(Color::Cyan);
+        let r = runs("@jayden.garrick", &th, &colour);
+        assert_eq!(r[0].0, "@jayden.garrick");
+        assert_eq!(r[0].1.fg, Some(Color::Cyan));
     }
 
     #[test]
