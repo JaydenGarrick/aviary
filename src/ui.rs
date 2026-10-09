@@ -95,6 +95,19 @@ pub fn status_glyph(status: BotStatus) -> Span<'static> {
     }
 }
 
+/// The session's figures for a title: `ctx 72% · $1.40` — only the parts
+/// somebody reported, empty when nobody did.
+pub fn detail_figures(d: &crate::agent_store::Detail) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = d.context_percent {
+        parts.push(format!("ctx {}%", p.round() as i64));
+    }
+    if let Some(c) = d.cost_usd {
+        parts.push(format!("${c:.2}"));
+    }
+    parts.join(" · ")
+}
+
 pub fn human_duration(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),

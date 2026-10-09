@@ -9,12 +9,13 @@
 //! `-` segment. A worker is only attributed when `<bird>` is a configured
 //! bird, so a stranger's `aviary-x_y-impl` shows nowhere.
 //!
-//! Status, most-truthful-first — the poll owns the LIVE states, the report
-//! file refines "idle":
+//! Status, most-truthful-first — the report file refines "idle":
 //!   1. poll stopped/exited/completed → Exited,
-//!   2. poll busy → Working · poll waiting/blocked → NeedsInput,
-//!   3. idle + a report → its `status:` (done · needs-input · failed · in-progress),
-//!   4. idle, no report → Done (aged since the kind last changed).
+//!   2. a live mod (its status file, via `ModStatus::reconcile` — the same
+//!      rule the birds wear) → its running state; its `done` goes to 4/5,
+//!   3. poll busy → Working · poll waiting/blocked → NeedsInput,
+//!   4. idle + a report → its `status:` (done · needs-input · failed · in-progress),
+//!   5. idle, no report → Done (aged since the kind last changed).
 //!
 //! A worker leaves the roster after [`MISSED_POLLS_BEFORE_DROP`] polls without
 //! it: the executor delivers an EMPTY poll on any failure, and one such poll
@@ -25,9 +26,10 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Instant, SystemTime};
 
-use crate::agent_store::{map_status_str, BotStatus, StatusKind};
+use crate::status::{map_status_str, BotStatus, StatusKind};
 use crate::command::SessionInfo;
 use crate::config::{Bot, BotId};
+use crate::status_file::{self, ModStatus};
 
 /// Separates the bird id from the workstream in a worker's session name.
 pub const SEP: char = '_';
@@ -203,11 +205,19 @@ pub struct Worker {
     pub session_name: String,
     /// The short id `claude attach|logs|stop|rm` take.
     pub id: String,
+    /// Claude's full session id — the mod's status file is named by it.
+    pub session_id: String,
     pub cwd: String,
     poll: (PollKind, Instant),
     /// When the coarse kind last changed — the chip's age while idle.
     kind_since: (StatusKind, Instant),
     report: Option<Report>,
+    /// The mod's latest word, from `status/<sessionId>.json`, and when its
+    /// state/reason/detail last changed (heartbeats do not count).
+    mod_state: Option<ModStatus>,
+    mod_changed: Instant,
+    /// The poll row's `waitingFor` (empty unless waiting).
+    waiting_for: String,
     missed: u8,
     unread: bool,
 }
@@ -253,21 +263,29 @@ impl Workers {
                     if !id.is_empty() {
                         w.id = id;
                     }
+                    if !row.session_id.is_empty() {
+                        w.session_id = row.session_id.clone();
+                    }
                     w.cwd = row.cwd.clone();
+                    w.waiting_for = row.waiting_for.clone();
                 }
                 None => {
                     let mut w = Worker {
                         name: parsed,
                         session_name: name.to_string(),
                         id,
+                        session_id: row.session_id.clone(),
                         cwd: row.cwd.clone(),
                         poll: (kind, now),
                         kind_since: (StatusKind::Done, now),
                         report: None,
+                        mod_state: None,
+                        mod_changed: now,
+                        waiting_for: row.waiting_for.clone(),
                         missed: 0,
                         unread: false,
                     };
-                    w.kind_since = (coarse(derive(&w)), now);
+                    w.kind_since = (derive(&w).kind(), now);
                     self.by_name.insert(name.to_string(), w);
                 }
             }
@@ -324,6 +342,32 @@ impl Workers {
         out
     }
 
+    /// Fold in the mod's status file for one session id (the worker it
+    /// names, if we hold it); returns the transition, as the poll does.
+    pub fn apply_mod(&mut self, session_id: &str, status: &ModStatus) -> Option<WorkerTransition> {
+        let name = self
+            .by_name
+            .values()
+            .find(|w| w.session_id == session_id)
+            .map(|w| w.session_name.clone())?;
+        let w = self.by_name.get_mut(&name)?;
+        let same = w.mod_state.as_ref().is_some_and(|p| p.same_word(status));
+        if !same {
+            w.mod_changed = Instant::now();
+        }
+        w.mod_state = Some(status.clone());
+        self.settle(&name)
+    }
+
+    /// Every worker's Claude session id (the GC's "still held" set).
+    pub fn session_ids(&self) -> Vec<String> {
+        self.by_name
+            .values()
+            .map(|w| w.session_id.clone())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
     /// The chip for one worker; `NotStarted` for a name we do not hold.
     pub fn status(&self, session_name: &str) -> BotStatus {
         self.by_name
@@ -375,7 +419,7 @@ impl Workers {
     fn settle(&mut self, session_name: &str) -> Option<WorkerTransition> {
         let w = self.by_name.get_mut(session_name)?;
         let status = derive(w);
-        let to = coarse(status);
+        let to = status.kind();
         let (from, _) = w.kind_since;
         if from == to {
             return None;
@@ -393,34 +437,45 @@ impl Workers {
 }
 
 /// The precedence rule (module doc).
+/// The poll owns exit; a live mod owns the running states (it saw the turn
+/// start, the dialog open, the turn die) and hands "done" to the idle
+/// branch; else the poll's live states; else idle, which the report refines.
 fn derive(w: &Worker) -> BotStatus {
-    match w.poll.0 {
-        PollKind::Exited => BotStatus::Exited,
-        PollKind::Working => BotStatus::Working,
-        PollKind::NeedsInput => BotStatus::NeedsInput,
-        PollKind::Idle => match w.report.as_ref().and_then(|r| r.status.map(|s| (s, r.mtime))) {
-            Some((status, mtime)) => {
-                let age = mtime.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-                match status {
-                    ReportStatus::Done => BotStatus::Done(age),
-                    ReportStatus::NeedsInput => BotStatus::NeedsInput,
-                    ReportStatus::Failed => BotStatus::Failed,
-                    ReportStatus::InProgress => BotStatus::Paused(age),
-                }
-            }
-            None => BotStatus::Done(w.kind_since.1.elapsed().as_secs()),
-        },
+    // The poll speaks over a live mod only where `ModStatus::reconcile`
+    // says — the same rule the birds wear.
+    let poll = status_file::PollView {
+        busy: w.poll.0 == PollKind::Working,
+        at: w.poll.1,
+        waiting_for: (!w.waiting_for.is_empty()).then(|| w.waiting_for.clone()),
+    };
+    let modded = w
+        .mod_state
+        .as_ref()
+        .filter(|s| s.is_alive(status_file::now_ms()))
+        .and_then(|s| s.reconcile(w.mod_changed, Some(&poll)).status(0));
+    match (w.poll.0, modded) {
+        (PollKind::Exited, _) => BotStatus::Exited,
+        (_, Some(BotStatus::Done(_))) => idle(w),
+        (_, Some(live)) => live,
+        (PollKind::Working, None) => BotStatus::Working,
+        (PollKind::NeedsInput, None) => BotStatus::NeedsInput,
+        (PollKind::Idle, None) => idle(w),
     }
 }
 
-/// The coarse kind transitions are measured in: attention, activity, quiet.
-fn coarse(s: BotStatus) -> StatusKind {
-    match s {
-        BotStatus::Working => StatusKind::Working,
-        BotStatus::NeedsInput | BotStatus::Failed => StatusKind::NeedsInput,
-        BotStatus::Done(_) | BotStatus::Paused(_) | BotStatus::Exited | BotStatus::NotStarted => {
-            StatusKind::Done
+/// Idle, refined by the report: done · needs-input · failed · in-progress.
+fn idle(w: &Worker) -> BotStatus {
+    match w.report.as_ref().and_then(|r| r.status.map(|s| (s, r.mtime))) {
+        Some((status, mtime)) => {
+            let age = mtime.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+            match status {
+                ReportStatus::Done => BotStatus::Done(age),
+                ReportStatus::NeedsInput => BotStatus::NeedsInput,
+                ReportStatus::Failed => BotStatus::Failed,
+                ReportStatus::InProgress => BotStatus::Paused(age),
+            }
         }
+        None => BotStatus::Done(w.kind_since.1.elapsed().as_secs()),
     }
 }
 
@@ -476,10 +531,56 @@ mod tests {
             name: name.into(),
             status: status.into(),
             id: "2d1601e0".into(),
+            session_id: format!("{name}-uuid"),
             kind: "background".into(),
             started_at: 10,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn mod_state_refines_worker_status_while_alive() {
+        let bots = [bot("swift")];
+        let mut w = Workers::default();
+        let name = "aviary-swift_x-impl";
+        w.apply_poll(&bots, &[row(name, "idle")]);
+        assert_eq!(w.status(name), BotStatus::Done(0));
+        assert_eq!(w.session_ids(), vec![format!("{name}-uuid")]);
+        let now = status_file::now_ms();
+        let st = |state: &str, at: u64| {
+            ModStatus::parse(&format!(r#"{{"v":1,"state":"{state}","updated_at":{at}}}"#)).unwrap()
+        };
+        // Unknown session id: nobody's.
+        assert!(w.apply_mod("stranger", &st("working", now)).is_none());
+        // The mod saw the turn start before the poll did.
+        let t = w.apply_mod(&format!("{name}-uuid"), &st("working", now)).unwrap();
+        assert_eq!(t.to, StatusKind::Working);
+        assert_eq!(w.status(name), BotStatus::Working);
+        // A laggy poll saying idle does not win against a live mod.
+        assert!(w.apply_poll(&bots, &[row(name, "idle")]).is_empty());
+        assert_eq!(w.status(name), BotStatus::Working);
+        // The mod's failed wears Failed; its done falls to the report branch.
+        w.apply_mod(&format!("{name}-uuid"), &st("failed", now));
+        assert_eq!(w.status(name), BotStatus::Failed);
+        w.apply_mod(&format!("{name}-uuid"), &st("done", now));
+        assert!(matches!(w.status(name), BotStatus::Done(_)));
+        // An approved permission: a busy poll a full period later clears it.
+        w.apply_mod(&format!("{name}-uuid"), &ModStatus::parse(&format!(
+            r#"{{"v":1,"state":"needs-input","reason":"permission","updated_at":{now}}}"#
+        )).unwrap());
+        w.apply_poll(&bots, &[row(name, "busy")]);
+        assert_eq!(w.status(name), BotStatus::NeedsInput, "a poll right after proves nothing");
+        w.by_name.get_mut(name).unwrap().mod_changed -= status_file::POLL_LAG;
+        w.apply_poll(&bots, &[row(name, "busy")]);
+        assert_eq!(w.status(name), BotStatus::Working);
+        // A stale mod hands back to the poll …
+        w.apply_mod(&format!("{name}-uuid"), &st("needs-input", now - 20_000));
+        w.apply_poll(&bots, &[row(name, "busy")]);
+        assert_eq!(w.status(name), BotStatus::Working);
+        // … and the poll's exit beats a mod however fresh.
+        w.apply_mod(&format!("{name}-uuid"), &st("working", now));
+        w.apply_poll(&bots, &[row(name, "stopped")]);
+        assert_eq!(w.status(name), BotStatus::Exited);
     }
 
     #[test]

@@ -7,12 +7,20 @@
 //! (rooms, handoffs, routines, webhooks) only ever address the primary.
 //!
 //! Status is layered, most-truthful-first:
+//!   0. the in-session mod's `status/<sessionId>.json`, while its heartbeat
+//!      is fresh (<15 s) → it saw the turn start, the dialog open, the turn
+//!      die; nothing below can contradict it (save `ModStatus::reconcile`'s
+//!      two documented exceptions — the signals live in `mod_layer.rs`),
 //!   1. PTY output in the last 2s → Working (streaming IS activity),
 //!   2. a fresh `claude agents --json` poll / hook event → busy · idle ·
 //!      needs_input (the state a PTY can never show: blocked on a prompt),
 //!   3. the output-recency heuristic as the fallback.
 //!
 //! Transitions feed unread dots and macOS notifications in the shell.
+//!
+//! Prompts for a RUNNING session go through ONE ordered queue, the inbox
+//! (`mod_layer.rs`): a live mod submits them, else this store types them,
+//! one per tick — see CLAUDE.md.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,7 +32,14 @@ use anyhow::{bail, Result};
 use crate::command::SessionInfo;
 use crate::config::{Bot, BotId, Config, SessionKey, State};
 use crate::event::Event;
+use crate::flock::WorkerTransition;
 use crate::pty;
+use crate::mod_layer::ModLayer;
+pub use crate::mod_layer::Delivery;
+pub use crate::status::{BotStatus, Detail, StatusKind};
+#[cfg(test)]
+use crate::status::map_status_str;
+use crate::status_file::ModStatus;
 
 pub struct AgentSession {
     pub term: pty::Terminal,
@@ -52,31 +67,6 @@ pub enum SessionKind {
     Attached { worker: String, label: String },
 }
 
-/// The coarse state machine a bird moves through (drives transitions).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StatusKind {
-    Working,
-    NeedsInput,
-    Done,
-}
-
-/// What the UI shows (Done carries its age).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BotStatus {
-    NotStarted,
-    Working,
-    /// Blocked on a permission prompt / question — the state worth a banner.
-    NeedsInput,
-    /// Finished responding, waiting at its prompt for `secs`.
-    Done(u64),
-    Exited,
-    /// Worn only by workers: the report said `failed`. Ranks with NeedsInput.
-    Failed,
-    /// Worn only by workers: idle on an `in-progress` report for `secs`.
-    /// Ranks with Done.
-    Paused(u64),
-}
-
 /// A status change worth reacting to (unread dot, notification).
 pub struct Transition {
     pub key: SessionKey,
@@ -84,24 +74,15 @@ pub struct Transition {
     pub to: StatusKind,
 }
 
-/// Map `claude agents --json` status strings; unknown strings read as Done
-/// (quiet) rather than inventing urgency.
-pub fn map_status_str(s: &str) -> StatusKind {
-    let s = s.to_ascii_lowercase();
-    if s == "busy" || s.contains("working") || s.contains("running") {
-        StatusKind::Working
-    } else if s.contains("input") || s.contains("waiting") || s.contains("blocked") {
-        StatusKind::NeedsInput
-    } else {
-        StatusKind::Done
-    }
-}
-
 /// Hook events → status kinds. `Stop` = finished; Notification subtypes that
 /// mean "a human must act" → NeedsInput; `idle_prompt` just means quiet.
+/// `PermissionRequest` fires the moment a permission dialog opens (the
+/// Notification's `permission_prompt` only after a ~6 s stall); `StopFailure`
+/// is a turn that died — attention, like a blocked bird.
 pub fn map_hook_event(event_name: &str, detail: &str) -> Option<StatusKind> {
     match event_name {
         "Stop" => Some(StatusKind::Done),
+        "PermissionRequest" | "StopFailure" => Some(StatusKind::NeedsInput),
         "Notification" => {
             if detail.contains("idle") {
                 Some(StatusKind::Done)
@@ -155,6 +136,9 @@ pub struct AgentStore {
     observed: HashMap<SessionKey, (StatusKind, Instant)>,
     /// When the observed kind last CHANGED (Done age on the chip).
     kind_since: HashMap<SessionKey, (StatusKind, Instant)>,
+    /// Everything known beyond the PTY: the poll's session id and
+    /// `waitingFor`, the hooks' last needs-input, the mod's status + inbox.
+    signals: ModLayer,
     // Unread and collab are deliberately per-BIRD: the roster card is the unit
     // of attention, whatever tab produced the signal.
     unread: HashMap<BotId, bool>,
@@ -172,6 +156,7 @@ impl AgentStore {
             last_output: HashMap::new(),
             observed: HashMap::new(),
             kind_since: HashMap::new(),
+            signals: ModLayer::new(cfg),
             unread: HashMap::new(),
             collab: HashMap::new(),
             state: State::load(&cfg.dir),
@@ -305,12 +290,28 @@ impl AgentStore {
     /// The roster chip plus WHICH tab it is reporting — named only when the
     /// bird has more than one session, so single-tab birds stay clean.
     pub fn status_tabbed(&self, id: &BotId) -> (BotStatus, Option<u8>) {
-        aggregate_status(
-            self.sessions
-                .iter()
-                .filter(|(k, s)| k.bot == *id && s.kind == SessionKind::Bird)
-                .map(|(k, _)| (k.tab, self.status_key(k))),
-        )
+        aggregate_status(self.bird_keys(id).map(|k| (k.tab, self.status_key(k))))
+    }
+
+    /// The session the roster chip reports — the tab `status_tabbed` names,
+    /// or the lone bird session (which it leaves unnamed), else the primary.
+    /// Its `detail` is the reason under the chip.
+    pub fn reporting_key(&self, id: &BotId) -> SessionKey {
+        let tab = self
+            .status_tabbed(id)
+            .1
+            .or_else(|| self.bird_keys(id).map(|k| k.tab).min())
+            .unwrap_or(1);
+        SessionKey { bot: id.clone(), tab }
+    }
+
+    /// The bird's own sessions — never a worker viewer. The one filter the
+    /// chip and its reason both count by.
+    fn bird_keys<'a>(&'a self, id: &'a BotId) -> impl Iterator<Item = &'a SessionKey> + 'a {
+        self.sessions
+            .iter()
+            .filter(move |(k, s)| k.bot == *id && s.kind == SessionKind::Bird)
+            .map(|(k, _)| k)
     }
 
     /// One session's status, layered most-truthful-first (see module doc).
@@ -326,27 +327,13 @@ impl AgentStore {
         if let SessionKind::Attached { worker, .. } = &session.kind {
             return self.workers.status(worker);
         }
-        let output_age = self.last_output.get(key).map(|t| t.elapsed());
-        // Streaming overrides everything — a laggy poll can say "idle" while
-        // tokens are visibly arriving.
-        if output_age.is_some_and(|a| a < OUTPUT_OVERRIDE) {
-            return BotStatus::Working;
-        }
-        if let Some((kind, at)) = self.observed.get(key) {
-            if at.elapsed() < POLL_TRUST {
-                return match kind {
-                    StatusKind::Working => BotStatus::Working,
-                    StatusKind::NeedsInput => BotStatus::NeedsInput,
-                    StatusKind::Done => BotStatus::Done(self.kind_age(key)),
-                };
-            }
-        }
-        // Fallback heuristic: recent output = working, else done-for-a-while.
-        match output_age {
-            Some(a) if a < WORKING_WINDOW => BotStatus::Working,
-            Some(a) => BotStatus::Done(a.as_secs()),
-            None => BotStatus::Working, // just spawned, first paint pending
-        }
+        let kind_age = self.kind_age(key);
+        pick_status(
+            self.mod_for(key).and_then(|st| st.status(kind_age)),
+            self.last_output.get(key).map(|t| t.elapsed()),
+            self.observed.get(key).map(|(k, at)| (*k, at.elapsed())),
+            kind_age,
+        )
     }
 
     fn kind_age(&self, key: &SessionKey) -> u64 {
@@ -354,6 +341,81 @@ impl AgentStore {
             .get(key)
             .map(|(_, t)| t.elapsed().as_secs())
             .unwrap_or(0)
+    }
+
+    /// The mod's word for a key while its heartbeat is fresh; the poll
+    /// speaks over it only where `ModStatus::reconcile` says.
+    fn mod_for(&self, key: &SessionKey) -> Option<ModStatus> {
+        self.signals.mod_for(key)
+    }
+
+    /// Is the in-session mod reporting for this key right now?
+    pub fn mod_alive(&self, key: &SessionKey) -> bool {
+        self.mod_for(key).is_some()
+    }
+
+    /// How a prompt should reach this (running) session.
+    pub fn delivery(&self, key: &SessionKey) -> Delivery {
+        self.signals.delivery(key)
+    }
+
+    /// Fold in every status file that changed since the last tick: the
+    /// mod's word for birds (by key) and workers (by session id). Returns
+    /// the transitions, as the poll does.
+    pub fn apply_status_files(&mut self) -> (Vec<Transition>, Vec<WorkerTransition>) {
+        let mut birds = Vec::new();
+        let mut workers = Vec::new();
+        for change in self.signals.scan() {
+            if let Some(t) = self.workers.apply_mod(&change.session_id, &change.status) {
+                workers.push(t);
+            }
+            let Some(key) = change.key else { continue };
+            let kind = self.mod_for(&key).and_then(|st| st.status(0)).map(BotStatus::kind);
+            if let Some(t) = kind.and_then(|k| self.observe(&key, k)) {
+                birds.push(t);
+            }
+        }
+        (birds, workers)
+    }
+
+    /// The inbox fallback, each tick: for a session whose mod is NOT alive,
+    /// TYPE the oldest prompt it never acked, one per tick so the Enter of
+    /// one never lands inside the next. A PTY younger than [`MARK_AFTER`] is
+    /// still booting: nothing is typed at it — its mod, once up, drains the
+    /// same folder (a resume keeps the session id).
+    /// Returns how many prompts were typed (tests count them).
+    pub fn sweep_inbox(&mut self) -> usize {
+        let sessions = &self.sessions;
+        let due = self.signals.take_for_typing(|key| {
+            sessions.get(key).is_some_and(|s| {
+                s.kind == SessionKind::Bird && s.term.is_running() && s.spawned_at.elapsed() >= MARK_AFTER
+            })
+        });
+        let typed = due.len();
+        for (key, text) in due {
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.term.send_line(&text);
+                session.last_prompt = Some(text);
+            }
+        }
+        typed
+    }
+
+    /// The banner body for a session that wants the person: the reason the
+    /// mod or poll gave (a dead turn says so), else the generic line.
+    pub fn attention_text(&self, key: &SessionKey) -> String {
+        let failed = matches!(self.status_key(key), BotStatus::Failed);
+        match self.detail(key).reason {
+            Some(r) if failed => format!("its turn died: {r}"),
+            Some(r) => r,
+            None => "blocked on a permission prompt or question".into(),
+        }
+    }
+
+    /// Sweep status files and inbox folders nobody holds any more (once a
+    /// minute from the shell).
+    pub fn gc(&mut self) {
+        self.signals.gc(self.workers.session_ids());
     }
 
     /// Record an observation; returns the transition if the kind changed.
@@ -394,11 +456,50 @@ impl AgentStore {
     }
 
     /// Fold one `claude agents --json` poll in; returns status transitions.
+    /// Also records each live key's session id (the mod's join key) and
+    /// `waitingFor`.
     pub fn apply_poll(&mut self, sessions: &[SessionInfo]) -> Vec<Transition> {
-        poll_matches(&self.live_keys(), sessions)
-            .into_iter()
-            .filter_map(|(key, kind)| self.observe(&key, kind))
-            .collect()
+        let mut out = Vec::new();
+        for (key, row) in poll_matches(&self.live_keys(), sessions) {
+            let kind = self.signals.note_poll(&key, row);
+            // The mod saw the turn start before the poll can: while it is
+            // alive the (laggier) poll must not flap the kind — it speaks only
+            // through `reconcile`, inside `mod_for`.
+            if let Some(st) = self.mod_for(&key) {
+                if let Some(t) = st.status(0).and_then(|s| self.observe(&key, s.kind())) {
+                    out.push(t);
+                }
+                continue;
+            }
+            if self.signals.poll_predates_hook(&key, kind) {
+                continue;
+            }
+            if let Some(t) = self.observe(&key, kind) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    /// The chip's fine print for one session: a reason while blocked, the
+    /// context fill and cost when something reports them.
+    pub fn detail(&self, key: &SessionKey) -> Detail {
+        let blocked = matches!(self.status_key(key), BotStatus::NeedsInput | BotStatus::Failed);
+        self.signals.detail(key, blocked)
+    }
+
+    /// Drop every per-session observation of a key (its PTY is gone).
+    fn forget_observations(&mut self, key: &SessionKey) {
+        self.forget_where(|k| k == key);
+    }
+
+    /// THE one place per-key observations are dropped — every new per-key
+    /// map is added here, and only here.
+    fn forget_where(&mut self, gone: impl Fn(&SessionKey) -> bool) {
+        self.last_output.retain(|k, _| !gone(k));
+        self.observed.retain(|k, _| !gone(k));
+        self.kind_since.retain(|k, _| !gone(k));
+        self.signals.forget_where(gone);
     }
 
     /// Fold one hook event in. A new-format event names its session
@@ -415,6 +516,10 @@ impl AgentStore {
     ) -> Option<Transition> {
         let kind = map_hook_event(event_name, detail)?;
         let key = resolve_hook_key(&cfg.bots, &self.live_keys(), cwd, aviary_session)?;
+        if self.mod_alive(&key) {
+            return None; // the mod already said so, sooner and finer
+        }
+        self.signals.note_hook(&key, kind);
         self.observe(&key, kind)
     }
 
@@ -433,15 +538,26 @@ impl AgentStore {
         tx: &Sender<Event>,
     ) -> Result<()> {
         let key = SessionKey { bot: bot.id.clone(), tab };
+        let delivery = self.delivery(&key);
         if let Some(session) = self.sessions.get_mut(&key) {
             if session.term.is_running() {
                 if session.kind != SessionKind::Bird {
                     return Ok(()); // a viewer: nothing to type at, nothing to resume
                 }
                 if let Some(p) = prompt {
-                    // send_line, never a trailing \r in the same burst — the
-                    // child's paste detection would swallow the submit.
-                    session.term.send_line(p);
+                    let posted = match &delivery {
+                        // The mod drains the inbox with `$.prompt.submit`:
+                        // queued until the session is idle, never keystrokes.
+                        Delivery::Inbox(sid) => {
+                            self.signals.post(sid, p)
+                        }
+                        Delivery::Typed => false,
+                    };
+                    if !posted {
+                        // send_line, never a trailing \r in the same burst —
+                        // the child's paste detection would swallow the submit.
+                        session.term.send_line(p);
+                    }
                     session.last_prompt = Some(p.to_string());
                 }
                 return Ok(());
@@ -453,6 +569,9 @@ impl AgentStore {
                 bail!("{label}'s viewer ended — reopen it from the worker row");
             }
             self.sessions.remove(&key); // exited — replace it
+            // The dead session's id must not route the next prompt to an
+            // inbox nobody drains; the poll re-names the new one.
+            self.forget_observations(&key);
         }
         let resume = self.state.spawned_once(&key.state_key());
         self.launch(cfg, bot, &key, prompt, tx, resume)
@@ -490,7 +609,10 @@ impl AgentStore {
             resume,
         );
 
-        let term = pty::Terminal::spawn(key.clone(), "claude", &args, &repo, 24, 80, tx.clone())?;
+        // The mod inside the bird finds its status/ and inbox/ through this;
+        // the workers the bird spawns inherit it.
+        let env = [("AVIARY_CONFIG_DIR", cfg.dir.display().to_string())];
+        let term = pty::Terminal::spawn(key.clone(), "claude", &args, &repo, &env, 24, 80, tx.clone())?;
         self.sessions.insert(
             key.clone(),
             AgentSession {
@@ -526,7 +648,7 @@ impl AgentStore {
         }
         self.sessions.remove(key);
         let args = vec!["attach".to_string(), short_id.to_string()];
-        let term = pty::Terminal::spawn(key.clone(), "claude", &args, &repo, 24, 80, tx.clone())?;
+        let term = pty::Terminal::spawn(key.clone(), "claude", &args, &repo, &[], 24, 80, tx.clone())?;
         self.sessions.insert(
             key.clone(),
             AgentSession {
@@ -589,9 +711,7 @@ impl AgentStore {
     pub fn reset_primary(&mut self, cfg: &Config, id: &BotId) -> bool {
         let key = SessionKey::primary(id.clone());
         let was_live = self.sessions.remove(&key).is_some(); // drop = hang up
-        self.observed.remove(&key);
-        self.last_output.remove(&key);
-        self.kind_since.remove(&key);
+        self.forget_observations(&key);
         self.collab.remove(id);
         let had_record = self.state.spawned_once(&key.state_key());
         self.state.forget(&cfg.dir, &key.state_key());
@@ -625,9 +745,7 @@ impl AgentStore {
             .collect();
         for key in &ended {
             self.sessions.remove(key);
-            self.last_output.remove(key);
-            self.observed.remove(key);
-            self.kind_since.remove(key);
+            self.forget_observations(key);
         }
         ended
     }
@@ -658,14 +776,14 @@ impl AgentStore {
     /// workers keep running, they just lose their window.
     pub fn stop(&mut self, id: &BotId) {
         self.sessions.retain(|k, _| k.bot != *id);
-        self.observed.retain(|k, _| k.bot != *id);
+        self.forget_where(|k| k.bot == *id);
         self.collab.remove(id);
     }
 
     /// Stop one tab's session only; the bird's other sessions keep flying.
     pub fn stop_key(&mut self, key: &SessionKey) {
         self.sessions.remove(key);
-        self.observed.remove(key);
+        self.forget_observations(key);
     }
 
     /// Close a tab: stop it, forget its resume record and label, so the strip
@@ -673,8 +791,6 @@ impl AgentStore {
     pub fn close_tab(&mut self, cfg: &Config, key: &SessionKey) {
         let viewer = self.is_attached(key);
         self.stop_key(key);
-        self.last_output.remove(key);
-        self.kind_since.remove(key);
         if viewer {
             return; // a viewer has no record and no label of its own
         }
@@ -687,8 +803,6 @@ impl AgentStore {
     /// `claude --resume aviary-<id>` works from any terminal.
     pub fn release(&mut self, cfg: &Config, id: &BotId) {
         self.stop(id);
-        self.last_output.retain(|k, _| k.bot != *id);
-        self.kind_since.retain(|k, _| k.bot != *id);
         self.unread.remove(id);
         self.workers.forget_bot(id);
         self.state.forget_bot(&cfg.dir, id);
@@ -725,16 +839,54 @@ fn aggregate_status(
     (folded.0, (n > 1).then_some(folded.1))
 }
 
+/// The layering itself, pure (see the module doc): the mod while alive,
+/// else streaming output, else a fresh poll/hook observation, else the
+/// output-recency heuristic.
+fn pick_status(
+    modded: Option<BotStatus>,
+    output_age: Option<Duration>,
+    observed: Option<(StatusKind, Duration)>,
+    kind_age: u64,
+) -> BotStatus {
+    if let Some(s) = modded {
+        return s;
+    }
+    // Streaming overrides a laggy poll — it can say "idle" while tokens are
+    // visibly arriving.
+    if output_age.is_some_and(|a| a < OUTPUT_OVERRIDE) {
+        return BotStatus::Working;
+    }
+    if let Some((kind, age)) = observed {
+        if age < POLL_TRUST {
+            return match kind {
+                StatusKind::Working => BotStatus::Working,
+                StatusKind::NeedsInput => BotStatus::NeedsInput,
+                // How long the kind has stood (`kind_since`), not output age.
+                StatusKind::Done => BotStatus::Done(kind_age),
+            };
+        }
+    }
+    // Fallback heuristic: recent output = working, else done-for-a-while.
+    match output_age {
+        Some(a) if a < WORKING_WINDOW => BotStatus::Working,
+        Some(a) => BotStatus::Done(a.as_secs()),
+        None => BotStatus::Working, // just spawned, first paint pending
+    }
+}
+
 /// Match poll rows to live keys by EXACT session name — `aviary-swift.2`
 /// never badges `aviary-swift`, and a foreign `aviary-swiftly` matches neither.
-fn poll_matches(live: &[SessionKey], sessions: &[SessionInfo]) -> Vec<(SessionKey, StatusKind)> {
+fn poll_matches<'a>(
+    live: &[SessionKey],
+    sessions: &'a [SessionInfo],
+) -> Vec<(SessionKey, &'a SessionInfo)> {
     live.iter()
         .filter_map(|key| {
             let name = key.session_name();
             sessions
                 .iter()
                 .find(|s| s.name == name)
-                .map(|s| (key.clone(), map_status_str(&s.status)))
+                .map(|s| (key.clone(), s))
         })
         .collect()
 }
@@ -803,7 +955,7 @@ fn launch_args(
         // The flock skills (orchestrator + worker), for this session only.
         "--plugin-dir".into(),
         plugin.display().to_string(),
-        // Per-session Stop/Notification hooks (+ optional permission allows) —
+        // The classic hooks (`HOOKED_EVENTS`) (+ optional permission allows) —
         // the source of truthful "done / needs input" signals.
         "--settings".into(),
         settings.display().to_string(),
@@ -821,6 +973,7 @@ fn launch_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status_file;
     use std::path::Path;
 
     #[test]
@@ -844,7 +997,14 @@ mod tests {
             map_hook_event("Notification", "idle_prompt"),
             Some(StatusKind::Done)
         );
+        // The stable floor under the mod: a dialog opening, a turn dying.
+        assert_eq!(map_hook_event("PermissionRequest", ""), Some(StatusKind::NeedsInput));
+        assert_eq!(map_hook_event("StopFailure", ""), Some(StatusKind::NeedsInput));
         assert_eq!(map_hook_event("PreToolUse", "x"), None);
+        // Every event the settings file hooks maps to something.
+        for event in crate::config::HOOKED_EVENTS {
+            assert!(map_hook_event(event, "").is_some(), "{event} must map");
+        }
     }
 
     /// The regression this guards: a variadic flag directly before the
@@ -927,6 +1087,7 @@ mod tests {
         let info = |name: &str, status: &str| SessionInfo {
             name: name.into(),
             status: status.into(),
+            session_id: format!("{name}-uuid"),
             cwd: String::new(),
             ..Default::default()
         };
@@ -936,10 +1097,13 @@ mod tests {
             info("aviary-swift.2", "waiting_for_input"),
             info("aviary-swiftly", "busy"), // foreign bird, not a tab
         ];
-        let got = poll_matches(&live, &polled);
+        let got: Vec<(SessionKey, StatusKind, &str)> = poll_matches(&live, &polled)
+            .into_iter()
+            .map(|(k, row)| (k, map_status_str(row.status_str()), row.session_id.as_str()))
+            .collect();
         assert_eq!(got.len(), 2);
-        assert!(got.contains(&(key("swift", 1), StatusKind::Working)));
-        assert!(got.contains(&(key("swift", 2), StatusKind::NeedsInput)));
+        assert!(got.contains(&(key("swift", 1), StatusKind::Working, "aviary-swift-uuid")));
+        assert!(got.contains(&(key("swift", 2), StatusKind::NeedsInput, "aviary-swift.2-uuid")));
     }
 
     #[test]
@@ -1003,5 +1167,196 @@ mod tests {
         assert_eq!(lowest_free_tab(&[1]), 2);
         assert_eq!(lowest_free_tab(&[1, 2, 4]), 3);
         assert_eq!(lowest_free_tab(&[1, 2, 3, 4]), 5);
+    }
+
+    #[test]
+    fn status_layers_mod_over_output_over_poll_over_heuristic() {
+        use BotStatus::*;
+        let s = Duration::from_secs;
+        // A live mod outranks everything, streaming output included.
+        assert_eq!(pick_status(Some(NeedsInput), Some(s(0)), Some((StatusKind::Working, s(1))), 0), NeedsInput);
+        assert_eq!(pick_status(Some(Failed), Some(s(0)), None, 0), Failed);
+        assert_eq!(pick_status(Some(Done(7)), None, Some((StatusKind::Working, s(1))), 7), Done(7));
+        // No mod: fresh output beats a laggy poll …
+        assert_eq!(pick_status(None, Some(s(1)), Some((StatusKind::Done, s(1))), 0), Working);
+        // … a fresh poll beats the heuristic …
+        assert_eq!(pick_status(None, Some(s(3)), Some((StatusKind::NeedsInput, s(14))), 0), NeedsInput);
+        assert_eq!(pick_status(None, Some(s(60)), Some((StatusKind::Working, s(14))), 0), Working);
+        // … an observed Done wears the KIND's age, not the output's …
+        assert_eq!(pick_status(None, Some(s(3)), Some((StatusKind::Done, s(3))), 300), Done(300));
+        // … a stale poll is forgotten …
+        assert_eq!(pick_status(None, Some(s(60)), Some((StatusKind::Working, s(16))), 0), Done(60));
+        assert_eq!(pick_status(None, Some(s(3)), Some((StatusKind::Done, s(16))), 0), Working);
+        // … and a session with no paint yet is working on its first one.
+        assert_eq!(pick_status(None, None, None, 0), Working);
+    }
+
+    /// A status file keyed by the poll's session id reaches the bird whose
+    /// key the poll named; a stale heartbeat stops counting.
+    #[test]
+    fn mod_status_joins_birds_by_session_id_while_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let swift = key("swift", 1);
+        store.signals.set_session_id(&swift, "sid-1");
+        let now = status_file::now_ms();
+        let write = |state: &str, extra: &str, at: u64| {
+            std::fs::write(
+                cfg.status_dir().join("sid-1.json"),
+                format!(r#"{{"v":1,"session_id":"sid-1","state":"{state}",{extra}"updated_at":{at}}}"#),
+            )
+            .unwrap();
+        };
+        write("needs-input", r#""reason":"permission","detail":"Bash · cargo test","context_percent":72.4,"cost_usd":1.5,"#, now);
+        let (birds, workers) = store.apply_status_files();
+        assert!(workers.is_empty());
+        assert_eq!(birds.len(), 1, "the first word is a transition");
+        assert_eq!(birds[0].key, swift);
+        assert_eq!(birds[0].to, StatusKind::NeedsInput);
+        assert!(store.mod_alive(&swift));
+        assert_eq!(store.delivery(&swift), Delivery::Inbox("sid-1".into()));
+        let d = store.detail(&swift);
+        assert_eq!(d.reason.as_deref(), Some("permission · Bash · cargo test"));
+        assert_eq!(d.context_percent, Some(72.4));
+        assert_eq!(d.cost_usd, Some(1.5));
+        // While the mod is alive the poll must not flap the kind.
+        let polled = [SessionInfo {
+            name: "aviary-swift".into(),
+            status: "idle".into(),
+            session_id: "sid-1".into(),
+            ..Default::default()
+        }];
+        // (apply_poll only badges LIVE keys; none here — but the guard is the point.)
+        assert!(store.apply_poll(&polled).is_empty());
+        assert!(store
+            .apply_hook(&cfg, Some("aviary-swift"), "", "Stop", "")
+            .is_none());
+        // The same file, unchanged, is not news; a change is.
+        assert!(store.apply_status_files().0.is_empty());
+        write("done", "", now + 1);
+        let (birds, _) = store.apply_status_files();
+        assert_eq!(birds.len(), 1);
+        assert_eq!(birds[0].to, StatusKind::Done);
+        assert_eq!(store.detail(&swift).reason, None, "quiet birds carry no reason");
+        // A stale heartbeat: the mod no longer speaks for the key.
+        write("working", "", now - 20_000);
+        store.apply_status_files();
+        assert!(!store.mod_alive(&swift));
+        assert_eq!(
+            store.delivery(&swift),
+            Delivery::Inbox("sid-1".into()),
+            "one queue: a dead mod's inbox is typed by the sweep, in order"
+        );
+        // An ended session is not alive however fresh.
+        write("ended", "", now);
+        store.apply_status_files();
+        assert!(!store.mod_alive(&swift));
+        // A key the poll never named has nothing to join.
+        assert_eq!(store.delivery(&key("swift", 2)), Delivery::Typed);
+    }
+
+    #[test]
+    fn inbox_sweep_drops_acked_files_and_types_for_a_dead_mod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let swift = key("swift", 1);
+        store.signals.set_session_id(&swift, "sid-1");
+        let mut stamp = status_file::PostStamp::default();
+        let first = status_file::inbox_post(&cfg.inbox_dir(), "sid-1", &mut stamp, "one").unwrap();
+        let second = status_file::inbox_post(&cfg.inbox_dir(), "sid-1", &mut stamp, "two").unwrap();
+        // Alive and acked up to the first file: it goes, the second waits.
+        std::fs::write(
+            cfg.status_dir().join("sid-1.json"),
+            format!(
+                r#"{{"v":1,"state":"working","inbox_ack":"{first}","updated_at":{}}}"#,
+                status_file::now_ms()
+            ),
+        )
+        .unwrap();
+        store.apply_status_files();
+        assert_eq!(store.sweep_inbox(), 0, "a live mod gets nothing typed");
+        let left = status_file::inbox_pending(&cfg.inbox_dir(), "sid-1", "");
+        assert_eq!(left.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), [&second]);
+        // Dead mod, but no live PTY for the key either: nothing to type into.
+        std::fs::remove_file(cfg.status_dir().join("sid-1.json")).unwrap();
+        store.apply_status_files();
+        assert_eq!(store.sweep_inbox(), 0, "no live PTY to type into");
+        assert_eq!(status_file::inbox_pending(&cfg.inbox_dir(), "sid-1", "").len(), 1, "kept for a session that may come back");
+    }
+
+    /// No event marks a permission dialog as answered; a poll a full period
+    /// later that reads busy with nothing waiting means it was approved.
+    #[test]
+    fn a_later_busy_poll_clears_an_answered_permission_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let swift = key("swift", 1);
+        store.signals.set_session_id(&swift, "sid-1");
+        let write = |state: &str, reason: &str| {
+            std::fs::write(
+                cfg.status_dir().join("sid-1.json"),
+                format!(
+                    r#"{{"v":1,"state":"{state}","reason":"{reason}","detail":"Bash · cargo test","updated_at":{}}}"#,
+                    status_file::now_ms()
+                ),
+            )
+            .unwrap();
+        };
+        write("needs-input", "permission");
+        store.apply_status_files();
+        let blocked = |s: &AgentStore| s.mod_for(&swift).unwrap().state == "needs-input";
+        assert!(blocked(&store));
+        // A busy poll taken right after the dialog opened proves nothing.
+        store.signals.set_poll(&swift, StatusKind::Working, Instant::now(), None);
+        assert!(blocked(&store));
+        // A full period later, busy with nothing waiting: approved, running.
+        let changed = store.signals.changed_at("sid-1");
+        store.signals.set_poll(&swift, StatusKind::Working, changed + status_file::POLL_LAG, None);
+        assert!(!blocked(&store));
+        assert_eq!(store.detail(&swift).reason, None);
+        // Still waiting per the poll: the dialog is open.
+        store.signals.set_poll(&swift, StatusKind::Working, changed + status_file::POLL_LAG, Some("permission prompt"));
+        assert!(blocked(&store));
+        store.signals.set_poll(&swift, StatusKind::Working, changed + status_file::POLL_LAG, None);
+        // A heartbeat does not reset the clock; a NEW word does.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write("needs-input", "permission");
+        store.apply_status_files();
+        assert!(!blocked(&store), "same word, heartbeat only");
+        write("needs-input", "question");
+        store.apply_status_files();
+        assert!(blocked(&store), "a question is never cleared by the poll");
+        // A dialog the mod cannot see (MCP elicitation …): a fresh poll's
+        // waitingFor turns the mod's done into needs-you, with the reason.
+        write("done", "");
+        store.apply_status_files();
+        assert!(!blocked(&store));
+        store.signals.set_poll(&swift, StatusKind::NeedsInput, Instant::now(), Some("dialog open"));
+        assert!(blocked(&store));
+        assert_eq!(store.detail(&swift).reason.as_deref(), Some("dialog open"));
+    }
+
+    /// A relaunch drops the key's session id; the next id the poll names for
+    /// that key inherits the prompts still queued for the old one.
+    #[test]
+    fn a_relaunch_carries_unsent_prompts_to_the_new_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let swift = key("swift", 1);
+        store.signals.set_session_id(&swift, "old-sid");
+        assert_eq!(store.delivery(&swift), Delivery::Inbox("old-sid".into()));
+        let mut stamp = status_file::PostStamp::default();
+        let queued = status_file::inbox_post(&cfg.inbox_dir(), "old-sid", &mut stamp, "hi").unwrap();
+        store.forget_observations(&swift); // the exited-replace path
+        assert_eq!(store.delivery(&swift), Delivery::Typed, "no id until the poll names the new one");
+        let row = SessionInfo { name: "aviary-swift".into(), status: "idle".into(), session_id: "new-sid".into(), ..Default::default() };
+        store.signals.note_poll(&swift, &row);
+        let moved = status_file::inbox_pending(&cfg.inbox_dir(), "new-sid", "");
+        assert_eq!(moved.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), [&queued]);
+        assert!(!cfg.inbox_dir().join("old-sid").exists());
     }
 }

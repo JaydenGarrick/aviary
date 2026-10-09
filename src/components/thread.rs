@@ -343,6 +343,12 @@ impl Component for Thread {
                 title.spans.push(muted(format!("viewing {label}")));
             }
         }
+        // The mod's figures (context fill, cost) when the session reports them.
+        let figures = crate::ui::detail_figures(&s.agents.detail(&key));
+        if !figures.is_empty() {
+            title.spans.push(dim("  ·  "));
+            title.spans.push(muted(figures));
+        }
         if let Some(info) = s
             .branches
             .data

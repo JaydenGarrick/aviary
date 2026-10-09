@@ -365,12 +365,15 @@ impl Config {
         Ok(())
     }
 
-    /// The per-session `--settings` file: Stop + Notification hooks (the
-    /// truthful done/needs-input signals, probed working via `--settings`),
-    /// merged with the bird's optional permission allowlist. Regenerated every
-    /// launch — the hook command embeds the current exe and the session name
-    /// (`--session`), which is what lets hook events name their tab; cwd alone
-    /// cannot, since every tab shares the repo.
+    /// The per-session `--settings` file: the classic hooks that are the
+    /// STABLE floor of status truth (Stop · Notification · PermissionRequest
+    /// · StopFailure — probed working via `--settings`), merged with the
+    /// bird's optional permission allowlist. The in-session mod (see
+    /// `status_file.rs`) layers above these; they stay so nothing regresses
+    /// when the mod is off. Regenerated every launch — the hook command
+    /// embeds the current exe and the session name (`--session`), which is
+    /// what lets hook events name their tab; cwd alone cannot, since every
+    /// tab shares the repo.
     pub fn settings_file_for(&self, bot: &Bot, key: &SessionKey) -> Result<PathBuf> {
         let dir = self.dir.join("settings");
         std::fs::create_dir_all(&dir)?;
@@ -381,9 +384,11 @@ impl Config {
             "type": "command",
             "command": format!("\"{exe}\" --hook --session {}", key.session_name()),
         }]}]);
-        let mut root = serde_json::json!({
-            "hooks": { "Stop": hook.clone(), "Notification": hook }
-        });
+        let mut hooks = serde_json::Map::new();
+        for event in HOOKED_EVENTS {
+            hooks.insert(event.to_string(), hook.clone());
+        }
+        let mut root = serde_json::json!({ "hooks": hooks });
 
         if let Some(rel) = &bot.permissions {
             let p = expand_tilde(rel);
@@ -403,6 +408,17 @@ impl Config {
         let path = dir.join(format!("{}.json", key.state_key()));
         std::fs::write(&path, serde_json::to_string_pretty(&root)? + "\n")?;
         Ok(path)
+    }
+
+    /// Where the in-session mod writes `status/<sessionId>.json`.
+    pub fn status_dir(&self) -> PathBuf {
+        self.dir.join("status")
+    }
+
+    /// Where prompts for RUNNING sessions wait for the mod:
+    /// `inbox/<sessionId>/<file>.md`.
+    pub fn inbox_dir(&self) -> PathBuf {
+        self.dir.join("inbox")
     }
 
     /// Where `aviary --hook` appends events and the shell reads them.
@@ -517,8 +533,8 @@ fn slug(s: &str) -> String {
 
 const PERSONA_TEMPLATE: &str = include_str!("../assets/birds/template.md");
 /// The flock skills, shipped into `<dir>/plugin/skills/` on startup.
-pub(crate) const ORCHESTRATOR_SKILL: &str = include_str!("../assets/skills/flock-orchestrator/SKILL.md");
-pub(crate) const WORKER_SKILL: &str = include_str!("../assets/skills/flock-worker/SKILL.md");
+pub(crate) const ORCHESTRATOR_SKILL: &str = include_str!("../assets/plugin/skills/flock-orchestrator/SKILL.md");
+pub(crate) const WORKER_SKILL: &str = include_str!("../assets/plugin/skills/flock-worker/SKILL.md");
 
 fn make_bot(id: BotId, name: &str, glyph: &str, repo: &str, persona: &str) -> Bot {
     Bot {
@@ -538,7 +554,7 @@ fn make_bot(id: BotId, name: &str, glyph: &str, repo: &str, persona: &str) -> Bo
 /// overwriting a user's edits. No personas ship: `birds/` fills as the user
 /// hatches birds (see [`Config::add_bot`]).
 fn materialize_defaults(dir: &Path) -> Result<()> {
-    for sub in ["birds", "rooms", "handoffs", "reports"] {
+    for sub in ["birds", "rooms", "handoffs", "reports", "status", "inbox"] {
         std::fs::create_dir_all(dir.join(sub))
             .with_context(|| format!("cannot create {}", dir.join(sub).display()))?;
     }
@@ -576,24 +592,19 @@ fn materialize_defaults(dir: &Path) -> Result<()> {
         )?;
     }
 
-    // The flock skills ride `--plugin-dir`: every bird loads this plugin for
-    // its session, and the orchestrator skill passes it to the workers it
-    // spawns. Per-file and never overwriting, like mcp.json — a user's edits
-    // survive upgrades (`aviary doctor` notes when a copy differs).
+    // The plugin rides `--plugin-dir`: every bird loads it for its session,
+    // and the orchestrator skill passes it to the workers it spawns. Two
+    // ownerships live in it:
+    //   · the SKILLS are prose a user may tune — per-file, never overwriting
+    //     (`aviary doctor` notes when a copy differs);
+    //   · the MANIFEST and the MOD (hooks/ + types/) are aviary-owned —
+    //     rewritten whenever the shipped text differs, because the mod's
+    //     status-file schema must match the binary reading it. An unchanged
+    //     file is left alone: birds hot-reload the folder on every save.
     let plugin = dir.join("plugin");
-    let manifest_dir = plugin.join(".claude-plugin");
-    std::fs::create_dir_all(&manifest_dir)?;
-    let manifest = manifest_dir.join("plugin.json");
-    if !manifest.is_file() {
-        std::fs::write(
-            &manifest,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "name": "aviary",
-                "description": "aviary flock skills — orchestrate background worker sessions and report back",
-                "version": env!("CARGO_PKG_VERSION"),
-                "author": { "name": "aviary" },
-            }))? + "\n",
-        )?;
+    write_owned(&plugin.join(".claude-plugin").join("plugin.json"), &plugin_manifest_text())?;
+    for (rel, text) in MOD_FILES {
+        write_owned(&plugin.join(rel), text)?;
     }
     for (name, text) in SHIPPED_SKILLS {
         let skill_dir = plugin.join("skills").join(name);
@@ -607,10 +618,46 @@ fn materialize_defaults(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// An aviary-owned file: written when missing or different, untouched when
+/// equal (a rewrite would bump the mtime and make every bird reload).
+fn write_owned(path: &Path, text: &str) -> Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|cur| cur == text) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// The plugin manifest as materialized: the repo copy stamped with THIS
+/// binary's version, so an upgrade rewrites it.
+pub(crate) fn plugin_manifest_text() -> String {
+    let mut v: serde_json::Value =
+        serde_json::from_str(PLUGIN_MANIFEST).expect("the shipped manifest parses");
+    v["version"] = serde_json::Value::String(env!("CARGO_PKG_VERSION").into());
+    serde_json::to_string_pretty(&v).expect("the manifest serializes") + "\n"
+}
+
+/// The classic (settings) hook events every bird session runs `aviary --hook`
+/// on. `map_hook_event` in agent_store.rs maps each to a status kind.
+pub(crate) const HOOKED_EVENTS: [&str; 4] = ["Stop", "Notification", "PermissionRequest", "StopFailure"];
+
 /// `(skill name, shipped text)` — the plugin's `skills/<name>/SKILL.md` files.
 pub(crate) const SHIPPED_SKILLS: [(&str, &str); 2] = [
     ("flock-orchestrator", ORCHESTRATOR_SKILL),
     ("flock-worker", WORKER_SKILL),
+];
+
+/// The repo's plugin manifest (version patched at materialize time).
+const PLUGIN_MANIFEST: &str = include_str!("../assets/plugin/.claude-plugin/plugin.json");
+
+/// `(path under plugin/, shipped text)` — the mod: aviary-owned, rewritten
+/// when the shipped text differs (see `materialize_defaults`).
+pub(crate) const MOD_FILES: [(&str, &str); 3] = [
+    ("hooks/hooks.json", include_str!("../assets/plugin/hooks/hooks.json")),
+    ("hooks/register.ts", include_str!("../assets/plugin/hooks/register.ts")),
+    ("types/index.d.ts", include_str!("../assets/plugin/types/index.d.ts")),
 ];
 
 /// First run only: an empty roster. Birds are hatched from the cockpit (`n`)
@@ -769,14 +816,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest["name"], "aviary");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"), "stamped with this binary");
+        assert_eq!(manifest["types"], "./types/index.d.ts", "the mod's $.state contract");
         for (name, text) in SHIPPED_SKILLS {
             let path = tmp.path().join("plugin/skills").join(name).join("SKILL.md");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{name} ships verbatim");
             assert!(text.starts_with(&format!("---\nname: {name}\n")), "{name} frontmatter");
         }
+        // The mod: hooks module + its contract, plus the dirs it talks through.
+        for (rel, text) in MOD_FILES {
+            let path = tmp.path().join("plugin").join(rel);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{rel} ships verbatim");
+        }
+        let hooks: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("plugin/hooks/hooks.json")).unwrap())
+                .unwrap();
+        assert_eq!(hooks["modules"][0], "./register.ts");
+        assert!(tmp.path().join("status").is_dir());
+        assert!(tmp.path().join("inbox").is_dir());
+        assert_eq!(cfg.status_dir(), tmp.path().join("status"));
+        assert_eq!(cfg.inbox_dir(), tmp.path().join("inbox"));
         // Reload reads what scaffold wrote.
         let again = Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
         assert!(again.bots.is_empty());
+    }
+
+    #[test]
+    fn materialize_ships_the_mod_and_rewrites_it_when_stale() {
+        let (tmp, _cfg) = temp_config(&[]);
+        let module = tmp.path().join("plugin/hooks/register.ts");
+        let manifest = tmp.path().join("plugin/.claude-plugin/plugin.json");
+        // An older release's copy (or an edit): aviary owns these files.
+        std::fs::write(&module, "export const register = () => {}\n").unwrap();
+        std::fs::write(&manifest, "{\"name\":\"aviary\",\"version\":\"0.0.1\"}\n").unwrap();
+        std::fs::remove_file(tmp.path().join("plugin/types/index.d.ts")).unwrap();
+        Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(std::fs::read_to_string(&module).unwrap(), MOD_FILES[1].1, "the mod is repaired");
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), plugin_manifest_text());
+        assert!(tmp.path().join("plugin/types/index.d.ts").is_file());
+        // Unchanged files keep their mtime — a rewrite would reload every bird.
+        let before = std::fs::metadata(&module).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(std::fs::metadata(&module).unwrap().modified().unwrap(), before);
+        // The engine lays its API types beside a loaded plugin; they are not ours to touch.
+        let laid = tmp.path().join("plugin/.claude-plugin/types/claude-code/index.d.ts");
+        std::fs::create_dir_all(laid.parent().unwrap()).unwrap();
+        std::fs::write(&laid, "// engine").unwrap();
+        Config::load_or_scaffold(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(std::fs::read_to_string(&laid).unwrap(), "// engine");
     }
 
     #[test]
@@ -1033,6 +1121,12 @@ mod tests {
         assert!(path.ends_with("settings/swift.2.json"));
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("--hook --session aviary-swift.2"));
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for event in HOOKED_EVENTS {
+            assert!(json["hooks"][event].is_array(), "{event} is hooked");
+        }
+        assert!(HOOKED_EVENTS.contains(&"PermissionRequest"), "the instant needs-you floor");
+        assert!(HOOKED_EVENTS.contains(&"StopFailure"), "a turn that died is attention");
         // The primary keeps its historical filename.
         let primary = cfg
             .settings_file_for(&bot, &SessionKey::primary(bot.id.clone()))

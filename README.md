@@ -87,6 +87,16 @@ and gives the birds each other.
   (a `status:` line the cockpit reads), and message the bird back. Aviary
   never spawns a worker — it attributes them from `claude agents --json` by
   name, so an aviary restart simply rediscovers them.
+- **A mod rides along.** The same plugin folder carries a Claude Code hooks
+  module (`plugin/hooks/register.ts`, needs Claude Code ≥ 2.1.287) that runs
+  *inside* every bird and worker. It writes `~/.config/aviary/status/<sessionId>.json`
+  on every change — the cockpit shows `⏸ needs you` the moment a permission
+  dialog opens (and why: `permission · Bash · cargo test`), `✗ failed` when a
+  turn dies, and the context fill and cost in the thread title. It also
+  drains `inbox/<sessionId>/`: a room message, handoff, routine or webhook
+  for a bird that is already running is queued as a turn of its own instead
+  of being typed into its terminal. Aviary rewrites the mod on every startup;
+  below 2.1.287 it simply does not load and the classic hooks carry on.
 
 ## Install
 
@@ -171,8 +181,10 @@ the pane.
 ## Doctor, routines, webhooks
 
 - **`aviary doctor`** — one screen of ✓/✗: claude version, repos, config, MCP
-  hooks, the events pipeline, the flock plugin + `reports/`, and how many
-  workers the poll attributes right now. Run it whenever something feels off.
+  hooks, the events pipeline, the flock plugin + `reports/`, the mod (files
+  match, `status/` + `inbox/` writable, how many live sessions it is heard
+  from), and how many workers the poll attributes right now. Run it whenever
+  something feels off.
 - **Routines** — per-bird scheduled prompts in `config.json`
   (`{"id":"standup","schedule":"weekdays@09:00","prompt":"…"}`; grammar:
   `daily@HH:MM` · `weekdays@HH:MM` · `every:<N>m|h`). Fire while aviary runs,
@@ -210,5 +222,6 @@ Everything stateful lives outside this repo, in `~/.config/aviary/`:
 (MCP hooks) · `settings/*.json` (per-bird hook settings, regenerated at
 launch) · `events.jsonl` (hook events) · `rooms/*.md` (transcripts) ·
 `handoffs/` (briefs) · `permissions/` (allowlists) · `plugin/` (the flock
-skills, loaded via `--plugin-dir`) · `reports/` (worker report files) ·
-`state.json`.
+skills + the mod, loaded via `--plugin-dir`) · `reports/` (worker report
+files) · `status/` (the mod's per-session status files) · `inbox/` (prompts
+waiting for running sessions) · `state.json`.

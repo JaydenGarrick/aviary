@@ -60,6 +60,10 @@ pub struct SessionInfo {
     /// Finer than `status` on background rows: "working", "done", …
     #[serde(default)]
     pub state: String,
+    /// Why a `waiting` row waits, per the docs: "permission prompt" ·
+    /// "input needed" · "dialog open" · … Empty unless waiting.
+    #[serde(default, rename = "waitingFor")]
+    pub waiting_for: String,
     /// The short id (background rows only).
     #[serde(default)]
     pub id: String,
@@ -284,6 +288,17 @@ mod tests {
         assert_eq!(v[2].short_id(), None, "too short to be an id");
         assert_eq!(v[3].status_str(), "done", "state fills in for a missing status");
         assert_eq!(v[0].status_str(), "busy");
+    }
+
+    #[test]
+    fn session_info_reads_waiting_for() {
+        let json = r#"[
+          {"name":"aviary-swift","status":"waiting","waitingFor":"permission prompt","sessionId":"dc808c13-1c3e"},
+          {"name":"aviary-raven","status":"busy"}
+        ]"#;
+        let v: Vec<SessionInfo> = serde_json::from_str(json).unwrap();
+        assert_eq!(v[0].waiting_for, "permission prompt");
+        assert_eq!(v[1].waiting_for, "", "absent reads as empty, never a guess");
     }
 
     #[test]

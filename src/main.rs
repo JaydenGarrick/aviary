@@ -19,12 +19,15 @@ mod flock;
 mod http;
 mod keymap;
 mod markdown;
+mod mod_layer;
 mod overlays;
 mod prompts;
 mod pty;
 mod room;
 mod routine;
 mod shared;
+mod status;
+mod status_file;
 mod ui;
 mod widgets;
 

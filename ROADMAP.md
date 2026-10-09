@@ -7,6 +7,18 @@ observed first-run friction in real use.
 
 ## Tier 1 — real signals (highest value, unblocks everything else)
 
+> Shipped (2026-10-09): items 1–3 below, plus a step past them — the **aviary
+> mod** (`assets/plugin/hooks/register.ts`), a Claude Code hooks module
+> (≥ 2.1.287) riding the existing `--plugin-dir` into every bird and worker.
+> It writes `status/<sessionId>.json` on every change (instant `⏸ needs you`
+> with the reason, `✗ failed`, context % and cost) and drains
+> `inbox/<sessionId>/` with `$.prompt.submit`, so prompts for running birds
+> are queued turns, not keystrokes. The classic hooks below stay as the floor
+> (`PermissionRequest` + `StopFailure` added). Still open from the same
+> survey: `$.agent.list()` rows for Agent-tool/Workflow fan-out under a bird,
+> a `post_room` tool via `$.tool.register`, a live persona via
+> `prompt.compose`, and mirroring worker `session.receive` messages.
+
 1. **Authoritative status from `claude agents --json`.** The agent view lists
    sessions with `Needs input / Working / Completed` states and supports
    `attach <id>` / `stop <id>`. Poll it from the Command executor (~2s) and map

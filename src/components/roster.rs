@@ -569,15 +569,26 @@ impl Component for Roster {
                                 title.push(Span::styled(" ●", Style::default().fg(ACCENT)));
                             }
 
-                            // Body: collab tag, then last prompt or branch.
+                            // Body: collab tag, then WHY it is blocked, else
+                            // the last prompt or branch.
                             let collab = s.agents.collab(&bot.id).map(|c| c.tag());
                             let tag_w = collab.as_ref().map_or(0, |t| t.chars().count() + 1);
+                            let reporting = s.agents.reporting_key(&bot.id);
                             let preview = s
                                 .agents
-                                .get(&crate::config::SessionKey::primary(bot.id.clone()))
-                                .and_then(|sess| sess.last_prompt.clone())
-                                .map(|p| {
-                                    format!("“{}”", truncate(&p, name_w.saturating_sub(tag_w)))
+                                .detail(&reporting)
+                                .reason
+                                .map(|r| truncate(&r, name_w.saturating_sub(tag_w)))
+                                .or_else(|| {
+                                    s.agents
+                                        .get(&crate::config::SessionKey::primary(bot.id.clone()))
+                                        .and_then(|sess| sess.last_prompt.clone())
+                                        .map(|p| {
+                                            format!(
+                                                "“{}”",
+                                                truncate(&p, name_w.saturating_sub(tag_w))
+                                            )
+                                        })
                                 })
                                 .or_else(|| {
                                     s.branches.data.as_ref().and_then(|v| {

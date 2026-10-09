@@ -202,7 +202,7 @@ impl App {
                     if bot.notify {
                         self.executor.run(crate::command::Command::Notify {
                             title: format!("{} {} needs you", bot.glyph, bot.name),
-                            body: "blocked on a permission prompt or question".into(),
+                            body: self.shared.agents.attention_text(&t.key),
                         });
                     }
                 }
@@ -358,6 +358,21 @@ impl App {
             }
         }
 
+        // The mod's status files: the truest word on birds and workers alike
+        // (read on change; joined by the session id the poll named).
+        let (bt, wt) = self.shared.agents.apply_status_files();
+        if !bt.is_empty() {
+            self.react(bt);
+        }
+        if !wt.is_empty() {
+            self.react_workers(wt);
+        }
+        // The inbox: a session whose mod is not alive gets one prompt typed
+        // per tick (a live mod drains its own).
+        self.shared.agents.sweep_inbox();
+        if self.ticks % 60 == 0 {
+            self.shared.agents.gc();
+        }
         // Worker reports: a `status:` line refines idle into done /
         // needs-input / failed / paused (stat per worker; read on change).
         let wt = self

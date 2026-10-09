@@ -12,8 +12,11 @@ context and character; aviary spawns, names, displays, and connects them.
        │     status chips + unread     ┌─────────────────────────────┐
        └── content pane ───────────────│ bird PTY  or  room transcript│
                                        └─────────────────────────────┘
- signals:  claude agents --json (3s poll)  +  Stop/Notification hooks
+ signals:  the mod inside each session → status/<sessionId>.json (on change + 5s beat)
+           claude agents --json (3s poll)  +  classic hooks as the floor
            (per-session via --settings → aviary --hook → events.jsonl)
+ prompts into a RUNNING bird: inbox/<sessionId>/*.md → the mod's $.prompt.submit
+           (typed into the PTY only when the mod is not heard from)
  birds ↔ birds:  native SendMessage (session names) + handoff briefs
  rooms:  append-only markdown transcripts, mention-driven dispatch
  workers: a bird's own `claude --bg` sessions (aviary-<bird>_<slug>-<role>),
@@ -36,6 +39,12 @@ context and character; aviary spawns, names, displays, and connects them.
    and spawns Sonnet workers as background worktree sessions. They show as
    rows under the bird; `⏎` attaches a viewer tab, `x` stops one. Needs
    Claude Code ≥ 2.1.289.
+6. **The mod**: the same plugin carries `hooks/register.ts`, a Claude Code
+   hooks module that runs inside every bird and worker (≥ 2.1.287). It is
+   the source of instant `⏸ needs you` (with the reason), `✗ failed`, the
+   `ctx 72% · $1.40` title figures, and the inbox. Edit it in
+   `assets/plugin/hooks/register.ts`; `claude plugin validate --strict
+   assets/plugin` checks it; aviary rewrites the installed copy on startup.
 
 ## The three load-bearing ideas
 
@@ -44,9 +53,11 @@ context and character; aviary spawns, names, displays, and connects them.
 - **The filesystem is the IPC.** Rooms, handoffs, hook events, config, state —
   all files under `~/.config/aviary/`, tick-polled. Crash-proof, inspectable,
   no sockets (except the opt-in webhook listener).
-- **Status is layered truth**: fresh PTY output → working; poll/hook
-  observation → busy/done/**needs-input** (the state a terminal can't show);
-  recency heuristic as fallback. Transitions drive unread dots + banners.
+- **Status is layered truth**: the mod's status file while its heartbeat is
+  fresh (it saw the turn start, the dialog open, the turn die); then fresh
+  PTY output → working; poll/hook observation → busy/done/**needs-input**
+  (the state a terminal can't show); recency heuristic as fallback.
+  Transitions drive unread dots + banners.
 
 ## Where things live
 
@@ -55,7 +66,8 @@ context and character; aviary spawns, names, displays, and connects them.
 | Shell: layered key dispatch, msg fan-out | `src/app.rs` (keep it thin) |
 | Screens (state + input + draw + hit rects) | `src/components/{roster,thread,room}.rs` |
 | Birds: spawn/resume/status/collab | `src/agent_store.rs` |
-| Workers: name grammar, poll attribution, report precedence | `src/flock.rs` (pure, tested) · skills in `assets/skills/` |
+| Workers: name grammar, poll attribution, report precedence | `src/flock.rs` (pure, tested) · skills in `assets/plugin/skills/` |
+| The mod's files: status parse/scan, inbox post/sweep, gc | `src/status_file.rs` (pure, tested) · the mod in `assets/plugin/hooks/register.ts` |
 | Embedded terminal (PTY + vt100) | `src/pty.rs` |
 | Keymaps → dispatch + hints + help (one source) | `src/keymap.rs` |
 | Pure, tested logic | `src/{room,prompts,routine,events,http}.rs` |
@@ -67,9 +79,11 @@ test-guarded.
 
 ## Verify your changes
 
-`cargo test` (92 unit tests) · `cargo clippy --all-targets` must stay at zero
-· `aviary doctor` green · then the manual smoke: wake a bird, block it on a
-permission prompt, watch `⏸ needs you` + the banner arrive.
+`cargo test` (113 unit tests) · `cargo clippy --all-targets` must stay at zero
+· `claude plugin validate --strict assets/plugin` + `claude plugin test
+assets/plugin` for the mod · `aviary doctor` green · then the manual smoke:
+wake a bird, block it on a permission prompt, watch `⏸ needs you` (with the
+tool named under the bird) + the banner arrive within a second.
 
 ## Git & publishing
 

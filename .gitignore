@@ -1,3 +1,5 @@
 /target
 # claude --worktree lands here when run from this repo
 .claude/worktrees/
+# the engine lays the mod API types beside a loaded plugin
+assets/plugin/.claude-plugin/types/

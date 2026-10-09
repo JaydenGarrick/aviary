@@ -10,16 +10,22 @@ use crate::config::{self, Config};
 const MIN_CLAUDE: (u32, u32, u32) = (2, 1, 224); // --name/--resume + messaging
 /// Flock workers: `--bg` · `attach` · `stop` · `rm` · `--plugin-dir`, verified here.
 const FLOCK_CLAUDE: (u32, u32, u32) = (2, 1, 289);
+/// Mods (a plugin's hooks module) shipped in 2.1.287; the status file and
+/// inbox need one. Below it the mod does not load and the classic hooks
+/// stay the whole truth.
+const MOD_CLAUDE: (u32, u32, u32) = (2, 1, 287);
 
 pub fn run() -> Result<()> {
     println!("aviary doctor\n");
 
     // claude version
     let mut flock_ok = false;
+    let mut mod_ok = false;
     match claude_version() {
         Some((v, n)) => {
             row(n >= MIN_CLAUDE, &format!("claude {v} (need ≥ 2.1.224 for named sessions + messaging)"));
             flock_ok = n >= FLOCK_CLAUDE;
+            mod_ok = n >= MOD_CLAUDE;
         }
         None => row(false, "claude not found on PATH"),
     }
@@ -27,6 +33,11 @@ pub fn run() -> Result<()> {
     // config + scaffold
     let dir = config::default_dir()?;
     println!("  · config dir {}", dir.display());
+    // Compared BEFORE loading: the load below rewrites any mod file that
+    // differs, so a check after it could never fail.
+    let same = |path: std::path::PathBuf, text: &str| std::fs::read_to_string(path).is_ok_and(|cur| cur == text);
+    let mod_files_ok = config::MOD_FILES.iter().all(|(rel, text)| same(dir.join("plugin").join(rel), text))
+        && same(dir.join("plugin/.claude-plugin/plugin.json"), &config::plugin_manifest_text());
     let cfg = match Config::load_or_scaffold(dir.clone()) {
         Ok(c) => {
             row(true, &format!("config.json parses — {} birds, {} rooms", c.bots.len(), c.rooms.len()));
@@ -89,11 +100,34 @@ pub fn run() -> Result<()> {
         for n in notes {
             println!("      · {n}");
         }
-        let reports = cfg.reports_dir();
-        let probe = reports.join(".doctor-probe");
-        let writable = std::fs::create_dir_all(&reports).is_ok() && std::fs::write(&probe, "ok").is_ok();
-        let _ = std::fs::remove_file(&probe);
-        row(writable, &format!("reports/ writable — workers drop <name>.md here ({})", reports.display()));
+        // The mod: aviary-owned files in the same plugin (compared before
+        // the load repaired them), the dirs it talks through, and whether
+        // live sessions are heard from.
+        row(mod_ok, "claude ≥ 2.1.287 for the aviary mod (instant needs-you · ctx % · cost · the inbox; below it the classic hooks are the whole truth)");
+        row(mod_files_ok, "mod files matched the shipped copy (manifest · plugin/hooks · plugin/types — rewritten just now if not)");
+        for (sub, label, what) in [
+            (cfg.reports_dir(), "reports", "workers drop <name>.md here"),
+            (cfg.status_dir(), "status", "the mod writes <sessionId>.json here"),
+            (cfg.inbox_dir(), "inbox", "prompts for running sessions wait here"),
+        ] {
+            let probe = sub.join(".doctor-probe");
+            let writable = std::fs::create_dir_all(&sub).is_ok() && std::fs::write(&probe, "ok").is_ok();
+            let _ = std::fs::remove_file(&probe);
+            row(writable, &format!("{label}/ writable — {what}"));
+        }
+        // Session ids with a fresh heartbeat — joined to OUR poll rows below,
+        // so a foreign session that loaded the plugin never counts.
+        let now_ms = crate::status_file::now_ms();
+        let alive_ids: std::collections::HashSet<String> = std::fs::read_dir(cfg.status_dir())
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                    .filter_map(|t| crate::status_file::ModStatus::parse(&t))
+                    .filter(|s| s.is_alive(now_ms))
+                    .map(|s| s.session_id)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Hooks: per-session via --settings (verified working on this machine);
         // the settings files regenerate at every launch with the current exe.
@@ -134,6 +168,22 @@ pub fn run() -> Result<()> {
                     "claude agents --json reachable — {} sessions, {workers} flock workers attributed",
                     rows.len()
                 ));
+                // Aviary's own sessions (birds, tabs, workers) vs the mods heard from.
+                let ours: Vec<&crate::command::SessionInfo> = rows
+                    .iter()
+                    .filter(|r| {
+                        crate::config::SessionKey::parse_session_name(&r.name)
+                            .is_some_and(|k| cfg.bot(&k.bot).is_some())
+                            || crate::flock::WorkerName::parse(&r.name)
+                                .is_some_and(|w| cfg.bot(&w.bot).is_some())
+                    })
+                    .collect();
+                let alive = ours.iter().filter(|r| alive_ids.contains(&r.session_id)).count();
+                let ours = ours.len();
+                row(
+                    ours == 0 || alive > 0,
+                    &format!("mod alive in {alive} of {ours} aviary sessions (a status file heartbeated within 15 s)"),
+                );
             }
             None => row(false, "claude agents --json reachable (authoritative busy/idle/needs_input)"),
         }

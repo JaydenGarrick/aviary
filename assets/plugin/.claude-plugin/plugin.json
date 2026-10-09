@@ -1,0 +1,9 @@
+{
+  "name": "aviary",
+  "description": "aviary — the flock skills (orchestrate background workers and report back) and the mod that tells the cockpit what each session is doing",
+  "version": "0.3.1",
+  "author": {
+    "name": "aviary"
+  },
+  "types": "./types/index.d.ts"
+}

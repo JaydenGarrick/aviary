@@ -34,14 +34,17 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Spawn `program` on a PTY of the given size, in `cwd`. The reader thread
-    /// pings the UI channel with the owning session's key after every chunk,
-    /// so the roster knows WHO spoke without polling.
+    /// Spawn `program` on a PTY of the given size, in `cwd`, with `env` set
+    /// over the inherited environment. The reader thread pings the UI channel
+    /// with the owning session's key after every chunk, so the roster knows
+    /// WHO spoke without polling.
+    #[allow(clippy::too_many_arguments)] // a spawn: every part of the child is its own argument
     pub fn spawn(
         key: SessionKey,
         program: &str,
         args: &[String],
         cwd: &std::path::Path,
+        env: &[(&str, String)],
         rows: u16,
         cols: u16,
         notify: Sender<Event>,
@@ -65,6 +68,11 @@ impl Terminal {
         // Claim a colour-capable terminal so the child does not fall back to
         // its monochrome rendering path.
         cmd.env("TERM", "xterm-256color");
+        // The caller's own variables (the config dir for the in-session mod);
+        // children the child spawns — flock workers — inherit them too.
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
 
         let running = Arc::new(AtomicBool::new(true));
 
