@@ -57,6 +57,8 @@ pub enum FormEvent {
     OpenPersona(BotId),
     /// Profile shortcut for a fresh conversation (closes the overlay).
     FreshStart(BotId),
+    /// Point a bird's tab 1 at one of its conversations (the tab menu).
+    PickConversation(crate::config::ConvKey),
     /// The confirm dialog said yes.
     Confirmed(crate::action::ConfirmTarget),
     /// A worker-row menu pick: open a viewer tab on the worker.
@@ -504,10 +506,10 @@ impl NewRoomForm {
         lines.extend(error_lines(&self.error));
         lines.push(Line::from(""));
         lines.push(Line::from(dim(
-            "  members start a fresh conversation on the room's first message",
+            "  each bird gets its own room conversation — home is untouched",
         )));
         lines.push(Line::from(dim(
-            "  — a working bird is interrupted · space drops one from the room",
+            "  — a busy bird joins when idle · space drops one from the room",
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -880,10 +882,18 @@ impl ContextMenu {
 
 // -------------------------------------------------------------------- tab menu
 
+/// What a tab-menu row does: a thread-pane Action on the current tab, or —
+/// tab 1 only — switching the bird to one of its conversations.
+#[derive(Clone)]
+enum TabPick {
+    Act(crate::action::Action),
+    Conv(crate::config::ConvKey),
+}
+
 /// Right-click menu for a session tab. The click already selected the tab, so
-/// every pick is just a thread-pane Action on the current tab.
+/// every pick is a thread-pane Action on the current tab, or a conversation.
 pub struct TabMenu {
-    items: Vec<(&'static str, crate::action::Action)>,
+    items: Vec<(String, TabPick)>,
     cursor: usize,
     anchor: (u16, u16),
     popup: Rect,
@@ -892,22 +902,39 @@ pub struct TabMenu {
 
 impl TabMenu {
     /// `attached`: the tab is a viewer on a worker — it can only be closed
-    /// (the worker keeps running) or sided with a new tab.
-    pub fn new(tab: u8, attached: bool, x: u16, y: u16) -> TabMenu {
+    /// (the worker keeps running) or sided with a new tab. `convs`: tab 1's
+    /// conversations with the one it runs marked — offered first when the
+    /// bird has more than one (home + a room's).
+    pub fn new(
+        tab: u8,
+        attached: bool,
+        convs: &[(crate::config::ConvKey, bool)],
+        x: u16,
+        y: u16,
+    ) -> TabMenu {
         use crate::action::Action;
-        let mut items = if attached {
-            vec![("new tab beside it", Action::NewTab)]
-        } else {
-            vec![
-                ("name the tab", Action::RenameTab),
-                ("fresh conversation here", Action::FreshTab),
-                ("new tab beside it", Action::NewTab),
-            ]
-        };
+        let act = |label: &str, a: Action| (label.to_string(), TabPick::Act(a));
+        let mut items = Vec::new();
+        if tab == 1 && !attached && convs.len() > 1 {
+            for (conv, on) in convs {
+                let label = match on {
+                    true => format!("● {} — running here", conv.label()),
+                    false => format!("→ switch to {}", conv.label()),
+                };
+                items.push((label, TabPick::Conv(conv.clone())));
+            }
+        }
         if attached {
-            items.push(("close the tab — the worker keeps running", Action::CloseTab));
+            items.push(act("new tab beside it", Action::NewTab));
+        } else {
+            items.push(act("name the tab", Action::RenameTab));
+            items.push(act("fresh conversation here", Action::FreshTab));
+            items.push(act("new tab beside it", Action::NewTab));
+        }
+        if attached {
+            items.push(act("close the tab — the worker keeps running", Action::CloseTab));
         } else if tab != 1 {
-            items.push(("close the tab", Action::CloseTab));
+            items.push(act("close the tab", Action::CloseTab));
         }
         TabMenu {
             items,
@@ -929,7 +956,7 @@ impl TabMenu {
                 self.cursor = (self.cursor + self.items.len() - 1) % self.items.len();
                 FormEvent::Consumed
             }
-            KeyCode::Enter => FormEvent::Tab(self.items[self.cursor].1),
+            KeyCode::Enter => self.pick(self.cursor),
             _ => FormEvent::Consumed,
         }
     }
@@ -949,9 +976,16 @@ impl TabMenu {
             return FormEvent::Cancel;
         };
         if let Some(i) = self.item_rects.iter().position(|r| hits(*r, x, y)) {
-            return FormEvent::Tab(self.items[i].1);
+            return self.pick(i);
         }
         FormEvent::Consumed
+    }
+
+    fn pick(&self, i: usize) -> FormEvent {
+        match &self.items[i].1 {
+            TabPick::Act(a) => FormEvent::Tab(*a),
+            TabPick::Conv(c) => FormEvent::PickConversation(c.clone()),
+        }
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -988,7 +1022,7 @@ impl TabMenu {
                     width: inner.width,
                     height: 1,
                 });
-                let destructive = matches!(act, crate::action::Action::CloseTab);
+                let destructive = matches!(act, TabPick::Act(crate::action::Action::CloseTab));
                 let style = if i == self.cursor {
                     Style::default()
                         .fg(if destructive { BAD } else { ACCENT })
@@ -1154,17 +1188,17 @@ impl ProfileView {
             Line::from(vec![
                 muted("  session   "),
                 Span::raw(self.id.session_name()),
-                // The profile is about the bird = its PRIMARY session; tabs
-                // live in the thread pane's strip.
-                dim(
-                    if s.agents.has_session_record(&crate::config::SessionKey::primary(
-                        self.id.clone(),
-                    )) {
-                        "  (resumes with full memory)"
+                // The profile is about the bird = its PRIMARY session (and
+                // the conversation it runs); tabs live in the thread strip.
+                dim({
+                    let primary = crate::config::SessionKey::primary(self.id.clone());
+                    let on = s.agents.conv_of(&primary).label();
+                    if s.agents.has_session_record(&primary) {
+                        format!("  (on {on} · resumes with full memory)")
                     } else {
-                        "  (never flown)"
-                    },
-                ),
+                        format!("  (on {on} · never flown)")
+                    }
+                }),
             ]),
             Line::from(""),
         ];

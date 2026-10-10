@@ -12,9 +12,9 @@ use serde::Deserialize;
 /// One hook payload line (tolerant: extra fields ignored, missing default).
 #[derive(Deserialize, Default)]
 pub struct HookEvent {
-    /// Claude's own uuid; kept for debugging the events file.
+    /// Claude's own uuid — the CONVERSATION. Resolved first: a late hook
+    /// from a conversation its slot no longer runs is dropped.
     #[serde(default)]
-    #[allow(dead_code)]
     pub session_id: String,
     /// Our session name, injected by `aviary --hook --session <name>` — the
     /// only attribution that can tell a bird's tabs apart (they share a cwd).

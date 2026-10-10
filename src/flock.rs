@@ -387,6 +387,14 @@ impl Workers {
         v
     }
 
+    /// Does this bird have a worker out (working or blocked)? Its reports
+    /// address the conversation that spawned it.
+    pub fn busy(&self, bot: &BotId) -> bool {
+        self.by_name.values().any(|w| {
+            w.name.bot == *bot && matches!(derive(w), BotStatus::Working | BotStatus::NeedsInput)
+        })
+    }
+
     pub fn has_working(&self) -> bool {
         self.by_name
             .values()

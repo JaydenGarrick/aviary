@@ -167,7 +167,7 @@ use Action as A;
 
 /// Bindings live everywhere a component table doesn't shadow them.
 pub static GLOBAL: &[Binding] = &[
-    bind(ch('q'), A::Quit, None, "quit aviary (birds keep flying — sessions resume by name)"),
+    bind(ch('q'), A::Quit, None, "quit aviary (birds keep flying — their conversations resume where they left off)"),
     bind(ch('?'), A::Help, Some("keys"), "help overlay"),
     bind(ch('n'), A::NewBot, None, "hatch a bird (new repo bot)"),
     // `c`, not `g` — the sidebar's g (jump to top) would shadow it.

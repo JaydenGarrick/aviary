@@ -19,7 +19,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::action::{Action, Effects};
-use crate::agent_store::Collab;
+use crate::agent_store::{Collab, Signaled};
 use crate::clipboard;
 use crate::components::{hits, Component};
 use crate::config::{BotId, Room};
@@ -140,15 +140,23 @@ impl RoomView {
 
         let targets = room::dispatch_targets(&room, &s.config.user_name, &text);
         let count = targets.len();
+        let mut queued = 0;
         for target in targets {
             let prompt = room::notify_prompt(&room, &s.config.user_name, &s.config.dir, &anchor);
-            s.boot_bot(&target, Some(&prompt));
-            s.agents.set_collab(&target, Collab::Room(room.id.clone()));
+            match s.signal(&target, Some(&room.id), Some(&prompt)) {
+                Some(Signaled::Queued) => queued += 1,
+                Some(_) => s.agents.set_collab(&target, Collab::Room(room.id.clone())),
+                None => {}
+            }
         }
-        fx.flash(match count {
+        let woke = match count {
             0 => "sent — no birds to wake".to_string(),
             1 => "sent — woke 1 bird".to_string(),
             n => format!("sent — woke {n} birds"),
+        };
+        fx.flash(match queued {
+            0 => woke,
+            n => format!("{woke} · {n} on another conversation — they join when idle"),
         });
         self.reload(s);
         self.scroll_up = 0;

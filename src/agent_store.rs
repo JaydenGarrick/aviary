@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 
 use crate::command::SessionInfo;
-use crate::config::{Bot, BotId, Config, SessionKey, State};
+use crate::config::{Bot, BotId, Config, ConvKey, SessionKey, State};
 use crate::event::Event;
 use crate::flock::WorkerTransition;
 use crate::pty;
@@ -46,8 +46,17 @@ pub struct AgentSession {
     /// The last prompt aviary itself typed — the sidebar's activity line.
     pub last_prompt: Option<String>,
     pub spawned_at: Instant,
-    /// Launched via `--resume`: if it dies within seconds, the named session
-    /// is gone and the next launch must be fresh.
+    /// The conversation this PTY runs, and the claude session id pinned for
+    /// it (`None` only for a v0.3.1 record resumed by name, until the poll
+    /// names it).
+    pub conv: ConvKey,
+    sid: Option<String>,
+    /// The prompt that rode argv — re-sent if this launch dies on arrival.
+    argv_prompt: Option<String>,
+    /// When aviary last TYPED a prompt here — a switch never lands on it.
+    typed_at: Option<Instant>,
+    /// Launched via `--resume`: if it dies within seconds, the session is
+    /// gone and the next launch must be fresh.
     resumed: bool,
     /// Fresh spawn not yet recorded in state — recorded only once the session
     /// SURVIVES [`MARK_AFTER`]. Marking at launch time was a trap: a spawn
@@ -106,6 +115,14 @@ const RESUME_FAIL_WINDOW: Duration = Duration::from_secs(4);
 const MARK_AFTER: Duration = Duration::from_secs(10);
 /// A collaboration tag older than this is stale and stops showing.
 const COLLAB_TTL: Duration = Duration::from_secs(10 * 60);
+/// Tab 1 switches conversation only once it has been Done this long (secs)
+/// — and nothing was typed into it this recently.
+const SWITCH_DWELL: u64 = 5;
+/// …and the person has not typed into it for this long.
+const HUMAN_QUIET: Duration = Duration::from_secs(30);
+/// A conversation the person picked holds tab 1 until a turn runs in it, or
+/// this long at most — a queued prompt elsewhere must not starve forever.
+const PIN_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// Who a bird is working WITH right now, as far as aviary brokered it.
 #[derive(Clone)]
@@ -144,6 +161,15 @@ pub struct AgentStore {
     unread: HashMap<BotId, bool>,
     collab: HashMap<BotId, (Collab, Instant)>,
     state: State,
+    /// A switch asked for outright, per bird: (conversation, by the person?).
+    want: HashMap<BotId, (ConvKey, bool)>,
+    /// Prompts for a not-running v0.3.1 conversation with no id to queue
+    /// under, oldest first, each with an inbox-style stamp for ordering.
+    held: HashMap<ConvKey, std::collections::VecDeque<(String, String)>>,
+    /// When the person last typed into each PTY.
+    human_input: HashMap<SessionKey, Instant>,
+    /// Birds whose tab 1 the person pointed at a conversation, and when.
+    pinned: HashMap<BotId, Instant>,
     /// The birds' workers — bird-spawned `claude --bg` sessions, attributed
     /// from the poll by name, never spawned here.
     pub workers: crate::flock::Workers,
@@ -160,6 +186,10 @@ impl AgentStore {
             unread: HashMap::new(),
             collab: HashMap::new(),
             state: State::load(&cfg.dir),
+            want: HashMap::new(),
+            held: HashMap::new(),
+            human_input: HashMap::new(),
+            pinned: HashMap::new(),
             workers: crate::flock::Workers::default(),
         }
     }
@@ -213,9 +243,20 @@ impl AgentStore {
             .count()
     }
 
-    /// Has this session EVER existed (drives resume vs the first-flight prompt)?
+    /// Has the conversation this slot runs EVER existed (drives resume vs
+    /// the first-flight prompt)?
     pub fn has_session_record(&self, key: &SessionKey) -> bool {
-        self.state.spawned_once(&key.state_key())
+        self.state.created(&self.conv_of(key))
+    }
+
+    /// The conversation a slot runs: the live one, else — tab 1 — the
+    /// bird's active conversation, or the tab's own.
+    pub fn conv_of(&self, key: &SessionKey) -> ConvKey {
+        match self.sessions.get(key) {
+            Some(s) => s.conv.clone(),
+            None if key.tab == 1 => self.state.active_conv(&key.bot),
+            None => ConvKey::home(key.clone()),
+        }
     }
 
     /// The tab's human label, if the user set one (display only).
@@ -224,12 +265,22 @@ impl AgentStore {
     }
 
     /// The strip's label: a viewer tab names its worker, a bird tab carries
-    /// the user's label.
+    /// the user's label — and tab 1, once the bird has room conversations,
+    /// names the one it runs (`home` / `#nest`) unless the user labelled it.
     pub fn tab_label(&self, key: &SessionKey) -> Option<String> {
         match self.sessions.get(key).map(|s| &s.kind) {
             Some(SessionKind::Attached { label, .. }) => Some(label.clone()),
-            _ => self.tab_name(key).map(str::to_string),
+            _ => self.tab_name(key).map(str::to_string).or_else(|| {
+                let conv = self.conv_of(key);
+                (key.tab == 1 && (conv.room.is_some() || !self.state.room_convs(&key.bot).is_empty()))
+                    .then(|| conv.label())
+            }),
         }
+    }
+
+    /// The room tab 1 runs, when it is not home — the roster card's tag.
+    pub fn active_room(&self, id: &BotId) -> Option<String> {
+        self.conv_of(&SessionKey::primary(id.clone())).room
     }
 
     pub fn is_attached(&self, key: &SessionKey) -> bool {
@@ -395,6 +446,7 @@ impl AgentStore {
         for (key, text) in due {
             if let Some(session) = self.sessions.get_mut(&key) {
                 session.term.send_line(&text);
+                session.typed_at = Some(Instant::now());
                 session.last_prompt = Some(text);
             }
         }
@@ -415,12 +467,18 @@ impl AgentStore {
     /// Sweep status files and inbox folders nobody holds any more (once a
     /// minute from the shell).
     pub fn gc(&mut self) {
-        self.signals.gc(self.workers.session_ids());
+        // Every conversation on record keeps its queue — one that is not
+        // running now drains when it next resumes.
+        let held: Vec<String> = self.state.all_sids().map(str::to_string).collect();
+        self.signals.gc(self.workers.session_ids().into_iter().chain(held));
     }
 
     /// Record an observation; returns the transition if the kind changed.
     fn observe(&mut self, key: &SessionKey, kind: StatusKind) -> Option<Transition> {
         self.observed.insert(key.clone(), (kind, Instant::now()));
+        if kind == StatusKind::Working && key.tab == 1 {
+            self.pinned.remove(&key.bot); // a turn ran in the picked conversation
+        }
         match self.kind_since.get(key) {
             Some((prev, _)) if *prev == kind => None,
             prev => {
@@ -456,12 +514,30 @@ impl AgentStore {
     }
 
     /// Fold one `claude agents --json` poll in; returns status transitions.
-    /// Also records each live key's session id (the mod's join key) and
-    /// `waitingFor`.
-    pub fn apply_poll(&mut self, sessions: &[SessionInfo]) -> Vec<Transition> {
+    /// Rows join live keys by PINNED id (see [`poll_matches`]); records the
+    /// id (the mod's join key) and `waitingFor`.
+    pub fn apply_poll(&mut self, cfg: &Config, sessions: &[SessionInfo]) -> Vec<Transition> {
         let mut out = Vec::new();
-        for (key, row) in poll_matches(&self.live_keys(), sessions) {
+        let live: Vec<(SessionKey, Option<String>)> = self
+            .live_keys()
+            .into_iter()
+            .map(|k| {
+                let sid = self.sessions.get(&k).and_then(|s| s.sid.clone());
+                (k, sid)
+            })
+            .collect();
+        let known: std::collections::HashSet<&str> = self.state.all_sids().collect();
+        let matched: Vec<(SessionKey, &SessionInfo)> = poll_matches(&live, &known, sessions);
+        for (key, row) in matched {
             let kind = self.signals.note_poll(&key, row);
+            // A by-name resume learning its id, or a `/clear` in the PTY:
+            // the conversation's record follows the session.
+            if let Some(session) = self.sessions.get_mut(&key) {
+                if !row.session_id.is_empty() && session.sid.as_deref() != Some(&row.session_id) {
+                    session.sid = Some(row.session_id.clone());
+                    self.state.set_sid(&cfg.dir, &session.conv, &row.session_id);
+                }
+            }
             // The mod saw the turn start before the poll can: while it is
             // alive the (laggier) poll must not flap the kind — it speaks only
             // through `reconcile`, inside `mod_for`.
@@ -499,6 +575,7 @@ impl AgentStore {
         self.last_output.retain(|k, _| !gone(k));
         self.observed.retain(|k, _| !gone(k));
         self.kind_since.retain(|k, _| !gone(k));
+        self.human_input.retain(|k, _| !gone(k));
         self.signals.forget_where(gone);
     }
 
@@ -506,29 +583,48 @@ impl AgentStore {
     /// (`aviary_session`, injected by `aviary --hook --session <name>`) and
     /// resolves to that exact key; an old or foreign payload falls back to
     /// cwd matching, which can only mean the PRIMARY — tabs share the repo.
+    #[allow(clippy::too_many_arguments)] // one hook payload, field by field
     pub fn apply_hook(
         &mut self,
         cfg: &Config,
+        session_id: &str,
         aviary_session: Option<&str>,
         cwd: &str,
         event_name: &str,
         detail: &str,
     ) -> Option<Transition> {
         let kind = map_hook_event(event_name, detail)?;
+        // By id first: a hook names the CONVERSATION, and a late one from a
+        // conversation this slot no longer runs must not badge its successor.
+        if !session_id.is_empty() {
+            let live = self.sessions.iter().find(|(_, s)| s.sid.as_deref() == Some(session_id));
+            if let Some((key, _)) = live {
+                let key = key.clone();
+                return self.note_hook_kind(&key, kind);
+            }
+            if self.state.all_sids().any(|s| s == session_id) {
+                return None;
+            }
+        }
         let key = resolve_hook_key(&cfg.bots, &self.live_keys(), cwd, aviary_session)?;
-        if self.mod_alive(&key) {
+        self.note_hook_kind(&key, kind)
+    }
+
+    fn note_hook_kind(&mut self, key: &SessionKey, kind: StatusKind) -> Option<Transition> {
+        if self.mod_alive(key) {
             return None; // the mod already said so, sooner and finer
         }
-        self.signals.note_hook(&key, kind);
-        self.observe(&key, kind)
+        self.signals.note_hook(key, kind);
+        self.observe(key, kind)
     }
 
     // ------------------------------------------------------------ lifecycle
 
     /// Make sure ONE session of the bot is live, spawning or resuming as
     /// needed. `prompt`: rides argv on a launch, typed into a running session.
-    /// External signals only ever arrive with tab 1 (via `Shared::boot_bot`);
-    /// extra tabs are human-driven only.
+    /// Runs the slot's CURRENT conversation (tab 1: the active one) — the
+    /// human wake. External signals arrive via [`AgentStore::signal`], tab 1
+    /// only; extra tabs are human-driven only.
     pub fn ensure_running_key(
         &mut self,
         cfg: &Config,
@@ -557,6 +653,7 @@ impl AgentStore {
                         // send_line, never a trailing \r in the same burst —
                         // the child's paste detection would swallow the submit.
                         session.term.send_line(p);
+                        session.typed_at = Some(Instant::now());
                     }
                     session.last_prompt = Some(p.to_string());
                 }
@@ -573,19 +670,50 @@ impl AgentStore {
             // inbox nobody drains; the poll re-names the new one.
             self.forget_observations(&key);
         }
-        let resume = self.state.spawned_once(&key.state_key());
-        self.launch(cfg, bot, &key, prompt, tx, resume)
+        let conv = self.conv_of(&key);
+        self.launch_conv(cfg, bot, &conv, prompt, tx)
+    }
+
+    /// Launch a conversation into its slot: `--resume` its pinned id once
+    /// it is created (by name only for a v0.3.1 record), else fresh under a
+    /// newly minted id.
+    fn launch_conv(
+        &mut self,
+        cfg: &Config,
+        bot: &Bot,
+        conv: &ConvKey,
+        prompt: Option<&str>,
+        tx: &Sender<Event>,
+    ) -> Result<()> {
+        let mode = self.launch_mode(cfg, conv);
+        self.launch(cfg, bot, conv, prompt, tx, mode)
+    }
+
+    /// How a conversation launches. A fresh one mints its id here and moves
+    /// prompts queued for the id it replaces (a resume that died, an
+    /// uncreated spawn) onto the new one.
+    fn launch_mode(&mut self, cfg: &Config, conv: &ConvKey) -> Launch {
+        if let Some(r) = self.state.record(conv).filter(|r| r.created) {
+            let target = r.sid.clone().unwrap_or_else(|| conv.slot.session_name());
+            return Launch::Resume { sid: r.sid.clone(), target };
+        }
+        let (sid, old) = self.state.begin_fresh(&cfg.dir, conv);
+        if let Some(old) = old {
+            crate::status_file::inbox_move(&cfg.inbox_dir(), &old, &sid);
+        }
+        Launch::Fresh { sid }
     }
 
     fn launch(
         &mut self,
         cfg: &Config,
         bot: &Bot,
-        key: &SessionKey,
+        conv: &ConvKey,
         prompt: Option<&str>,
         tx: &Sender<Event>,
-        resume: bool,
+        mode: Launch,
     ) -> Result<()> {
+        let key = &conv.slot;
         let repo = bot.repo_path();
         if !repo.is_dir() {
             bail!(
@@ -598,6 +726,8 @@ impl AgentStore {
 
         let persona = bot.persona_path(&cfg.dir);
         let settings = cfg.settings_file_for(bot, key)?;
+        let resumed = matches!(mode, Launch::Resume { .. });
+        let sid = mode.sid().map(str::to_string);
         let args = launch_args(
             key.session_name(),
             &persona,
@@ -606,7 +736,7 @@ impl AgentStore {
             &cfg.mcp_config_path(),
             &cfg.plugin_dir(),
             prompt,
-            resume,
+            &mode,
         );
 
         // The mod inside the bird finds its status/ and inbox/ through this;
@@ -618,15 +748,27 @@ impl AgentStore {
             AgentSession {
                 term,
                 last_prompt: prompt.map(str::to_string),
+                conv: conv.clone(),
+                sid: sid.clone(),
+                argv_prompt: prompt.map(str::to_string),
+                typed_at: None,
                 spawned_at: Instant::now(),
-                resumed: resume,
-                fresh_unmarked: !resume,
+                resumed,
+                fresh_unmarked: !resumed,
                 exit_handled: false,
                 kind: SessionKind::Bird,
             },
         );
         self.kind_since
             .insert(key.clone(), (StatusKind::Working, Instant::now()));
+        if key.tab == 1 {
+            self.state.set_active(&cfg.dir, conv);
+        }
+        // Known at birth: delivery is the inbox from the first tick, and no
+        // id from the slot's previous conversation is inherited.
+        if let Some(sid) = &sid {
+            self.signals.seed(key, sid);
+        }
         Ok(())
     }
 
@@ -654,6 +796,10 @@ impl AgentStore {
             AgentSession {
                 term,
                 last_prompt: None,
+                conv: ConvKey::home(key.clone()),
+                sid: None,
+                argv_prompt: None,
+                typed_at: None,
                 spawned_at: Instant::now(),
                 resumed: false,
                 fresh_unmarked: false,
@@ -697,25 +843,260 @@ impl AgentStore {
         if self.is_attached(&key) {
             bail!("tab {tab} shows a worker — close it instead");
         }
+        let conv = self.conv_of(&key);
         self.sessions.remove(&key);
-        self.state.forget(&cfg.dir, &key.state_key());
-        self.launch(cfg, bot, &key, prompt, tx, false)
+        self.forget_observations(&key);
+        self.state.forget(&cfg.dir, &conv);
+        self.launch_conv(cfg, bot, &conv, prompt, tx)
     }
 
-    /// A room is forming around this bird: abandon its PRIMARY conversation
-    /// WITHOUT relaunching. The room's first dispatch hatches it fresh with
-    /// the notify prompt ON ARGV — spawning here would turn that first
-    /// message into keystrokes at a booting PTY, the race the argv rule
-    /// exists for. Tabs are untouched (rooms never address them). Returns
-    /// true when there was something to drop: a live session or a record.
-    pub fn reset_primary(&mut self, cfg: &Config, id: &BotId) -> bool {
-        let key = SessionKey::primary(id.clone());
-        let was_live = self.sessions.remove(&key).is_some(); // drop = hang up
+    // ------------------------------------------------------- conversations
+
+    /// An EXTERNAL signal for a bird's conversation — `room: None` is home.
+    /// Tab 1 runs one conversation at a time, so a live tab 1 on ANOTHER
+    /// conversation never relaunches here: the prompt is queued in the
+    /// target's inbox and [`AgentStore::pump_switches`] — the ONE place a
+    /// live tab 1 changes conversation — switches when the bird is idle.
+    /// A prompt-less signal (a handoff's wake) on another conversation asks
+    /// for that switch outright.
+    pub fn signal(
+        &mut self,
+        cfg: &Config,
+        bot: &Bot,
+        room: Option<&str>,
+        prompt: Option<&str>,
+        tx: &Sender<Event>,
+    ) -> Result<Signaled> {
+        let key = SessionKey::primary(bot.id.clone());
+        let conv = match room {
+            Some(r) => ConvKey::room(bot.id.clone(), r),
+            None => ConvKey::home(key.clone()),
+        };
+        let running = self
+            .sessions
+            .get(&key)
+            .filter(|s| s.kind == SessionKind::Bird && s.term.is_running());
+        let on_target = running.is_some_and(|s| s.conv == conv);
+        match route(running.is_some(), on_target) {
+            Route::Launch => {
+                self.state.set_active(&cfg.dir, &conv);
+                self.ensure_running_key(cfg, bot, 1, prompt, tx)?;
+                Ok(Signaled::Launched)
+            }
+            Route::Deliver => {
+                self.ensure_running_key(cfg, bot, 1, prompt, tx)?;
+                Ok(Signaled::Delivered)
+            }
+            Route::Queue => {
+                match prompt {
+                    Some(p) => self.enqueue(cfg, &conv, p),
+                    None => {
+                        self.want.insert(bot.id.clone(), (conv, false));
+                    }
+                }
+                Ok(Signaled::Queued)
+            }
+        }
+    }
+
+    /// The person picked a conversation for tab 1 (the tab menu). A stopped
+    /// bird just points there (its next wake opens it); a live one switches
+    /// at the next idle moment, and stays put until a turn runs in it.
+    /// Returns true when the switch is waiting for the bird to go idle.
+    pub fn pick_conversation(&mut self, cfg: &Config, conv: &ConvKey) -> bool {
+        let key = &conv.slot;
+        let running = self
+            .sessions
+            .get(key)
+            .filter(|s| s.kind == SessionKind::Bird && s.term.is_running());
+        match running {
+            None => {
+                self.sessions.remove(key);
+                self.state.set_active(&cfg.dir, conv);
+                false
+            }
+            Some(s) if s.conv == *conv => {
+                self.want.remove(&key.bot);
+                false
+            }
+            Some(_) => {
+                self.want.insert(key.bot.clone(), (conv.clone(), true));
+                true
+            }
+        }
+    }
+
+    /// The conversations tab 1 can run: home, then each room's, sorted.
+    pub fn conversations(&self, id: &BotId) -> Vec<ConvKey> {
+        let mut out = vec![ConvKey::home(SessionKey::primary(id.clone()))];
+        out.extend(self.state.room_convs(id).iter().map(|r| ConvKey::room(id.clone(), r)));
+        out
+    }
+
+    /// Queue a prompt for a conversation tab 1 is NOT running. A v0.3.1
+    /// record has no id to name a folder by; it waits in memory instead.
+    fn enqueue(&mut self, cfg: &Config, conv: &ConvKey, prompt: &str) {
+        let posted = self
+            .state
+            .queue_sid(&cfg.dir, conv)
+            .is_some_and(|sid| self.signals.post(&sid, prompt));
+        if !posted {
+            let stamp = format!("{:013}-9999.md", crate::status_file::now_ms());
+            self.held.entry(conv.clone()).or_default().push_back((stamp, prompt.to_string()));
+        }
+    }
+
+    /// Has a prompt starting with `prefix` queued for a conversation that is
+    /// not running? (A routine never stacks a second firing behind a busy
+    /// bird.)
+    pub fn queued_with_prefix(&self, conv: &ConvKey, prefix: &str) -> bool {
+        let held = self.held.get(conv).is_some_and(|q| q.iter().any(|(_, t)| t.starts_with(prefix)));
+        held || self.state.record(conv).and_then(|r| r.sid.as_deref()).is_some_and(|sid| {
+            self.signals
+                .queued(sid)
+                .iter()
+                .any(|(_, path)| std::fs::read_to_string(path).is_ok_and(|t| t.starts_with(prefix)))
+        })
+    }
+
+    /// The person typed into this PTY (switches wait for them to stop).
+    pub fn note_human_input(&mut self, key: &SessionKey) {
+        self.human_input.insert(key.clone(), Instant::now());
+    }
+
+    /// Once a tick: switch each idle tab 1 to the conversation that wants it
+    /// (a person's pick, else the OLDEST queued prompt). The oldest prompt
+    /// rides argv; the rest drain through the mod. Returns who switched.
+    pub fn pump_switches(&mut self, cfg: &Config, tx: &Sender<Event>) -> Vec<(BotId, ConvKey)> {
+        let mut out = Vec::new();
+        for bot in &cfg.bots {
+            let key = SessionKey::primary(bot.id.clone());
+            let Some(view) = self.switch_view(&key) else { continue };
+            let Some(target) = next_switch(&view) else { continue };
+            let human = self.want.get(&bot.id).is_some_and(|(c, h)| *h && *c == target);
+            match self.switch_to(cfg, bot, &target, human, tx) {
+                Ok(()) => out.push((bot.id.clone(), target)),
+                Err(_) => {
+                    // The launch failed (a moved repo): the PTY is gone, as
+                    // with any failed launch; the queue waits for the next.
+                    self.want.remove(&bot.id);
+                }
+            }
+        }
+        out
+    }
+
+    /// Everything [`next_switch`] weighs for one bird's tab 1 — `None` when
+    /// tab 1 is not a live bird session.
+    fn switch_view(&self, key: &SessionKey) -> Option<SwitchView> {
+        let s = self.sessions.get(key)?;
+        if s.kind != SessionKind::Bird || !s.term.is_running() {
+            return None;
+        }
+        let active_queued = s.sid.as_deref().is_some_and(|sid| !self.signals.queued(sid).is_empty())
+            || self.held.get(&s.conv).is_some_and(|q| !q.is_empty());
+        let queued = self
+            .conversations(&key.bot)
+            .into_iter()
+            .filter(|c| *c != s.conv)
+            .filter_map(|c| self.oldest_queued(&c).map(|stamp| (c, stamp)))
+            .collect();
+        Some(SwitchView {
+            done_for: match self.status_key(key) {
+                BotStatus::Done(age) => Some(age),
+                _ => None,
+            },
+            pty_age: s.spawned_at.elapsed(),
+            active_queued,
+            human_idle: self.human_input.get(key).map(Instant::elapsed),
+            typed_ago: s.typed_at.map(|t| t.elapsed()),
+            workers_busy: self.workers.busy(&key.bot),
+            want: self.want.get(&key.bot).map(|(c, _)| c.clone()).filter(|c| *c != s.conv),
+            pinned: self
+                .pinned
+                .get(&key.bot)
+                .is_some_and(|at| at.elapsed() < PIN_MAX),
+            queued,
+        })
+    }
+
+    /// The name (stamp) of a not-running conversation's oldest queued
+    /// prompt — the order switches are served in.
+    fn oldest_queued(&self, conv: &ConvKey) -> Option<String> {
+        let held = self.held.get(conv).and_then(|q| q.front()).map(|(stamp, _)| stamp.clone());
+        let filed = self
+            .state
+            .record(conv)
+            .and_then(|r| r.sid.as_deref())
+            .and_then(|sid| self.signals.queued(sid).into_iter().next())
+            .map(|(name, _)| name);
+        held.into_iter().chain(filed).min()
+    }
+
+    /// Take a conversation's oldest queued prompt out of its queue (it is
+    /// about to ride argv).
+    fn take_oldest(&mut self, conv: &ConvKey) -> Option<String> {
+        if let Some(q) = self.held.get_mut(conv) {
+            if let Some((_, text)) = q.pop_front() {
+                return Some(text);
+            }
+        }
+        let sid = self.state.record(conv)?.sid.clone()?;
+        let (_, path) = self.signals.queued(&sid).into_iter().next()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        Some(text)
+    }
+
+    /// Relaunch tab 1 on `target`, its oldest queued prompt on argv.
+    fn switch_to(
+        &mut self,
+        cfg: &Config,
+        bot: &Bot,
+        target: &ConvKey,
+        human: bool,
+        tx: &Sender<Event>,
+    ) -> Result<()> {
+        let key = SessionKey::primary(bot.id.clone());
+        let prompt = self.take_oldest(target);
+        self.sessions.remove(&key); // drop = hang up
         self.forget_observations(&key);
-        self.collab.remove(id);
-        let had_record = self.state.spawned_once(&key.state_key());
-        self.state.forget(&cfg.dir, &key.state_key());
-        was_live || had_record
+        self.want.remove(&bot.id);
+        match (&target.room, prompt.is_some()) {
+            (Some(room), true) => self.set_collab(&bot.id, Collab::Room(room.clone())),
+            (None, _) if matches!(self.collab(&bot.id), Some(Collab::Room(_))) => {
+                self.collab.remove(&bot.id);
+            }
+            _ => {}
+        }
+        if human {
+            self.pinned.insert(bot.id.clone(), Instant::now());
+        } else {
+            self.pinned.remove(&bot.id);
+        }
+        self.launch_conv(cfg, bot, target, prompt.as_deref(), tx)
+    }
+
+    /// A room left the roster: its conversations are forgotten and their
+    /// queues dropped. A bird running one goes home — now if it is not
+    /// live, else at its next idle moment.
+    pub fn forget_room(&mut self, cfg: &Config, room: &str) {
+        for sid in self.state.forget_room(&cfg.dir, room) {
+            let _ = std::fs::remove_dir_all(cfg.inbox_dir().join(&sid));
+        }
+        self.held.retain(|c, _| c.room.as_deref() != Some(room));
+        for bot in &cfg.bots {
+            if self.state.active_room(&bot.id) != Some(room) {
+                continue;
+            }
+            let home = ConvKey::home(SessionKey::primary(bot.id.clone()));
+            if self.switch_view(&home.slot).is_some() {
+                self.want.insert(bot.id.clone(), (home, false));
+            } else {
+                self.sessions.remove(&home.slot);
+                self.state.set_active(&cfg.dir, &home);
+            }
+        }
     }
 
     /// Once a second: a fresh session that has survived [`MARK_AFTER`] becomes
@@ -732,9 +1113,9 @@ impl AgentStore {
             .map(|(key, _)| key.clone())
             .collect();
         for key in ripe {
-            self.state.mark_spawned(&cfg.dir, &key.state_key());
             if let Some(s) = self.sessions.get_mut(&key) {
                 s.fresh_unmarked = false;
+                self.state.mark_created(&cfg.dir, &s.conv);
             }
         }
         let ended: Vec<SessionKey> = self
@@ -751,9 +1132,10 @@ impl AgentStore {
     }
 
     /// Note PTY activity (from `Event::AgentOutput`). Returns a relaunch
-    /// request when a `--resume` died instantly: the named session no longer
-    /// exists, so the caller should boot THIS KEY again — the state file
-    /// has already been reset to force a fresh spawn.
+    /// request when a `--resume` died instantly: the session no longer
+    /// exists, so the caller should boot THIS KEY again with the prompt that
+    /// rode the dead launch — the record is already uncreated, so that boot
+    /// mints a fresh id and carries the old id's queue over.
     pub fn note_output(&mut self, cfg: &Config, key: &SessionKey) -> RelaunchHint {
         self.last_output.insert(key.clone(), Instant::now());
         let Some(session) = self.sessions.get_mut(key) else {
@@ -764,9 +1146,12 @@ impl AgentStore {
         }
         session.exit_handled = true;
         if session.resumed && session.spawned_at.elapsed() < RESUME_FAIL_WINDOW {
-            self.state.forget(&cfg.dir, &key.state_key());
+            let prompt = session.argv_prompt.clone();
+            let conv = session.conv.clone();
+            self.state.uncreate(&cfg.dir, &conv);
             self.sessions.remove(key);
-            return RelaunchHint::FreshSpawn;
+            self.forget_observations(key);
+            return RelaunchHint::FreshSpawn(prompt);
         }
         RelaunchHint::No
     }
@@ -794,16 +1179,19 @@ impl AgentStore {
         if viewer {
             return; // a viewer has no record and no label of its own
         }
-        self.state.forget(&cfg.dir, &key.state_key());
+        self.state.forget(&cfg.dir, &ConvKey::home(key.clone()));
         self.state.set_tab_name(&cfg.dir, &key.state_key(), "");
     }
 
     /// A bird leaving the roster: stop all its sessions and drop all
     /// bookkeeping. The claude sessions themselves survive —
-    /// `claude --resume aviary-<id>` works from any terminal.
+    /// `claude --resume <session id>` works from any terminal.
     pub fn release(&mut self, cfg: &Config, id: &BotId) {
         self.stop(id);
         self.unread.remove(id);
+        self.want.remove(id);
+        self.pinned.remove(id);
+        self.held.retain(|c, _| c.slot.bot != *id);
         self.workers.forget_bot(id);
         self.state.forget_bot(&cfg.dir, id);
     }
@@ -874,19 +1262,30 @@ fn pick_status(
     }
 }
 
-/// Match poll rows to live keys by EXACT session name — `aviary-swift.2`
-/// never badges `aviary-swift`, and a foreign `aviary-swiftly` matches neither.
+/// Match poll rows to live keys: by the PINNED session id first. A name is
+/// shared by every conversation the slot ever ran, so the name fallback —
+/// for a v0.3.1 record resumed by name, or a `/clear` that re-minted the id
+/// inside the PTY — takes only a row that is UNIQUE under that name and
+/// whose id belongs to no other conversation on record (`known`).
+/// `aviary-swift.2` never badges `aviary-swift`; `aviary-swiftly` neither.
 fn poll_matches<'a>(
-    live: &[SessionKey],
+    live: &[(SessionKey, Option<String>)],
+    known: &std::collections::HashSet<&str>,
     sessions: &'a [SessionInfo],
 ) -> Vec<(SessionKey, &'a SessionInfo)> {
     live.iter()
-        .filter_map(|key| {
+        .filter_map(|(key, sid)| {
+            if let Some(row) = sid
+                .as_deref()
+                .and_then(|sid| sessions.iter().find(|s| s.session_id == sid))
+            {
+                return Some((key.clone(), row));
+            }
             let name = key.session_name();
-            sessions
-                .iter()
-                .find(|s| s.name == name)
-                .map(|s| (key.clone(), s))
+            let mut named = sessions.iter().filter(|s| s.name == name);
+            let row = named.next()?;
+            let unique = named.next().is_none();
+            (unique && !known.contains(row.session_id.as_str())).then(|| (key.clone(), row))
         })
         .collect()
 }
@@ -914,11 +1313,106 @@ pub fn lowest_free_tab(tabs: &[u8]) -> u8 {
     (2..u8::MAX).find(|n| !tabs.contains(n)).unwrap_or(u8::MAX)
 }
 
-#[derive(PartialEq, Eq)]
+/// Where an external signal's prompt went.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Signaled {
+    /// Tab 1 was not live: launched on the target, prompt on argv.
+    Launched,
+    /// Tab 1 already runs the target: delivered as any prompt is.
+    Delivered,
+    /// Tab 1 runs ANOTHER conversation: queued for the next idle switch.
+    Queued,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum Route {
+    Launch,
+    Deliver,
+    Queue,
+}
+
+/// A signal's route — never a relaunch of a live tab 1 (only
+/// [`AgentStore::pump_switches`] does that, behind its guards).
+fn route(live: bool, on_target: bool) -> Route {
+    match (live, on_target) {
+        (false, _) => Route::Launch,
+        (true, true) => Route::Deliver,
+        (true, false) => Route::Queue,
+    }
+}
+
+/// What [`next_switch`] weighs for one live tab 1.
+#[derive(Default)]
+struct SwitchView {
+    /// Some(age secs) while the status is Done.
+    done_for: Option<u64>,
+    pty_age: Duration,
+    /// The running conversation still has prompts to drain.
+    active_queued: bool,
+    /// Since the person last typed into it (None: never).
+    human_idle: Option<Duration>,
+    /// Since aviary last typed into it (None: never).
+    typed_ago: Option<Duration>,
+    /// The bird has workers running — their reports address the
+    /// conversation that spawned them.
+    workers_busy: bool,
+    /// A switch asked for outright (a pick, a handoff's wake, a deleted room).
+    want: Option<ConvKey>,
+    /// The person's pick holds tab 1 until a turn runs in it.
+    pinned: bool,
+    /// Not-running conversations with queued prompts, each with the stamp
+    /// of its oldest.
+    queued: Vec<(ConvKey, String)>,
+}
+
+/// Should tab 1 switch now, and to what? Only a bird that is truly idle —
+/// Done for a while, booted, drained, untouched by the person and by
+/// aviary's typing, no workers out. Then: an outright want, else (unless
+/// pinned) the conversation whose queued prompt is OLDEST.
+fn next_switch(v: &SwitchView) -> Option<ConvKey> {
+    let idle = v.done_for.is_some_and(|age| age >= SWITCH_DWELL)
+        && v.pty_age >= MARK_AFTER
+        && !v.active_queued
+        && v.human_idle.is_none_or(|d| d >= HUMAN_QUIET)
+        && v.typed_ago.is_none_or(|d| d.as_secs() >= SWITCH_DWELL)
+        && !v.workers_busy;
+    if !idle {
+        return None;
+    }
+    if let Some(c) = &v.want {
+        return Some(c.clone());
+    }
+    if v.pinned {
+        return None;
+    }
+    v.queued.iter().min_by(|a, b| a.1.cmp(&b.1)).map(|(c, _)| c.clone())
+}
+
+#[derive(PartialEq, Eq, Debug)]
 pub enum RelaunchHint {
     No,
-    /// A resumed session is gone — spawn fresh.
-    FreshSpawn,
+    /// A resumed session is gone — spawn fresh, re-sending the prompt that
+    /// rode the dead launch (if any).
+    FreshSpawn(Option<String>),
+}
+
+/// How [`launch_args`] starts a conversation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Launch {
+    /// A new conversation under an id aviary minted (`--session-id`).
+    Fresh { sid: String },
+    /// An existing one: `target` is its id — or, for a v0.3.1 record whose
+    /// id was never learned, its name (`sid: None`).
+    Resume { sid: Option<String>, target: String },
+}
+
+impl Launch {
+    pub fn sid(&self) -> Option<&str> {
+        match self {
+            Launch::Fresh { sid } => Some(sid),
+            Launch::Resume { sid, .. } => sid.as_deref(),
+        }
+    }
 }
 
 /// Argv for a bird's launch. ORDER IS LOAD-BEARING: `--mcp-config` and
@@ -937,12 +1431,13 @@ fn launch_args(
     mcp: &std::path::Path,
     plugin: &std::path::Path,
     prompt: Option<&str>,
-    resume: bool,
+    mode: &Launch,
 ) -> Vec<String> {
-    let mut args: Vec<String> = if resume {
-        vec!["--resume".into(), session]
-    } else {
-        vec!["--name".into(), session]
+    let mut args: Vec<String> = match mode {
+        Launch::Resume { target, .. } => vec!["--resume".into(), target.clone()],
+        // The name addresses the bird (SendMessage, hooks); the id IS the
+        // conversation — pinned so nothing has to learn it afterwards.
+        Launch::Fresh { sid } => vec!["--name".into(), session, "--session-id".into(), sid.clone()],
     };
     args.extend([
         // The Linear + Figma hooks, independent of repo-level MCP config.
@@ -1019,7 +1514,7 @@ mod tests {
             Path::new("/cfg/mcp.json"),
             Path::new("/cfg/plugin"),
             Some("You've just been perched."),
-            false,
+            &Launch::Fresh { sid: "sid-1".into() },
         );
         assert_eq!(args.last().map(String::as_str), Some("You've just been perched."));
         let p = args.iter().position(|a| a == "--plugin-dir").unwrap();
@@ -1038,6 +1533,8 @@ mod tests {
         assert_eq!(i + 2, args.len() - 1);
         let s = args.iter().position(|a| a == "--settings").unwrap();
         assert_eq!(args[s + 1], "/cfg/settings/swift.json");
+        // A fresh launch is NAMED for addressing and PINNED for identity.
+        assert_eq!(args[..4], ["--name", "aviary-swift", "--session-id", "sid-1"]);
     }
 
     #[test]
@@ -1050,10 +1547,10 @@ mod tests {
             Path::new("/cfg/mcp.json"),
             Path::new("/cfg/plugin"),
             None,
-            true,
+            &Launch::Resume { sid: Some("sid-r".into()), target: "sid-r".into() },
         );
-        assert_eq!(args[0], "--resume");
-        assert_eq!(args[1], "aviary-raven");
+        assert_eq!(args[..2], ["--resume", "sid-r"]);
+        assert!(!args.iter().any(|a| a == "--name" || a == "--session-id"));
         assert_eq!(args.last().map(String::as_str), Some("/cfg/birds/raven.md"));
     }
 
@@ -1091,13 +1588,13 @@ mod tests {
             cwd: String::new(),
             ..Default::default()
         };
-        let live = [key("swift", 1), key("swift", 2)];
+        let live = [(key("swift", 1), None), (key("swift", 2), None)];
         let polled = [
             info("aviary-swift", "busy"),
             info("aviary-swift.2", "waiting_for_input"),
             info("aviary-swiftly", "busy"), // foreign bird, not a tab
         ];
-        let got: Vec<(SessionKey, StatusKind, &str)> = poll_matches(&live, &polled)
+        let got: Vec<(SessionKey, StatusKind, &str)> = poll_matches(&live, &Default::default(), &polled)
             .into_iter()
             .map(|(k, row)| (k, map_status_str(row.status_str()), row.session_id.as_str()))
             .collect();
@@ -1140,26 +1637,218 @@ mod tests {
         assert_eq!(resolve_hook_key(&bots, &[key("swift", 2)], &repo, None), None);
     }
 
+    /// A fresh launch mints and PINS an id; once created it resumes BY ID
+    /// (a name shared by two sessions is refused); a v0.3.1 record with no
+    /// id resumes by name; a dead resume mints anew and carries its queue.
     #[test]
-    fn reset_primary_forgets_tab_one_only_and_reports_what_it_dropped() {
+    fn launch_mode_pins_resumes_by_id_and_remints_after_a_dead_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let home = ConvKey::home(key("swift", 1));
+
+        let Launch::Fresh { sid: first } = store.launch_mode(&cfg, &home) else { panic!("never flown: fresh") };
+        assert_eq!(store.state.record(&home).and_then(|r| r.sid.as_deref()), Some(first.as_str()));
+        store.state.mark_created(&cfg.dir, &home);
+        assert_eq!(
+            store.launch_mode(&cfg, &home),
+            Launch::Resume { sid: Some(first.clone()), target: first.clone() }
+        );
+        // Persisted across restarts.
+        assert_eq!(AgentStore::new(&cfg).state.record(&home).unwrap().sid.as_deref(), Some(first.as_str()));
+
+        // The resume died on arrival: uncreated → a NEW id (claude refuses a
+        // reused one), and prompts queued for the dead id follow it.
+        let mut stamp = status_file::PostStamp::default();
+        status_file::inbox_post(&cfg.inbox_dir(), &first, &mut stamp, "queued").unwrap();
+        store.state.uncreate(&cfg.dir, &home);
+        let Launch::Fresh { sid: second } = store.launch_mode(&cfg, &home) else { panic!("fresh again") };
+        assert_ne!(first, second);
+        assert_eq!(status_file::inbox_pending(&cfg.inbox_dir(), &second, "").len(), 1);
+
+        // A v0.3.1 state file: spawned, never named — resumed by name once.
+        std::fs::write(cfg.dir.join("state.json"), r#"{"spawned":["swift","swift.2"]}"#).unwrap();
+        let mut legacy = AgentStore::new(&cfg);
+        assert_eq!(
+            legacy.launch_mode(&cfg, &ConvKey::home(key("swift", 2))),
+            Launch::Resume { sid: None, target: "aviary-swift.2".into() }
+        );
+    }
+
+    /// Rows join by PINNED id; the name fallback takes only a row that is
+    /// unique under the name and owned by no other conversation on record.
+    #[test]
+    fn poll_matches_by_pinned_id_before_name() {
+        let row = |name: &str, sid: &str| SessionInfo {
+            name: name.into(),
+            status: "idle".into(),
+            session_id: sid.into(),
+            ..Default::default()
+        };
+        let known: std::collections::HashSet<&str> = ["home-sid", "room-sid"].into_iter().collect();
+        // A foreign `claude --resume` of the same name listed FIRST: the id wins.
+        let polled = [row("aviary-swift", "foreign"), row("aviary-swift", "room-sid")];
+        let got = poll_matches(&[(key("swift", 1), Some("room-sid".into()))], &known, &polled);
+        assert_eq!(got[0].1.session_id, "room-sid");
+        // Name fallback: never when the name is ambiguous…
+        assert!(poll_matches(&[(key("swift", 1), None)], &known, &polled).is_empty());
+        // …nor when the row is another conversation on record…
+        let home_only = [row("aviary-swift", "home-sid")];
+        assert!(poll_matches(&[(key("swift", 1), Some("room-sid".into()))], &known, &home_only).is_empty());
+        // …but a unique, unknown row (a by-name resume, a `/clear`) joins.
+        let cleared = [row("aviary-swift", "brand-new")];
+        let got = poll_matches(&[(key("swift", 1), Some("room-sid".into()))], &known, &cleared);
+        assert_eq!(got[0].1.session_id, "brand-new");
+    }
+
+    /// A hook names its conversation: one from a conversation on record that
+    /// no slot runs now is dropped, never pinned on the slot's successor.
+    #[test]
+    fn hooks_from_a_conversation_no_longer_running_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let home = ConvKey::home(key("swift", 1));
+        let (old, _) = store.state.begin_fresh(&cfg.dir, &home);
+        assert!(store
+            .apply_hook(&cfg, &old, Some("aviary-swift"), "", "PermissionRequest", "")
+            .is_none());
+    }
+
+    /// gc keeps the queue of every conversation on record, running or not —
+    /// a room conversation drains its inbox when it next resumes.
+    #[test]
+    fn gc_keeps_the_queues_of_conversations_on_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let (held, _) = store.state.begin_fresh(&cfg.dir, &ConvKey::home(key("swift", 2)));
+        let mut stamp = status_file::PostStamp::default();
+        for sid in [held.as_str(), "orphan"] {
+            status_file::inbox_post(&cfg.inbox_dir(), sid, &mut stamp, "x").unwrap();
+            let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+            std::fs::File::open(cfg.inbox_dir().join(sid)).unwrap().set_modified(old).unwrap();
+        }
+        store.gc();
+        assert!(cfg.inbox_dir().join(&held).is_dir());
+        assert!(!cfg.inbox_dir().join("orphan").exists());
+    }
+
+    /// A signal never relaunches a live tab 1: it launches a stopped one,
+    /// delivers to the conversation running, else queues.
+    #[test]
+    fn route_never_relaunches_a_live_tab_one() {
+        assert_eq!(route(false, false), Route::Launch);
+        assert_eq!(route(false, true), Route::Launch);
+        assert_eq!(route(true, true), Route::Deliver);
+        assert_eq!(route(true, false), Route::Queue);
+    }
+
+    fn idle_view() -> SwitchView {
+        SwitchView {
+            done_for: Some(SWITCH_DWELL),
+            pty_age: MARK_AFTER,
+            ..Default::default()
+        }
+    }
+
+    /// Tab 1 switches only when truly idle — and then to an outright want,
+    /// else (unless the person pinned it) the OLDEST queued prompt.
+    #[test]
+    fn next_switch_waits_for_true_idle_then_serves_the_oldest() {
+        let nest = ConvKey::room(BotId("swift".into()), "nest");
+        let ops = ConvKey::room(BotId("swift".into()), "ops");
+        let home = ConvKey::home(key("swift", 1));
+        let queued = vec![(nest.clone(), "0000000000200-0000.md".into()), (ops.clone(), "0000000000100-0000.md".into())];
+        let v = SwitchView { queued: queued.clone(), ..idle_view() };
+        assert_eq!(next_switch(&v), Some(ops.clone()), "oldest first, across rooms");
+        assert_eq!(next_switch(&idle_view()), None, "nothing queued, nothing to do");
+
+        // Every guard holds it back on its own.
+        let held_back = [
+            SwitchView { done_for: None, ..SwitchView { queued: queued.clone(), ..idle_view() } },
+            SwitchView { done_for: Some(SWITCH_DWELL - 1), queued: queued.clone(), ..idle_view() },
+            SwitchView { pty_age: MARK_AFTER - Duration::from_secs(1), queued: queued.clone(), ..idle_view() },
+            SwitchView { active_queued: true, queued: queued.clone(), ..idle_view() },
+            SwitchView { human_idle: Some(Duration::from_secs(3)), queued: queued.clone(), ..idle_view() },
+            SwitchView { typed_ago: Some(Duration::from_secs(1)), queued: queued.clone(), ..idle_view() },
+            SwitchView { workers_busy: true, queued: queued.clone(), ..idle_view() },
+            SwitchView { pinned: true, queued: queued.clone(), ..idle_view() },
+        ];
+        for (i, v) in held_back.iter().enumerate() {
+            assert_eq!(next_switch(v), None, "guard #{i}");
+        }
+        // A long-quiet person does not block; a want beats the queue and a pin.
+        let v = SwitchView { human_idle: Some(HUMAN_QUIET), queued: queued.clone(), ..idle_view() };
+        assert_eq!(next_switch(&v), Some(ops));
+        let v = SwitchView { want: Some(home.clone()), pinned: true, queued, ..idle_view() };
+        assert_eq!(next_switch(&v), Some(home));
+    }
+
+    /// Queued prompts for a conversation tab 1 is not running: filed under
+    /// a minted id (a never-launched room) — or, for a v0.3.1 record with
+    /// no id, held in memory — served oldest first, taken for argv.
+    #[test]
+    fn queues_for_not_running_conversations_serve_oldest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let nest = ConvKey::room(BotId("swift".into()), "nest");
+        store.enqueue(&cfg, &nest, "first");
+        store.enqueue(&cfg, &nest, "second");
+        let sid = store.state.record(&nest).and_then(|r| r.sid.clone()).expect("minted to queue under");
+        assert!(!store.state.created(&nest), "queued, never launched");
+        assert_eq!(store.signals.queued(&sid).len(), 2);
+        assert!(store.oldest_queued(&nest).is_some());
+        assert_eq!(store.take_oldest(&nest).as_deref(), Some("first"));
+        assert_eq!(store.signals.queued(&sid).len(), 1);
+        // Its first launch is FRESH under a new id, carrying the rest along.
+        let Launch::Fresh { sid: new } = store.launch_mode(&cfg, &nest) else { panic!() };
+        assert_eq!(store.signals.queued(&new).len(), 1);
+
+        // A v0.3.1 home with no id: held in memory, same order.
+        std::fs::write(cfg.dir.join("state.json"), r#"{"spawned":["swift"]}"#).unwrap();
+        let mut legacy = AgentStore::new(&cfg);
+        let home = ConvKey::home(key("swift", 1));
+        legacy.enqueue(&cfg, &home, "[routine r] go");
+        assert!(legacy.queued_with_prefix(&home, "[routine r]"));
+        assert!(!legacy.queued_with_prefix(&home, "[routine q]"));
+        assert_eq!(legacy.take_oldest(&home).as_deref(), Some("[routine r] go"));
+        assert!(legacy.oldest_queued(&home).is_none());
+    }
+
+    /// Tab 1's conversation when nothing runs: the active one. A room's
+    /// deletion forgets its conversations and queues, and a stopped bird
+    /// active on it goes home at once.
+    #[test]
+    fn active_conversation_survives_restarts_and_room_deletion_sends_it_home() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = crate::config::test_flock(tmp.path(), &["swift", "raven"]);
         let mut store = AgentStore::new(&cfg);
-        let swift = BotId("swift".into());
-        store.state.mark_spawned(&cfg.dir, "swift");
-        store.state.mark_spawned(&cfg.dir, "swift.2");
-        store.state.set_tab_name(&cfg.dir, "swift.2", "review");
-        store.set_collab(&swift, Collab::Room("nest".into()));
+        let primary = key("swift", 1);
+        let nest = ConvKey::room(BotId("swift".into()), "nest");
+        assert_eq!(store.conv_of(&primary), ConvKey::home(primary.clone()));
+        store.state.set_active(&cfg.dir, &nest);
+        store.enqueue(&cfg, &ConvKey::room(BotId("raven".into()), "nest"), "hi");
+        assert_eq!(AgentStore::new(&cfg).conv_of(&primary), nest, "persisted");
+        assert_eq!(key("swift", 2), AgentStore::new(&cfg).conv_of(&key("swift", 2)).slot, "tabs run their own");
+        assert_eq!(store.conversations(&BotId("swift".into())), [ConvKey::home(primary.clone())]);
 
-        assert!(store.reset_primary(&cfg, &swift), "a resume record was dropped");
-        assert!(!store.has_session_record(&key("swift", 1)));
-        assert!(store.has_session_record(&key("swift", 2)), "tabs are untouched");
-        assert_eq!(store.tab_name(&key("swift", 2)), Some("review"));
-        assert!(store.collab(&swift).is_none());
-        // Persisted: a fresh store reads the same truth.
-        assert!(!AgentStore::new(&cfg).has_session_record(&key("swift", 1)));
-        // A never-flown bird has nothing to lose.
-        assert!(!store.reset_primary(&cfg, &BotId("raven".into())));
+        store.forget_room(&cfg, "nest");
+        assert_eq!(store.conv_of(&primary), ConvKey::home(primary.clone()));
+        assert!(store.state.room_convs(&BotId("raven".into())).is_empty());
+        assert_eq!(std::fs::read_dir(cfg.inbox_dir()).map_or(0, |d| d.count()), 0, "queues dropped");
+    }
+
+    /// The person's pick on a stopped bird points tab 1 there at once.
+    #[test]
+    fn picking_a_conversation_for_a_stopped_bird_points_tab_one_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let nest = ConvKey::room(BotId("swift".into()), "nest");
+        assert!(!store.pick_conversation(&cfg, &nest), "nothing to wait for");
+        assert_eq!(store.conv_of(&key("swift", 1)), nest);
     }
 
     #[test]
@@ -1228,9 +1917,9 @@ mod tests {
             ..Default::default()
         }];
         // (apply_poll only badges LIVE keys; none here — but the guard is the point.)
-        assert!(store.apply_poll(&polled).is_empty());
+        assert!(store.apply_poll(&cfg, &polled).is_empty());
         assert!(store
-            .apply_hook(&cfg, Some("aviary-swift"), "", "Stop", "")
+            .apply_hook(&cfg, "", Some("aviary-swift"), "", "Stop", "")
             .is_none());
         // The same file, unchanged, is not news; a change is.
         assert!(store.apply_status_files().0.is_empty());
@@ -1337,6 +2026,27 @@ mod tests {
         store.signals.set_poll(&swift, StatusKind::NeedsInput, Instant::now(), Some("dialog open"));
         assert!(blocked(&store));
         assert_eq!(store.detail(&swift).reason.as_deref(), Some("dialog open"));
+    }
+
+    /// The invariant that keeps conversations apart: a PINNED launch seeds
+    /// its id and clears the slot's retired one, so the prompts queued for
+    /// the conversation the slot ran before stay with THAT conversation.
+    #[test]
+    fn a_pinned_launch_never_inherits_the_previous_conversations_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::test_flock(tmp.path(), &["swift"]);
+        let mut store = AgentStore::new(&cfg);
+        let swift = key("swift", 1);
+        store.signals.set_session_id(&swift, "home-sid");
+        let mut stamp = status_file::PostStamp::default();
+        status_file::inbox_post(&cfg.inbox_dir(), "home-sid", &mut stamp, "for home").unwrap();
+        store.forget_observations(&swift); // the slot switches conversations…
+        store.signals.seed(&swift, "room-sid"); // …to one launched under a pinned id
+        assert_eq!(store.delivery(&swift), Delivery::Inbox("room-sid".into()), "inbox from birth");
+        let row = SessionInfo { name: "aviary-swift".into(), status: "idle".into(), session_id: "room-sid".into(), ..Default::default() };
+        store.signals.note_poll(&swift, &row);
+        assert_eq!(status_file::inbox_pending(&cfg.inbox_dir(), "home-sid", "").len(), 1, "home keeps its queue");
+        assert!(status_file::inbox_pending(&cfg.inbox_dir(), "room-sid", "").is_empty());
     }
 
     /// A relaunch drops the key's session id; the next id the poll names for

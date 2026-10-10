@@ -14,7 +14,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
 use crate::config::SessionKey;
 use crate::event::Event;
@@ -30,7 +30,22 @@ pub struct Terminal {
     running: Arc<AtomicBool>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
+    /// Hangs the child up when the terminal is dropped. Closing our master
+    /// is NOT enough: the reader thread holds a dup of it (blocked in
+    /// `read`), so the child never sees the hangup and outlives its pane.
+    killer: Box<dyn ChildKiller + Send + Sync>,
     size: (u16, u16),
+}
+
+impl Drop for Terminal {
+    /// Dropping a session means hanging it up (stop, fresh start, a
+    /// conversation switch) — SIGHUP, which claude answers by saving and
+    /// exiting. A child that already exited makes this a no-op.
+    fn drop(&mut self) {
+        if self.running.load(Ordering::Relaxed) {
+            let _ = self.killer.kill();
+        }
+    }
 }
 
 impl Terminal {
@@ -81,6 +96,7 @@ impl Terminal {
             .spawn_command(cmd)
             .with_context(|| format!("could not start `{program}`"))?;
         drop(pair.slave);
+        let killer = child.clone_killer();
 
         {
             let running = running.clone();
@@ -132,6 +148,7 @@ impl Terminal {
             running,
             writer: Arc::new(Mutex::new(writer)),
             master: pair.master,
+            killer,
             size: (rows, cols),
         })
     }

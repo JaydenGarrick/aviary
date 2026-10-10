@@ -85,6 +85,15 @@ impl ModLayer {
         }
     }
 
+    /// A launch under a PINNED id: the key's id is known before any poll,
+    /// and the slot's previous conversation is NOT its predecessor — its
+    /// retired id must never hand this one its queue (`note_poll` would
+    /// `inbox_move` one conversation's prompts into another).
+    pub fn seed(&mut self, key: &SessionKey, sid: &str) {
+        self.retired.remove(key);
+        self.session_ids.insert(key.clone(), sid.to_string());
+    }
+
     // ------------------------------------------------------------- poll
 
     /// Record one poll row for a live key; returns the kind it read. A new
@@ -197,6 +206,13 @@ impl ModLayer {
             Some(sid) => Delivery::Inbox(sid.clone()),
             None => Delivery::Typed,
         }
+    }
+
+    /// The prompts queued for a session id that its mod has not acked,
+    /// oldest first (`(file name, path)`).
+    pub fn queued(&self, session_id: &str) -> Vec<(String, PathBuf)> {
+        let ack = self.mod_status.get(session_id).map_or("", |(st, _)| st.inbox_ack.as_str());
+        status_file::inbox_pending(&self.inbox_path, session_id, ack)
     }
 
     /// Queue a prompt for a session id; false when the write failed (the

@@ -154,17 +154,15 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // The verdict is read here, before any dialog: `ask` means one opens now.
-  // A subagent's ask opens the same dialog in the same session — it blocks
-  // the person just as much, so it is NOT filtered like the loop events are.
-  // A `$.tool.check` query (no `tool_use_id`) opens no dialog and is ignored.
-  on('tool.check', async ($, e, next) => {
-    const verdict = await next(e)
-    if (verdict.decision === 'ask' && e.tool_use_id !== undefined) {
-      set('needs-input', 'permission', describe(e.tool, e.input))
-      await write($)
-    }
-    return verdict
+  // PermissionRequest fires when the dialog is SHOWN. A `tool.check` `ask` is
+  // not one: it goes to the mode's decider, and in auto mode the classifier
+  // settles nearly every ask with no dialog — reading `ask` as needs-input
+  // flashed ⏸ and notified on every approved call. A subagent's dialog
+  // blocks the person just as much, so it is NOT filtered like loop events.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    set('needs-input', 'permission', describe(e.tool_name, e.tool_input))
+    await write($)
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('tool.call', async ($, e, next) => {

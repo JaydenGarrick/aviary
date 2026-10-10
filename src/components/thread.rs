@@ -369,12 +369,14 @@ impl Component for Thread {
             Line::from(""),
             Line::from(dim(if s.agents.has_session_record(&key) {
                 format!(
-                    "  ⏎ RESUMES the conversation named {} with its full memory",
+                    "  ⏎ RESUMES its {} conversation ({}) with its full memory",
+                    s.agents.conv_of(&key).label(),
                     key.session_name()
                 )
             } else {
                 format!(
-                    "  ⏎ starts a BRAND-NEW conversation named {}",
+                    "  ⏎ starts a BRAND-NEW {} conversation named {}",
+                    s.agents.conv_of(&key).label(),
                     key.session_name()
                 )
             })),
@@ -427,7 +429,7 @@ fn draw_empty_aviary(frame: &mut Frame, area: Rect) {
         .centered(),
         Line::from(""),
         Line::from(dim("a bird is a Claude Code session that lives in one repo")).centered(),
-        Line::from(dim("and resumes by name — hatch one per repo you work in")).centered(),
+        Line::from(dim("and remembers across restarts — hatch one per repo you work in")).centered(),
         Line::from(""),
         Line::from(vec![key(&hatch), muted("hatch your first bird — or click here")]),
         Line::from(vec![key(&help), muted("every key")]),

@@ -13,7 +13,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::DefaultTerminal;
 
 use crate::action::{Action, Effects, Msg};
-use crate::agent_store::Collab;
+use crate::agent_store::{Collab, Signaled};
 use crate::clipboard;
 use crate::command::Executor;
 use crate::components::{hits, Component, Components};
@@ -136,11 +136,12 @@ impl App {
             Event::Mouse(m) => self.on_mouse(m),
             Event::AgentOutput(key) => {
                 use crate::agent_store::RelaunchHint;
-                if self.shared.agents.note_output(&self.shared.config, &key)
-                    == RelaunchHint::FreshSpawn
+                if let RelaunchHint::FreshSpawn(resend) =
+                    self.shared.agents.note_output(&self.shared.config, &key)
                 {
-                    // The named session was gone — start THAT tab fresh.
-                    let prompt = self.shared.opening_prompt(&key);
+                    // The session was gone — start THAT tab fresh, with the
+                    // prompt the dead launch carried (never lose it).
+                    let prompt = resend.or_else(|| self.shared.opening_prompt(&key));
                     self.shared.boot_key(&key, prompt.as_deref());
                     self.shared.flash(format!(
                         "{}'s old session was gone — hatched fresh",
@@ -154,7 +155,7 @@ impl App {
                 }
                 crate::command::CommandResult::Agents { gen, ref sessions } => {
                     if self.shared.agents_poll.accept(gen, ()) {
-                        let transitions = self.shared.agents.apply_poll(sessions);
+                        let transitions = self.shared.agents.apply_poll(&self.shared.config, sessions);
                         self.react(transitions);
                         // The same poll names the birds' workers.
                         let wt = self
@@ -279,7 +280,7 @@ impl App {
                     return;
                 }
                 let prompt = prompts::direct(&format!("[webhook] {}", hook.text));
-                self.shared.boot_bot(&id, Some(&prompt));
+                self.shared.signal(&id, None, Some(&prompt));
                 self.shared.agents.mark_unread(&id);
                 self.shared.flash(format!("webhook → {id}"));
             }
@@ -331,9 +332,14 @@ impl App {
             self.shared.agents.mark_routine_run(&self.shared.config, &id, &rid, now);
         }
         for (id, rid, prompt) in fire {
-            self.shared
-                .boot_bot(&id, Some(&format!("[routine {rid}] {prompt}")));
             self.shared.agents.mark_routine_run(&self.shared.config, &id, &rid, now);
+            // A busy bird away from home never stacks a second firing.
+            let tag = format!("[routine {rid}]");
+            let home = config::ConvKey::home(config::SessionKey::primary(id.clone()));
+            if self.shared.agents.queued_with_prefix(&home, &tag) {
+                continue;
+            }
+            self.shared.signal(&id, None, Some(&format!("{tag} {prompt}")));
             self.shared.flash(format!("routine {rid} → {id}"));
         }
     }
@@ -391,6 +397,7 @@ impl App {
             for ev in events {
                 if let Some(t) = self.shared.agents.apply_hook(
                     &self.shared.config,
+                    &ev.session_id,
                     ev.aviary_session.as_deref(),
                     &ev.cwd,
                     &ev.hook_event_name,
@@ -417,8 +424,16 @@ impl App {
         // whether or not anyone is looking at the room.
         let dispatches = self.shared.watcher.poll(&self.shared.config);
         for (target, room_id, prompt) in dispatches {
-            self.shared.boot_bot(&target, Some(&prompt));
-            self.shared.agents.set_collab(&target, Collab::Room(room_id));
+            // Collab marks a room prompt the bird is ON — not one queued.
+            if self.shared.signal(&target, Some(&room_id), Some(&prompt)).is_some_and(|s| s != Signaled::Queued) {
+                self.shared.agents.set_collab(&target, Collab::Room(room_id));
+            }
+        }
+        // Tab 1 changes conversation only here, and only when idle.
+        let tx = self.shared.tx.clone();
+        for (id, conv) in self.shared.agents.pump_switches(&self.shared.config, &tx) {
+            let name = self.shared.config.bot(&id).map_or_else(|| id.0.clone(), |b| b.name.clone());
+            self.shared.flash(format!("{name} ⇄ {}", conv.label()));
         }
 
         let mut fx = Effects::default();
@@ -460,6 +475,7 @@ impl App {
                     s.term.send_key(key);
                     // The user taking over means the bird works for THEM now.
                     self.shared.agents.clear_collab(&skey.bot);
+                    self.shared.agents.note_human_input(&skey);
                 }
                 _ => self.shared.agent_focused = false,
             }
@@ -579,7 +595,10 @@ impl App {
             }
             // Content-pane verbs go to the room view; everything else is the
             // sidebar's (which owns selection and all bird actions).
-            Action::PageUp | Action::PageDown | Action::Compose | Action::Quick(_) => {
+            Action::PageUp
+            | Action::PageDown
+            | Action::Compose
+            | Action::Quick(_) => {
                 if self.room_selected() {
                     let mut fx = Effects::default();
                     self.components.room.update(action, &mut self.shared, &mut fx);
@@ -643,20 +662,11 @@ impl App {
                 match self.shared.config.add_room(&name, members) {
                     Ok(id) => {
                         self.overlay = Overlay::None;
-                        // Every member starts over on the room's first message;
-                        // nothing spawns here (see Shared::reset_for_room).
-                        let reset = match self.shared.config.room(&id).cloned() {
-                            Some(room) => self.shared.reset_for_room(&room),
-                            None => Vec::new(),
-                        };
-                        self.shared.flash(if reset.is_empty() {
-                            format!("#{id} created — members start fresh on the first message")
-                        } else {
-                            format!(
-                                "#{id} created · {} start fresh on the first message",
-                                reset.join(", ")
-                            )
-                        });
+                        // No session is touched: the room owns a conversation
+                        // per member, hatched on its first message to them.
+                        self.shared.flash(format!(
+                            "#{id} created — each bird joins in its own room conversation"
+                        ));
                         let mut fx = Effects::default();
                         fx.msg(Msg::OpenRoom(id));
                         self.apply(fx);
@@ -740,7 +750,7 @@ impl App {
                 self.shared.agents.stop(&id);
                 self.shared.agent_focused = false;
                 self.shared
-                    .flash(format!("{id} stopped — its session resumes by name"));
+                    .flash(format!("{id} stopped — its conversations resume where they left off"));
             }
             FormEvent::WriteRoom(id) => {
                 self.overlay = Overlay::None;
@@ -761,6 +771,10 @@ impl App {
                     self.apply(fx);
                 }
             }
+            FormEvent::PickConversation(conv) => {
+                self.overlay = Overlay::None;
+                self.shared.pick_conversation(&conv);
+            }
             FormEvent::RenameTab { key, name } => {
                 self.overlay = Overlay::None;
                 self.shared.agents.set_tab_name(&self.shared.config, &key, &name);
@@ -780,6 +794,9 @@ impl App {
                 self.shared.agents.release(&self.shared.config, &id);
                 match self.shared.config.remove_bot(&id) {
                     Ok(dissolved) => {
+                        for room in &dissolved {
+                            self.shared.agents.forget_room(&self.shared.config, room);
+                        }
                         if self.shared.current_bot.as_ref() == Some(&id) {
                             self.shared.current_bot = None;
                             self.shared.agent_focused = false;
@@ -803,6 +820,7 @@ impl App {
             }
             RosterTarget::Room(id) => match self.shared.config.remove_room(&id) {
                 Ok(()) => {
+                    self.shared.agents.forget_room(&self.shared.config, &id);
                     if self.shared.current_room.as_deref() == Some(id.as_str()) {
                         self.shared.current_room = None;
                     }
@@ -829,12 +847,16 @@ impl App {
                 ) else {
                     return;
                 };
-                let wake = self
-                    .shared
-                    .opening_prompt(&crate::config::SessionKey::primary(target.clone()));
-                self.shared.boot_bot(&target, wake.as_deref());
+                // The target wakes on HOME — the handoff is no room's
+                // business; a target busy elsewhere goes home when idle.
+                let home = config::SessionKey::primary(target.clone());
+                let wake = match self.shared.agents.conv_of(&home).room {
+                    None => self.shared.opening_prompt(&home),
+                    Some(_) => None,
+                };
+                self.shared.signal(&target, None, wake.as_deref());
                 let prompt = prompts::handoff(&from, &to, &text, &self.shared.config.handoffs_dir());
-                self.shared.boot_bot(&src, Some(&prompt));
+                self.shared.signal(&src, None, Some(&prompt));
                 self.shared.agents.set_collab(&src, Collab::Delegating(to.id.0.clone()));
                 self.shared.agents.set_collab(&target, Collab::Receiving(from.id.0.clone()));
                 self.shared
@@ -842,7 +864,7 @@ impl App {
             }
             None => {
                 let prompt = prompts::direct(&text);
-                self.shared.boot_bot(&target, Some(&prompt));
+                self.shared.signal(&target, None, Some(&prompt));
                 // A direct user message makes the bird the USER's again.
                 self.shared.agents.clear_collab(&target);
                 let name = self
@@ -981,13 +1003,20 @@ impl App {
                     self.overlay = Overlay::Context(crate::overlays::ContextMenu::new(target, x, y));
                 }
                 Msg::OpenTabMenu { x, y } => {
-                    let attached = self
-                        .shared
-                        .current_key()
-                        .is_some_and(|k| self.shared.agents.is_attached(&k));
+                    let key = self.shared.current_key();
+                    let attached = key.as_ref().is_some_and(|k| self.shared.agents.is_attached(k));
+                    let convs: Vec<(config::ConvKey, bool)> = match &key {
+                        Some(k) if k.tab == 1 => {
+                            let on = self.shared.agents.conv_of(k);
+                            let all = self.shared.agents.conversations(&k.bot);
+                            all.into_iter().map(|c| { let here = c == on; (c, here) }).collect()
+                        }
+                        _ => Vec::new(),
+                    };
                     self.overlay = Overlay::TabMenu(crate::overlays::TabMenu::new(
                         self.shared.current_tab,
                         attached,
+                        &convs,
                         x,
                         y,
                     ));

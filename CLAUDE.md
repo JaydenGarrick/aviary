@@ -10,7 +10,7 @@ architecture throughout — read this map before touching the shell.
 | `app.rs` | the THIN shell: layered key dispatch, overlay routing, msg fan-out, run loop. If a change grows this file, it probably belongs in a component. |
 | `components/` | one module per screen (roster · thread · room), each owning state + input + draw + its own hit rects. Bots and rooms are STATE inside components, never new components. |
 | `shared.rs` | cross-component state (`Shared`): config, `AgentStore`, room watcher, branch slot, focus. |
-| `agent_store.rs` | the birds: spawn/resume (`--name` / `--resume aviary-<id>[.n]`), stop, status, keyed by `SessionKey` (bird × tab; tab 1 = primary). Session identity IS the session name — no jsonl bookkeeping. Owns the PTYs and the status LAYERING (`pick_status`); the signals beyond the PTY live in its `ModLayer`. Types the dead-mod inbox fallback itself (`sweep_inbox`) and derives the chip text components draw (`detail` · `reporting_key` · `attention_text`). Per-key observations are dropped in ONE place (`forget_where`). |
+| `agent_store.rs` | the birds: spawn/resume (`--name aviary-<id>[.n] --session-id <uuid>` / `--resume <uuid>`), stop, status, keyed by `SessionKey` (bird × tab; tab 1 = primary), each PTY running one CONVERSATION (`ConvKey`: a tab's own, or tab 1's home / a room's). Routes external signals (`signal` → `route`) and owns the ONE place tab 1 switches conversation (`pump_switches` → `next_switch`). No jsonl bookkeeping. Owns the PTYs and the status LAYERING (`pick_status`); the signals beyond the PTY live in its `ModLayer`. Types the dead-mod inbox fallback itself (`sweep_inbox`) and derives the chip text components draw (`detail` · `reporting_key` · `attention_text`). Per-key observations are dropped in ONE place (`forget_where`). |
 | `mod_layer.rs` | `ModLayer`, owned by `AgentStore` (as `Workers` is): per-key session ids, poll kind + `waitingFor`, the hooks' last needs-input, the mod's status records, and the inbox (`delivery` · `post` · `take_for_typing` · `inbox_move` on a new id · `gc`). Bounded fs only. |
 | `status.rs` | the status vocabulary (`StatusKind` · `BotStatus` · `Detail` · `map_status_str`), pure — its own module so the store, flock, status files and UI depend on it, not on each other. |
 | `pty.rs` | embedded terminal (portable-pty + vt100 + tui-term). Resize is guarded; wheel forwards SGR on the alt screen. |
@@ -41,24 +41,52 @@ architecture throughout — read this map before touching the shell.
 - **Room dispatch is mention-driven** — a bot append wakes only who it
   @-mentions. Loosening this reintroduces unbounded bot chatter; don't.
 - **External signals target the PRIMARY session (tab 1) only** — rooms,
-  handoffs, routines, and webhooks all funnel through `Shared::boot_bot`.
-  Extra session tabs (`aviary-<id>.<n>`) are human-driven; routing signals at
-  them reintroduces unbounded fan-out. The `.` tab separator is safe because
+  handoffs, routines, and webhooks all funnel through `Shared::signal`, each
+  naming a CONVERSATION: rooms their own, everything else home. Extra session
+  tabs (`aviary-<id>.<n>`) are human-driven; routing signals at them
+  reintroduces unbounded fan-out. The `.` tab separator is safe because
   `slug()` can never emit one into a bot id.
+- **Session identity is the PINNED id, not the name.** Every fresh launch is
+  `--name aviary-<id>[.n] --session-id <uuid>` with a uuid aviary minted
+  (`State::begin_fresh`, never a reused one — claude refuses "already in
+  use"); every later one is `--resume <uuid>`. The name only ADDRESSES the
+  bird (SendMessage, hooks) and is shared by every conversation tab 1 ever
+  ran — claude refuses `--resume <name>` once two sessions share it. Records
+  live in state.json `convs` (`ConvRecord { sid, created }`); a v0.3.1
+  `spawned` entry migrates to `{sid: None}` and resumes by name once. The
+  poll joins rows by pinned id first (`poll_matches`; the name fallback takes
+  only a unique row no other record owns), hooks by their `session_id` (a
+  late hook from a conversation no longer running is dropped), and gc keeps
+  every recorded id's queue. A launch SEEDS its id into `ModLayer` and
+  clears the slot's retired one (`ModLayer::seed`) — or `note_poll` would
+  move one conversation's queue into another.
 - **Prompts into FRESH sessions ride argv**, never typed into a booting PTY.
   A session already RUNNING gets its prompt through ONE ordered queue, the
-  inbox (`inbox/<sessionId>/`), as soon as the poll has named its session id
+  inbox (`inbox/<sessionId>/`) — known at launch for a pinned session
   (`AgentStore::delivery` → `Delivery::Inbox`). A live mod submits each file
   with `$.prompt.submit` (a turn of its own, once idle) and acks it; for a
   mod not heard from for 30 s (or never — claude < 2.1.287) the shell types
   the oldest file, one per tick, never into a PTY younger than MARK_AFTER.
-  Immediate keystrokes (`send_line`) remain only for a running session the
-  poll has not named yet (its first ~3 s), or when the inbox write fails.
-- **Room creation RESETS members' primary sessions without relaunching** —
-  drop the PTY, forget the resume record (`AgentStore::reset_primary`); the
-  room's first dispatch hatches them fresh with the prompt on argv. Never
-  eager-spawn at creation: the composer opens immediately and the first
-  message would be keystrokes at a booting PTY. Tabs are untouched.
+  Immediate keystrokes (`send_line`) remain only for a v0.3.1 session the
+  poll has not named yet, or when the inbox write fails. A resume that dies
+  on arrival relaunches fresh WITH the prompt that rode it.
+- **Each room owns a conversation per member** (`ConvKey` `<bird>#<room>`),
+  run in tab 1 — the bird's HOME conversation is `<bird>`. Room creation
+  touches no session and never eager-spawns; the room's first dispatch to a
+  bird hatches its room conversation with the prompt on argv. Tab 1 runs ONE
+  conversation (`active` in state.json): a signal for the running one is
+  delivered, a stopped tab 1 launches the target, and a live tab 1 on
+  ANOTHER conversation is never relaunched by a signal — the prompt queues in
+  the target's inbox (`AgentStore::signal` → `route`). `pump_switches` is the
+  ONE place a live tab 1 changes conversation, behind pure `next_switch`:
+  Done ≥ 5 s, booted ≥ MARK_AFTER, its own queue drained, no keystroke from
+  the person for 30 s, nothing typed by aviary for 5 s, no workers out
+  (their reports address the conversation that spawned them). Then: an
+  outright want (the person's tab-menu pick — pinned until a turn runs in
+  it — a handoff's wake, a deleted room sending it home), else the OLDEST
+  queued prompt, which rides argv; the rest drain through the mod. Pending
+  switches are files, so they survive a restart. Deleting a room forgets its
+  conversations and queues.
 - **Mouse gestures have an owner.** The pane that takes `Down` receives
   `Drag`/`Up` until release (`App::drag_owner`), so a drag-select in the room
   finishes even when the button comes up over the sidebar. Selection lives
@@ -85,9 +113,10 @@ architecture throughout — read this map before touching the shell.
   invent urgency from an unrecognized state. Workers: the poll's exit wins,
   then a live mod, then the poll, then the report refining idle.
 - **Worker name grammar is a hard rule:** `aviary-<bird>_<slug>-<role>` —
-  `_` is the worker separator, `.` the tab separator; `slug()` emits neither
-  and config load rejects ids containing them, so `SessionKey::parse_session_name`
-  and `flock::WorkerName::parse` are provably disjoint (test-guarded). Roles:
+  `_` is the worker separator, `.` the tab separator, `#` the room one (state
+  keys only); `slug()` emits none and config load rejects ids containing
+  them, so `SessionKey::parse_session_name`, `ConvKey::parse_record_key` and
+  `flock::WorkerName::parse` are provably disjoint (test-guarded). Roles:
   impl · research · review · pr. A worker only attributes to a CONFIGURED bird.
 - **Workers are poll-attributed, never spawned by aviary.** The bird spawns
   them (the shipped `flock-orchestrator` skill); aviary watches `claude agents
@@ -122,7 +151,7 @@ architecture throughout — read this map before touching the shell.
 
 ## Verify
 
-`cargo test` (113 unit tests: keymap, list_nav, config scaffold + mod
+`cargo test` (125 unit tests: keymap, list_nav, config scaffold + mod
 materialization, user-name resolution, session keys, status layering, hook
 attribution, room dispatch, prompt wording, markdown layout, room selection
 math, worker name grammar + report precedence, status-file

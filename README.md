@@ -52,10 +52,10 @@ and gives the birds each other.
 
 ## How a bird works
 
-- **One session per repo, resumed by name.** A bird spawns as
+- **One session per repo, resumed by id.** A bird spawns as
   `claude --name aviary-<id>` in its repo; every later open is
-  `claude --resume aviary-<id>` — the conversation (and the repo context in it)
-  persists across aviary restarts.
+  `claude --resume <sessionId>` (the id aviary pinned at birth with `--session-id`) —
+  the conversation (and the repo context in it) persists across aviary restarts.
 - **Character via `--append-system-prompt-file`.** Each bird has a persona file
   in `~/.config/aviary/birds/` — identity and voice, teammates, room protocol.
   The repo's own CLAUDE.md stays the law; the persona is who the bird *is*.
@@ -71,8 +71,15 @@ and gives the birds each other.
   Dispatch is mention-driven: your message with no mentions wakes every member,
   a bird's reply only wakes who it @-mentions — so bot chatter is bounded.
   Transcripts render as markdown (tables, lists, code, bold, coloured
-  @mentions). Creating a room gives every member a **fresh conversation**:
-  their primary sessions reset and hatch anew on the room's first message.
+  @mentions). **Each room owns a conversation per member**, separate from
+  the bird's **home** conversation: creating a room touches no session, and
+  the room's first message to a bird hatches its room conversation. Tab 1
+  runs one conversation at a time and switches by itself — when the bird is
+  idle (done ≥ 5 s, you not typing, no workers out) to whichever
+  conversation has the oldest queued prompt. Rooms switch it to the room's;
+  routines, handoffs and webhooks switch it home. The tab strip (`1:home` /
+  `1:#nest`), the roster card and the profile say which it is on; tab 1's
+  menu switches it by hand.
 - **Linear + Figma come along.** Every bird spawns with
   `--mcp-config ~/.config/aviary/mcp.json` (Linear + Figma remote MCP servers),
   and composers detect `ABC-123` / linear.app / figma.com references and wrap
@@ -131,7 +138,7 @@ no birds, and the cockpit opens on a zero state that says so:
 │ no birds yet —    │          the aviary is empty                   │
 │ n hatches one     │                                                │
 │                   │  a bird is a Claude Code session that lives    │
-│                   │  in one repo and resumes by name               │
+│                   │  in one repo and remembers across restarts     │
 │                   │                                                │
 │                   │        n  hatch your first bird — or click     │
 │                   │        ?  every key                            │
@@ -159,7 +166,7 @@ Requires Claude Code ≥ 2.1.224 (cross-session messaging + `--name`);
 | `n` / `c` (or the `+ bird` / `+ room` buttons) | hatch a bird / create a room |
 | `p` | bird profile: persona, routines, notifications toggle, fresh start |
 | `N` | abandon the bird's conversation and start a fresh one |
-| `x` | stop a bird (all its sessions; they resume by name later) — on a worker row, `claude stop` it after a confirm |
+| `x` | stop a bird (all its sessions; their conversations resume later) — on a worker row, `claude stop` it after a confirm |
 | `T` / click `[+]` | open a parallel session of the bird in a new tab |
 | `]` / `[` / click a tab | cycle / pick the bird's session tabs |
 | `W` | close the viewed tab and forget it (tab 1 refuses — that's the bird); a worker viewer tab just closes, the worker keeps running |

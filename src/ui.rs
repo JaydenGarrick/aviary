@@ -216,7 +216,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect, groups: &[(&'static str, &[Bindi
         lines.push(Line::from(""));
     }
     lines.push(Line::from(dim(
-        "  birds are claude sessions named aviary-<id> — they resume by name",
+        "  birds are claude sessions named aviary-<id> — every conversation resumes by its id",
     )));
 
     let height = (lines.len() as u16 + 2).min(area.height);

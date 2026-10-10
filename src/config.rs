@@ -14,7 +14,7 @@
 //! work-repo paths and handoff content concerns work code — none of which
 //! belongs in a personal GitHub repo.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -77,9 +77,10 @@ impl SessionKey {
 
     /// Inverse of [`SessionKey::state_key`].
     pub fn parse_state_key(key: &str) -> Option<SessionKey> {
-        // `_` is the worker separator (`flock::WorkerName`): a worker name is
-        // never a bird or a tab. `slug()` emits neither separator.
-        if key.is_empty() || key.contains(crate::flock::SEP) {
+        // `_` is the worker separator (`flock::WorkerName`) and `#` the room
+        // one (`ConvKey`): neither is ever a bird or a tab. `slug()` emits
+        // none of them.
+        if key.is_empty() || key.contains(crate::flock::SEP) || key.contains(ROOM_SEP) {
             return None;
         }
         match key.split_once('.') {
@@ -90,6 +91,63 @@ impl SessionKey {
                     bot: BotId(id.to_string()),
                     tab,
                 })
+            }
+        }
+    }
+}
+
+/// The room separator in a conversation record key: `<bird>#<room>`.
+/// `slug()` never emits it, so it is disjoint from `.` (tabs) and `_`
+/// (workers).
+pub const ROOM_SEP: char = '#';
+
+/// A CONVERSATION: what a PTY slot runs. A tab runs its own; tab 1 runs the
+/// bird's home conversation or — `room: Some` — its conversation in a room.
+/// Record key grammar: `<bird>` · `<bird>.<n>` · `<bird>#<room>`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ConvKey {
+    pub slot: SessionKey,
+    pub room: Option<String>,
+}
+
+impl ConvKey {
+    /// The slot's own conversation (home on tab 1).
+    pub fn home(slot: SessionKey) -> ConvKey {
+        ConvKey { slot, room: None }
+    }
+
+    /// A bird's conversation in a room — always on its primary.
+    pub fn room(bot: BotId, room: &str) -> ConvKey {
+        ConvKey {
+            slot: SessionKey::primary(bot),
+            room: Some(room.to_string()),
+        }
+    }
+
+    /// The `state.json` key: `<id>`, `<id>.<n>`, or `<id>#<room>`.
+    pub fn record_key(&self) -> String {
+        match &self.room {
+            None => self.slot.state_key(),
+            Some(room) => format!("{}{ROOM_SEP}{room}", self.slot.bot),
+        }
+    }
+
+    /// How it reads in the tab strip and flashes: `home` / `#room`.
+    pub fn label(&self) -> String {
+        match &self.room {
+            Some(room) => format!("#{room}"),
+            None => "home".into(),
+        }
+    }
+
+    /// Inverse of [`ConvKey::record_key`].
+    pub fn parse_record_key(key: &str) -> Option<ConvKey> {
+        match key.split_once(ROOM_SEP) {
+            None => SessionKey::parse_state_key(key).map(ConvKey::home),
+            Some((bird, room)) => {
+                let slot = SessionKey::parse_state_key(bird).filter(|k| k.tab == 1)?;
+                let clean = !room.is_empty() && !room.contains(['.', ROOM_SEP, crate::flock::SEP]);
+                clean.then(|| ConvKey::room(slot.bot, room))
             }
         }
     }
@@ -323,7 +381,7 @@ impl Config {
     }
 
     /// Remove a bird from the roster. Its persona file and claude session
-    /// survive (resumable with `claude --resume aviary-<id>`); it also leaves
+    /// survive (resumable with `claude --resume <session id>`); it also leaves
     /// every room, and a room left with fewer than two birds dissolves too.
     /// Returns the ids of rooms that dissolved.
     pub fn remove_bot(&mut self, id: &BotId) -> Result<Vec<String>> {
@@ -514,7 +572,7 @@ impl Config {
 /// suffix and `_` starts a worker suffix. `slug()` never emits them; this
 /// guards hand-edited config.json.
 pub fn valid_bot_id(s: &str) -> bool {
-    !s.is_empty() && !s.contains('.') && !s.contains(crate::flock::SEP)
+    !s.is_empty() && !s.contains('.') && !s.contains(crate::flock::SEP) && !s.contains(ROOM_SEP)
 }
 
 fn slug(s: &str) -> String {
@@ -678,45 +736,193 @@ fn scaffold(dir: &Path) -> Result<()> {
 
 // --------------------------------------------------------------------- state
 
-/// Which bots have ever had a session — decides `--resume` vs a fresh spawn —
-/// plus when each routine last fired.
+/// One conversation's record. `sid` is the claude session id aviary PINNED
+/// for it (`--session-id`, minted here) — `None` only for a v0.3.1 record,
+/// which resumes by name until the poll names it. `created` = the session
+/// survived [`MARK_AFTER`](crate::agent_store) and is resumable.
+#[derive(Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct ConvRecord {
+    #[serde(default)]
+    pub sid: Option<String>,
+    #[serde(default)]
+    pub created: bool,
+}
+
+/// Every conversation's record and when each routine last fired. Session
+/// identity is the PINNED id: a name is shared by every conversation a slot
+/// ever ran, and claude refuses `--resume <name>` once two sessions share it.
 #[derive(Default, Serialize, Deserialize)]
 pub struct State {
+    /// Conversation record key (`ConvKey::record_key`) → its record.
     #[serde(default)]
-    spawned: BTreeSet<String>,
+    convs: BTreeMap<String, ConvRecord>,
     /// `"<bot>/<routine id>"` → unix seconds of the last firing.
     #[serde(default)]
-    routine_runs: std::collections::BTreeMap<String, u64>,
-    /// State key → a human label for the tab strip. Display only — the
-    /// SESSION name stays `aviary-<id>[.n]`, or resume would break.
+    routine_runs: BTreeMap<String, u64>,
+    /// State key → a human label for the tab strip. Display only.
     #[serde(default)]
-    tab_names: std::collections::BTreeMap<String, String>,
+    tab_names: BTreeMap<String, String>,
+    /// Bird id → the room whose conversation its tab 1 runs (absent = home).
+    #[serde(default)]
+    active: BTreeMap<String, String>,
+    /// v0.3.1: the keys that ever spawned. Read once into `convs`.
+    #[serde(default, skip_serializing)]
+    spawned: BTreeSet<String>,
+    /// Pre-release: ids the poll named per key. Read once into `convs`.
+    #[serde(default, skip_serializing)]
+    session_ids: BTreeMap<String, String>,
 }
 
 impl State {
     pub fn load(dir: &Path) -> State {
-        std::fs::read_to_string(dir.join("state.json"))
+        let mut state: State = std::fs::read_to_string(dir.join("state.json"))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.migrate();
+        state
     }
 
-    pub fn spawned_once(&self, state_key: &str) -> bool {
-        self.spawned.contains(state_key)
+    /// Older files name only which keys spawned (and, pre-release, the id
+    /// the poll saw): each becomes a created record — by id when one is
+    /// known, else resumed by name once and named by the poll.
+    fn migrate(&mut self) {
+        for key in std::mem::take(&mut self.spawned) {
+            let sid = self.session_ids.get(&key).cloned();
+            self.convs.entry(key).or_insert(ConvRecord { sid, created: true });
+        }
+        self.session_ids.clear();
     }
 
-    pub fn mark_spawned(&mut self, dir: &Path, state_key: &str) {
-        self.spawned.insert(state_key.to_string());
+    pub fn record(&self, conv: &ConvKey) -> Option<&ConvRecord> {
+        self.convs.get(&conv.record_key())
+    }
+
+    /// Resumable: the session survived its first launch.
+    pub fn created(&self, conv: &ConvKey) -> bool {
+        self.record(conv).is_some_and(|r| r.created)
+    }
+
+    /// A fresh launch: mint a new id (claude refuses a reused one — "already
+    /// in use" — so even an uncreated record never re-pins its old id).
+    /// Returns `(new, old)`; the caller carries `old`'s queued prompts over.
+    pub fn begin_fresh(&mut self, dir: &Path, conv: &ConvKey) -> (String, Option<String>) {
+        let sid = mint_session_id();
+        let old = self
+            .convs
+            .insert(conv.record_key(), ConvRecord { sid: Some(sid.clone()), created: false })
+            .and_then(|r| r.sid);
         self.write(dir);
+        (sid, old)
     }
 
-    /// Forget a session of record so the next launch starts fresh (a dead
-    /// resume, a closed tab, a deliberate fresh start). The label survives —
-    /// a fresh conversation on a named tab keeps its name; `set_tab_name`
+    /// The session survived [`MARK_AFTER`](crate::agent_store): resumable.
+    /// Never resurrects a record forgotten meanwhile (a deleted room).
+    pub fn mark_created(&mut self, dir: &Path, conv: &ConvKey) {
+        if let Some(r) = self.convs.get_mut(&conv.record_key()) {
+            r.created = true;
+            self.write(dir);
+        }
+    }
+
+    /// The id a prompt for a NOT-running conversation is queued under
+    /// (`inbox/<sid>/`): its record's, or one minted now for a conversation
+    /// never launched — its first launch moves the queue to its real id.
+    /// `None` for a v0.3.1 record whose id was never learned.
+    pub fn queue_sid(&mut self, dir: &Path, conv: &ConvKey) -> Option<String> {
+        if let Some(r) = self.convs.get(&conv.record_key()) {
+            return r.sid.clone();
+        }
+        let sid = mint_session_id();
+        self.convs
+            .insert(conv.record_key(), ConvRecord { sid: Some(sid.clone()), created: false });
+        self.write(dir);
+        Some(sid)
+    }
+
+    /// A resume died on arrival: the next launch is fresh (and moves this
+    /// id's queued prompts to the new one — see [`State::begin_fresh`]).
+    pub fn uncreate(&mut self, dir: &Path, conv: &ConvKey) {
+        if let Some(r) = self.convs.get_mut(&conv.record_key()) {
+            r.created = false;
+            self.write(dir);
+        }
+    }
+
+    /// The poll saw this conversation under another id (`/clear` inside the
+    /// PTY, or a by-name resume learning its id); writes only on change.
+    pub fn set_sid(&mut self, dir: &Path, conv: &ConvKey, sid: &str) {
+        let Some(r) = self.convs.get_mut(&conv.record_key()) else {
+            return; // forgotten meanwhile (a deleted room): stay forgotten
+        };
+        if r.sid.as_deref() != Some(sid) {
+            r.sid = Some(sid.to_string());
+            self.write(dir);
+        }
+    }
+
+    /// Forget a conversation so the next launch starts fresh (a closed tab,
+    /// a deliberate fresh start). The tab's label survives — `set_tab_name`
     /// with an empty string clears it where that is wanted.
-    pub fn forget(&mut self, dir: &Path, state_key: &str) {
-        self.spawned.remove(state_key);
+    pub fn forget(&mut self, dir: &Path, conv: &ConvKey) {
+        self.convs.remove(&conv.record_key());
         self.write(dir);
+    }
+
+    /// Every pinned id on record — gc keeps their status files and inboxes.
+    pub fn all_sids(&self) -> impl Iterator<Item = &str> {
+        self.convs.values().filter_map(|r| r.sid.as_deref())
+    }
+
+    /// The room whose conversation the bird's tab 1 runs; `None` = home.
+    pub fn active_room(&self, bot: &BotId) -> Option<&str> {
+        self.active.get(&bot.0).map(String::as_str)
+    }
+
+    /// The conversation the bird's tab 1 runs.
+    pub fn active_conv(&self, bot: &BotId) -> ConvKey {
+        match self.active_room(bot) {
+            Some(room) => ConvKey::room(bot.clone(), room),
+            None => ConvKey::home(SessionKey::primary(bot.clone())),
+        }
+    }
+
+    pub fn set_active(&mut self, dir: &Path, conv: &ConvKey) {
+        let bot = conv.slot.bot.0.clone();
+        let changed = match &conv.room {
+            Some(room) => self.active.insert(bot, room.clone()).as_deref() != Some(room.as_str()),
+            None => self.active.remove(&bot).is_some(),
+        };
+        if changed {
+            self.write(dir);
+        }
+    }
+
+    /// The rooms this bird has a conversation in, sorted.
+    pub fn room_convs(&self, bot: &BotId) -> Vec<String> {
+        self.convs
+            .keys()
+            .filter_map(|k| ConvKey::parse_record_key(k))
+            .filter(|c| c.slot.bot == *bot)
+            .filter_map(|c| c.room)
+            .collect()
+    }
+
+    /// A room left the roster: its conversations are forgotten (the claude
+    /// sessions themselves survive on disk). Returns their ids, so the
+    /// caller can drop their queues. A bird ACTIVE on the room keeps the
+    /// pointer until the caller moves it home (it may still be running).
+    pub fn forget_room(&mut self, dir: &Path, room: &str) -> Vec<String> {
+        let mut sids = Vec::new();
+        self.convs.retain(|k, r| {
+            let gone = ConvKey::parse_record_key(k).is_some_and(|c| c.room.as_deref() == Some(room));
+            if gone {
+                sids.extend(r.sid.clone());
+            }
+            !gone
+        });
+        self.write(dir);
+        sids
     }
 
     pub fn tab_name(&self, state_key: &str) -> Option<&str> {
@@ -734,25 +940,28 @@ impl State {
         self.write(dir);
     }
 
-    /// Every tab of this bird with a session of record (`<id>` → 1,
-    /// `<id>.<n>` → n). Order is ascending by tab.
+    /// Every tab of this bird with a resumable conversation of its own
+    /// (`<id>` → 1, `<id>.<n>` → n). Order is ascending by tab.
     pub fn spawned_tabs(&self, id: &BotId) -> Vec<u8> {
         let mut tabs: Vec<u8> = self
-            .spawned
+            .convs
             .iter()
-            .filter_map(|k| SessionKey::parse_state_key(k))
-            .filter(|k| k.bot == *id)
-            .map(|k| k.tab)
+            .filter(|(_, r)| r.created)
+            .filter_map(|(k, _)| ConvKey::parse_record_key(k))
+            .filter(|c| c.slot.bot == *id && c.room.is_none())
+            .map(|c| c.slot.tab)
             .collect();
         tabs.sort_unstable();
         tabs
     }
 
-    /// Drop every session record of one bird — primary and tabs alike.
+    /// Drop every record of one bird — primary, tabs and room conversations
+    /// alike. Keys are PARSED, never prefix-matched: `swift` ≠ `swiftly`.
     pub fn forget_bot(&mut self, dir: &Path, id: &BotId) {
-        let foreign = |k: &str| SessionKey::parse_state_key(k).is_none_or(|key| key.bot != *id);
-        self.spawned.retain(|k| foreign(k));
+        let foreign = |k: &str| ConvKey::parse_record_key(k).is_none_or(|c| c.slot.bot != *id);
+        self.convs.retain(|k, _| foreign(k));
         self.tab_names.retain(|k, _| foreign(k));
+        self.active.remove(&id.0);
         self.write(dir);
     }
 
@@ -770,6 +979,29 @@ impl State {
             let _ = std::fs::write(dir.join("state.json"), json + "\n");
         }
     }
+}
+
+/// A fresh claude session id: a v4 uuid from 16 bytes of `/dev/urandom`
+/// (bounded fs — UI-thread safe; no uuid crate for one function).
+pub fn mint_session_id() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    let read = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    if read.is_err() {
+        // Never block a launch on entropy: time + pid + a counter is unique
+        // enough for a local session id.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        b[..8].copy_from_slice(&(t as u64).to_le_bytes());
+        b[8..].copy_from_slice(&((std::process::id() as u64) << 32 | n).to_le_bytes());
+    }
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
 /// Test fixture: a scaffolded config dir with birds `ids` hatched into
@@ -1032,29 +1264,94 @@ mod tests {
             .is_err());
     }
 
+    fn conv(k: &str) -> ConvKey {
+        ConvKey::parse_record_key(k).unwrap()
+    }
+
     #[test]
     fn state_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         let mut st = State::default();
-        assert!(!st.spawned_once("swift"));
-        st.mark_spawned(tmp.path(), "swift");
-        assert!(State::load(tmp.path()).spawned_once("swift"));
-        st.forget(tmp.path(), "swift");
-        assert!(!State::load(tmp.path()).spawned_once("swift"));
-
-        // Tab entries share the set; forget_bot sweeps a bird's whole family
-        // without touching a bird whose id merely shares the prefix.
-        st.mark_spawned(tmp.path(), "swift");
-        st.mark_spawned(tmp.path(), "swift.2");
-        st.mark_spawned(tmp.path(), "swiftly");
+        let swift = conv("swift");
+        assert!(!st.created(&swift));
+        let (sid, old) = st.begin_fresh(tmp.path(), &swift);
+        assert_eq!(old, None);
+        assert!(!State::load(tmp.path()).created(&swift), "resumable only once it survives");
+        st.mark_created(tmp.path(), &swift);
         let loaded = State::load(tmp.path());
-        assert!(loaded.spawned_once("swift.2"));
-        assert_eq!(loaded.spawned_tabs(&BotId("swift".into())), vec![1, 2]);
+        assert_eq!(loaded.record(&swift), Some(&ConvRecord { sid: Some(sid.clone()), created: true }));
+        assert_eq!(loaded.all_sids().collect::<Vec<_>>(), [sid.as_str()]);
+        st.forget(tmp.path(), &swift);
+        assert!(State::load(tmp.path()).record(&swift).is_none());
+
+        // Tabs and room conversations share the map; forget_bot sweeps a
+        // bird's whole family without touching a bird whose id merely
+        // shares the prefix.
+        for k in ["swift", "swift.2", "swift#nest", "swiftly", "swiftly#nest"] {
+            st.begin_fresh(tmp.path(), &conv(k));
+            st.mark_created(tmp.path(), &conv(k));
+        }
+        let loaded = State::load(tmp.path());
+        assert_eq!(loaded.spawned_tabs(&BotId("swift".into())), vec![1, 2], "a room is not a tab");
         st.forget_bot(tmp.path(), &BotId("swift".into()));
         let loaded = State::load(tmp.path());
-        assert!(!loaded.spawned_once("swift"));
-        assert!(!loaded.spawned_once("swift.2"));
-        assert!(loaded.spawned_once("swiftly"));
+        for gone in ["swift", "swift.2", "swift#nest"] {
+            assert!(loaded.record(&conv(gone)).is_none(), "{gone}");
+        }
+        assert!(loaded.created(&conv("swiftly")));
+        assert!(loaded.created(&conv("swiftly#nest")));
+    }
+
+    /// v0.3.1 named only which keys spawned; the pre-release interim also
+    /// had poll-learned ids. Both load as created records, and the old
+    /// fields are never written back.
+    #[test]
+    fn state_migrates_spawned_sets_and_interim_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("state.json"),
+            r#"{"spawned":["swift","swift.2"],"session_ids":{"swift":"abc"},"tab_names":{"swift.2":"x"}}"#,
+        )
+        .unwrap();
+        let mut st = State::load(tmp.path());
+        assert_eq!(st.record(&conv("swift")), Some(&ConvRecord { sid: Some("abc".into()), created: true }));
+        assert_eq!(st.record(&conv("swift.2")), Some(&ConvRecord { sid: None, created: true }));
+        assert_eq!(st.tab_name("swift.2"), Some("x"));
+        st.mark_routine_run(tmp.path(), &BotId("swift".into()), "r", 1);
+        let text = std::fs::read_to_string(tmp.path().join("state.json")).unwrap();
+        assert!(!text.contains("spawned") && !text.contains("session_ids"), "{text}");
+        assert!(State::load(tmp.path()).created(&conv("swift.2")));
+    }
+
+    #[test]
+    fn conv_keys_parse_their_three_shapes_and_nothing_else() {
+        let home = ConvKey::home(SessionKey::primary(BotId("swift".into())));
+        let tab = ConvKey::home(SessionKey { bot: BotId("swift".into()), tab: 2 });
+        let room = ConvKey::room(BotId("swift".into()), "fly-calc");
+        for c in [&home, &tab, &room] {
+            assert_eq!(ConvKey::parse_record_key(&c.record_key()).as_ref(), Some(c));
+        }
+        assert_eq!(room.record_key(), "swift#fly-calc");
+        assert_eq!(room.slot, SessionKey::primary(BotId("swift".into())), "rooms run in tab 1");
+        // Rooms live on the primary only; separators never nest.
+        for bad in ["swift.2#nest", "swift#", "#nest", "swift#a#b", "swift#a.b", "swift#a_b", "swift_x#nest"] {
+            assert_eq!(ConvKey::parse_record_key(bad), None, "{bad}");
+        }
+        // The three grammars are disjoint: a room key is never a slot key.
+        assert_eq!(SessionKey::parse_state_key("swift#nest"), None);
+        assert_eq!(SessionKey::parse_session_name("aviary-swift#nest"), None);
+    }
+
+    #[test]
+    fn minted_session_ids_are_v4_uuids_and_unique() {
+        let a = mint_session_id();
+        let b = mint_session_id();
+        assert_ne!(a, b);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        assert!(a.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        assert!(parts[2].starts_with('4'), "version 4");
+        assert!(matches!(&parts[3][..1], "8" | "9" | "a" | "b"), "RFC 4122 variant");
     }
 
     #[test]
@@ -1069,7 +1366,7 @@ mod tests {
         st.set_tab_name(tmp.path(), "swift", "  ");
         assert_eq!(st.tab_name("swift"), None);
         // A fresh start forgets the record but KEEPS the label.
-        st.forget(tmp.path(), "swift.2");
+        st.forget(tmp.path(), &conv("swift.2"));
         assert_eq!(st.tab_name("swift.2"), Some("refactor"));
         // Releasing a bird forgets every label.
         st.forget_bot(tmp.path(), &BotId("raven".into()));
@@ -1109,6 +1406,9 @@ mod tests {
         // Same for the worker separator: `aviary-<bird>_<slug>-<role>`.
         assert_eq!(slug("night_jar"), "night-jar");
         assert!(!slug("a_b__c").contains(crate::flock::SEP));
+        // And the room separator: `<bird>#<room>`.
+        assert!(!slug("#nest #2").contains(ROOM_SEP));
+        assert!(!valid_bot_id("swift#nest"));
         assert!(valid_bot_id(&slug("Night_Jar.2")));
     }
 

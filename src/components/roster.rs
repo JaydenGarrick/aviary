@@ -302,7 +302,7 @@ impl Component for Roster {
                     let (id, name) = (bot.id.clone(), bot.name.clone());
                     s.agents.stop(&id);
                     s.agent_focused = false;
-                    fx.flash(format!("{name} stopped — its session resumes by name"));
+                    fx.flash(format!("{name} stopped — its conversations resume where they left off"));
                 }
             }
             Action::FreshStart => {
@@ -569,10 +569,13 @@ impl Component for Roster {
                                 title.push(Span::styled(" ●", Style::default().fg(ACCENT)));
                             }
 
-                            // Body: collab tag, then WHY it is blocked, else
-                            // the last prompt or branch.
-                            let collab = s.agents.collab(&bot.id).map(|c| c.tag());
-                            let tag_w = collab.as_ref().map_or(0, |t| t.chars().count() + 1);
+                            // Body: collab tag (else the room tab 1 runs, when
+                            // not home), then WHY it is blocked, else the last
+                            // prompt or branch.
+                            let collab = s.agents.collab(&bot.id).map(|c| (c.tag(), crate::ui::WARN)).or_else(|| {
+                                s.agents.active_room(&bot.id).map(|r| (format!("#{r}"), MUTED))
+                            });
+                            let tag_w = collab.as_ref().map_or(0, |(t, _)| t.chars().count() + 1);
                             let reporting = s.agents.reporting_key(&bot.id);
                             let preview = s
                                 .agents
@@ -605,11 +608,8 @@ impl Component for Roster {
                                     })
                                 });
                             let mut body = vec![Span::raw(" ")];
-                            if let Some(tag) = collab {
-                                body.push(Span::styled(
-                                    format!("{tag} "),
-                                    Style::default().fg(crate::ui::WARN),
-                                ));
+                            if let Some((tag, colour)) = collab {
+                                body.push(Span::styled(format!("{tag} "), Style::default().fg(colour)));
                             }
                             match preview {
                                 Some(p) => body.push(dim(p)),

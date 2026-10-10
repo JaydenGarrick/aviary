@@ -4,9 +4,9 @@
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use crate::agent_store::AgentStore;
+use crate::agent_store::{AgentStore, Signaled};
 use crate::command::{BranchInfo, Slot};
-use crate::config::{BotId, Config, Room, SessionKey};
+use crate::config::{BotId, Config, ConvKey, SessionKey};
 use crate::event::Event;
 use crate::events::EventsReader;
 use crate::prompts;
@@ -79,11 +79,39 @@ impl Shared {
         })
     }
 
-    /// Spawn/resume a bot's PRIMARY session, typing `prompt` into it. Every
-    /// external signal lands here; extra tabs are only ever booted by a human
-    /// via [`Shared::boot_key`].
-    pub fn boot_bot(&mut self, id: &BotId, prompt: Option<&str>) {
-        self.boot_key(&SessionKey::primary(id.clone()), prompt);
+    /// An EXTERNAL signal for a bird — every room, handoff, routine and
+    /// webhook lands here, on the PRIMARY: `room: Some` for that room's
+    /// conversation, `None` for home. Tab 1 switches between them only when
+    /// idle (`AgentStore::signal` / `pump_switches`); extra tabs are only
+    /// ever booted by a human via [`Shared::boot_key`]. `None` on error
+    /// (flashed).
+    pub fn signal(&mut self, id: &BotId, room: Option<&str>, prompt: Option<&str>) -> Option<Signaled> {
+        let Some(bot) = self.config.bot(id).cloned() else {
+            self.flash(format!("no bot named {id:?}"));
+            return None;
+        };
+        let tx = self.tx.clone();
+        match self.agents.signal(&self.config, &bot, room, prompt, &tx) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                self.flash(format!("{e:#}"));
+                None
+            }
+        }
+    }
+
+    /// The person points a bird's tab 1 at one of its conversations.
+    pub fn pick_conversation(&mut self, conv: &ConvKey) {
+        let name = self
+            .config
+            .bot(&conv.slot.bot)
+            .map_or_else(|| conv.slot.bot.0.clone(), |b| b.name.clone());
+        let label = conv.label();
+        if self.agents.pick_conversation(&self.config, conv) {
+            self.flash(format!("{name} → {label} when it's idle"));
+        } else {
+            self.flash(format!("{name} — tab 1 is {label}"));
+        }
     }
 
     /// Spawn/resume one session of a bot, typing `prompt` into it; errors
@@ -103,10 +131,12 @@ impl Shared {
         }
     }
 
-    /// First prompt for a never-before-spawned session, None otherwise — and
-    /// never for a viewer tab, which is not a conversation of the bird's.
+    /// First prompt for a never-before-spawned session, None otherwise —
+    /// never for a viewer tab (not a conversation of the bird's), nor for a
+    /// room conversation (the room's notify prompt introduces the room; the
+    /// persona rides the system prompt either way).
     pub fn opening_prompt(&self, key: &SessionKey) -> Option<String> {
-        if self.agents.is_attached(key) {
+        if self.agents.is_attached(key) || self.agents.conv_of(key).room.is_some() {
             return None;
         }
         let bot = self.config.bot(&key.bot)?;
@@ -157,10 +187,12 @@ impl Shared {
             return;
         };
         let tx = self.tx.clone();
-        let prompt = prompts::first_flight(&bot);
+        // A room conversation is introduced by the room, never first_flight.
+        let home = self.agents.conv_of(key).room.is_none();
+        let prompt = home.then(|| prompts::first_flight(&bot));
         if let Err(e) = self
             .agents
-            .fresh_key(&self.config, &bot, key.tab, Some(&prompt), &tx)
+            .fresh_key(&self.config, &bot, key.tab, prompt.as_deref(), &tx)
         {
             self.flash(format!("{e:#}"));
         } else {
@@ -168,28 +200,8 @@ impl Shared {
         }
     }
 
-    /// A new room: every member's primary conversation ends now and starts
-    /// over on the room's first message (the prompt rides argv then — see
-    /// `AgentStore::reset_primary`). Returns the names of birds that had a
-    /// live session or a resume record to lose.
-    pub fn reset_for_room(&mut self, room: &Room) -> Vec<String> {
-        let mut reset = Vec::new();
-        for id in &room.members {
-            let Some(name) = self.config.bot(id).map(|b| b.name.clone()) else {
-                continue;
-            };
-            if self.agents.reset_primary(&self.config, id) {
-                reset.push(name);
-            }
-            // Never leave the keyboard pointed at a PTY that was just dropped.
-            if self.current_bot.as_ref() == Some(id) && self.current_tab == 1 {
-                self.agent_focused = false;
-            }
-        }
-        reset
-    }
-
-    /// Abandon the bird's PRIMARY conversation on purpose and start a new one.
+    /// Abandon the conversation the bird's tab 1 runs (home or a room's) on
+    /// purpose and start a new one; the others are untouched.
     pub fn fresh_bot(&mut self, id: &BotId) {
         let Some(bot) = self.config.bot(id).cloned() else {
             self.flash(format!("no bot named {id:?}"));
@@ -200,14 +212,15 @@ impl Shared {
             self.current_tab = 1;
         }
         let tx = self.tx.clone();
-        let prompt = prompts::first_flight(&bot);
+        let conv = self.agents.conv_of(&SessionKey::primary(id.clone()));
+        let prompt = conv.room.is_none().then(|| prompts::first_flight(&bot));
         if let Err(e) = self
             .agents
-            .fresh_start(&self.config, &bot, Some(&prompt), &tx)
+            .fresh_start(&self.config, &bot, prompt.as_deref(), &tx)
         {
             self.flash(format!("{e:#}"));
         } else {
-            self.flash(format!("{} — fresh conversation", bot.name));
+            self.flash(format!("{} — fresh {} conversation", bot.name, conv.label()));
         }
     }
 }
